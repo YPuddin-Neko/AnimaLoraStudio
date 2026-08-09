@@ -75,15 +75,53 @@ export default function SystemStats() {
 
   if (!stats) return null
 
-  const gpu0 = stats.gpu && stats.gpu.length > 0 ? stats.gpu[0] : null
   const ramPct = stats.ram_total_gb > 0 ? (stats.ram_used_gb / stats.ram_total_gb) * 100 : 0
-  const vramPct = gpu0 && gpu0.vram_total_gb > 0 ? (gpu0.vram_used_gb / gpu0.vram_total_gb) * 100 : 0
 
-  const gpuExtra = stats.gpu && stats.gpu.length > 1
-    ? ` (+${stats.gpu.length - 1} more)`
+  // ── 多卡汇总 ────────────────────────────────────────────────────────
+  // pill 显示全卡合计，逐卡明细进 tooltip（原实现只显示 gpu[0] + "(+N more)"，
+  // 双卡机器上等于一半的显存看不见）。
+  //
+  // 汇总口径按量的性质分开，不能一律取和或一律取平均：
+  // - **显存**：物理量，可加 —— 合计已用 / 合计总量。
+  // - **利用率**：百分比，相加无意义（两卡满载会得到 200%）—— 取算术平均。
+  //   刻意不按显存或 SM 数加权：topbar 是粗粒度概览，加权在同型号多卡上与
+  //   平均等价，混插不同型号时反而更难解释。
+  const gpus = stats.gpu ?? []
+  const hasGpu = gpus.length > 0
+  const multi = gpus.length > 1
+
+  const vramUsed = gpus.reduce((s, g) => s + g.vram_used_gb, 0)
+  const vramTotal = gpus.reduce((s, g) => s + g.vram_total_gb, 0)
+  const vramPct = vramTotal > 0 ? (vramUsed / vramTotal) * 100 : 0
+
+  // 利用率可能整体缺失（DCU 上 smi 解析不到时为 null），只对有读数的卡求平均。
+  // 一张都没有 → null，整个 GPU pill 隐藏（0% 是合法读数，不能拿来兜底缺失值）。
+  const utilValues = gpus.map((g) => g.util_pct).filter((u): u is number => u != null)
+  const utilAvg = utilValues.length > 0
+    ? utilValues.reduce((s, u) => s + u, 0) / utilValues.length
+    : null
+
+  /** 逐卡一行：`#0 BW  12.3/64G (19%) · 45% · 50°C`。缺失项省略而非填 0。 */
+  const perCardLines = gpus.map((g) => {
+    const pct = g.vram_total_gb > 0
+      ? ` (${((g.vram_used_gb / g.vram_total_gb) * 100).toFixed(0)}%)`
+      : ''
+    const util = g.util_pct != null ? ` · ${g.util_pct}%` : ''
+    const temp = g.temp_c != null ? ` · ${g.temp_c}°C` : ''
+    return `#${g.index} ${g.name}  ${g.vram_used_gb.toFixed(1)}/${Math.round(g.vram_total_gb)}G${pct}${util}${temp}`
+  }).join('\n')
+
+  // 单卡时不重复显示汇总行（与逐卡行内容完全一样，纯噪音）
+  const vramTooltip = hasGpu
+    ? (multi
+        ? `显存合计 ${vramUsed.toFixed(1)} / ${Math.round(vramTotal)} GB (${vramPct.toFixed(0)}%) · ${gpus.length} 卡\n${perCardLines}`
+        : `显存 ${perCardLines}`)
     : ''
-  const gpuTempText = gpu0?.temp_c != null ? ` · ${gpu0.temp_c}°C` : ''
-  const gpuLabel = gpu0 ? `${gpu0.name}${gpuTempText}${gpuExtra}` : ''
+  const utilTooltip = hasGpu
+    ? (multi && utilAvg != null
+        ? `GPU 利用率均值 ${utilAvg.toFixed(0)}% · ${gpus.length} 卡\n${perCardLines}`
+        : `GPU 利用率 · ${perCardLines}`)
+    : ''
 
   return (
     <div className="hidden md:flex items-center gap-2 shrink-0">
@@ -99,24 +137,25 @@ export default function SystemStats() {
         pct={ramPct}
         tooltip={`内存 ${stats.ram_used_gb.toFixed(1)} / ${stats.ram_total_gb.toFixed(1)} GB (${ramPct.toFixed(0)}%)`}
       />
-      {gpu0 && (
+      {hasGpu && (
         <>
-          {/* 利用率可能拿不到（DCU 上后端不报，见 GpuStats.util_pct）——整个 pill
-              隐藏而不是显示 "null%" / "0%"。0% 是合法读数，不能拿来兜底缺失值。
-              VRAM pill 不受影响：显存在两个后端上都可靠。 */}
-          {gpu0.util_pct != null && (
+          {/* 利用率可能整体拿不到（DCU 上 smi 解析失败时为 null，见 GpuStats.util_pct）
+              —— 整个 pill 隐藏而不是显示 "null%" / "0%"。0% 是合法读数，不能拿来
+              兜底缺失值。VRAM pill 不受影响：显存在两个后端上都可靠。
+              多卡时 label 带卡数（"GPU×2"），让「这是均值不是单卡」一眼可见。 */}
+          {utilAvg != null && (
             <Pill
-              label="GPU"
-              value={`${gpu0.util_pct}%`}
-              pct={gpu0.util_pct}
-              tooltip={`GPU 利用率 · ${gpuLabel}`}
+              label={multi ? `GPU×${gpus.length}` : 'GPU'}
+              value={`${utilAvg.toFixed(0)}%`}
+              pct={utilAvg}
+              tooltip={utilTooltip}
             />
           )}
           <Pill
-            label="VRAM"
-            value={fmtGb(gpu0.vram_used_gb, gpu0.vram_total_gb)}
+            label={multi ? `VRAM×${gpus.length}` : 'VRAM'}
+            value={fmtGb(vramUsed, vramTotal)}
             pct={vramPct}
-            tooltip={`显存 ${gpu0.vram_used_gb.toFixed(1)} / ${gpu0.vram_total_gb.toFixed(1)} GB (${vramPct.toFixed(0)}%) · ${gpuLabel}`}
+            tooltip={vramTooltip}
           />
         </>
       )}
