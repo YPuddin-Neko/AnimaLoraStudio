@@ -7,6 +7,22 @@ from unittest.mock import MagicMock
 import pytest
 
 from studio.services.runtime import torch as ts
+from utils import accelerator
+
+
+@pytest.fixture(autouse=True)
+def _reset_accelerator_cache():
+    """每个用例前后清 `utils.accelerator` 的进程内后端缓存（ADR 0016）。
+
+    `detect()` 刻意缓存结果 —— 生产环境里 torch build 在进程生命周期内不会变。
+    但本文件的用例靠 `monkeypatch.setitem(sys.modules, "torch", fake)` 换掉 torch，
+    如果缓存已被别的用例（或 import 期的真实探测）填好，`detect()` 就看不见 fake，
+    `cuda_build` 会全部退化成宿主机的真实后端。前后都清是因为：前清保证本用例看到
+    fake，后清保证本用例的 fake 不泄漏给下一个用例。
+    """
+    accelerator._CACHE = None
+    yield
+    accelerator._CACHE = None
 
 
 # ---------------------------------------------------------------------------
@@ -40,10 +56,15 @@ def test_detect_torch_not_installed(monkeypatch: pytest.MonkeyPatch) -> None:
         raise PackageNotFoundError
     monkeypatch.setattr(ts, "_pkg_version", _raise)
     res = ts.detect_torch()
-    assert res == {
-        "installed": False, "version": None, "cuda_build": None,
-        "cuda_available": False, "device_name": None,
-    }
+    # 原有 5 个 key 的语义锁死（下游 /api/torch/status + cli.py + 前端在消费）。
+    # 不用 `==` 全等断言：ADR 0016 起 detect_torch 会附带后端字段（backend /
+    # vendor_label / cuda_version / hip_version），那是加法，全等断言会把后续任何
+    # 加字段都变成假失败。后端字段本身另有专门用例覆盖。
+    assert res["installed"] is False
+    assert res["version"] is None
+    assert res["cuda_build"] is None
+    assert res["cuda_available"] is False
+    assert res["device_name"] is None
 
 
 def test_detect_torch_cpu_build(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -53,6 +74,9 @@ def test_detect_torch_cpu_build(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_torch.__version__ = "2.5.0+cpu"
     fake_torch.cuda.is_available.return_value = False
     fake_torch.version.cuda = None
+    # 必须显式设 None：MagicMock 的属性访问会自动造一个 truthy 子 mock，
+    # accelerator.detect() 读到 torch.version.hip 为真就判成 DCU（ADR 0016）。
+    fake_torch.version.hip = None
     monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
 
     res = ts.detect_torch()
@@ -70,6 +94,9 @@ def test_detect_torch_cuda_build(monkeypatch: pytest.MonkeyPatch) -> None:
     fake_torch.cuda.is_available.return_value = True
     fake_torch.cuda.get_device_name.return_value = "RTX 5090"
     fake_torch.version.cuda = "12.8"
+    # 必须显式设 None：MagicMock 的属性访问会自动造一个 truthy 子 mock，
+    # accelerator.detect() 读到 torch.version.hip 为真就判成 DCU（ADR 0016）。
+    fake_torch.version.hip = None
     monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
 
     res = ts.detect_torch()
@@ -88,6 +115,9 @@ def test_detect_torch_cuda_build_no_suffix_falls_back_to_version_cuda(
     fake_torch.cuda.is_available.return_value = True
     fake_torch.cuda.get_device_name.return_value = "Tesla T4"
     fake_torch.version.cuda = "11.8"
+    # 必须显式设 None：MagicMock 的属性访问会自动造一个 truthy 子 mock，
+    # accelerator.detect() 读到 torch.version.hip 为真就判成 DCU（ADR 0016）。
+    fake_torch.version.hip = None
     monkeypatch.setitem(__import__("sys").modules, "torch", fake_torch)
 
     res = ts.detect_torch()

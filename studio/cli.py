@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -152,6 +153,43 @@ def _pip_install(args: list[str]) -> int:
     return rc
 
 
+#: DCU 上要从 requirements 里剔掉的包名。DTK 版 torch / torchvision 由厂商镜像
+#: 预装，PyPI 上没有对应 wheel —— 让 pip 看见 `torch>=2.0.0` 就会装 PyPI 的 CPU 版
+#: 覆盖掉它们，环境不可逆报废。与 studio.sh 里同名的过滤保持一致（shell 首装路径
+#: 走 shell 那份，本函数只管「已有 venv 缺包」的补装路径）。
+_DCU_UNMANAGED_REQS: tuple[str, ...] = ("torch", "torchvision")
+
+
+def _requirements_for_install() -> tuple[Path, Optional[Path]]:
+    """返回 (要交给 pip 的 requirements 路径, 需要事后删的临时文件)。
+
+    非 DCU 后端原样返回 `requirements.txt`（NVIDIA 路径逐字节不变）。DCU 上生成
+    一份剔掉 torch / torchvision 的临时副本 —— 不改 requirements.txt 本体，因为它
+    对 NVIDIA 用户仍然是必需约束，且 `check_requirements_changed.py` 的 hash
+    marker 认的是原文件。
+    """
+    req = REPO_ROOT / "requirements.txt"
+    from studio.services.runtime import torch as torch_setup  # noqa: PLC0415
+    if torch_setup.can_manage_torch_install():
+        return req, None
+
+    kept: list[str] = []
+    for line in req.read_text(encoding="utf-8").splitlines():
+        # 只看行首的包名（`torch>=2.0.0` / `torchvision>=0.15.0`）。注意不能用
+        # `startswith("torch")`：torchsde 是纯 Python 包、PyPI 上有、必须装。
+        name = re.split(r"[<>=!~;\[\s]", line.strip(), maxsplit=1)[0].lower()
+        if name in _DCU_UNMANAGED_REQS:
+            continue
+        kept.append(line)
+    tmp = REPO_ROOT / "tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    filtered = tmp / "requirements.dcu.txt"
+    filtered.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    _say(f"海光 DCU：requirements 里已剔除 {' / '.join(_DCU_UNMANAGED_REQS)}"
+         "（DTK 版由镜像预装，pip 覆盖会报废环境）")
+    return filtered, filtered
+
+
 def _ensure_python_deps() -> int:
     """检查关键包（fastapi）是否安装，缺失时自动补装 requirements.txt。"""
     req = REPO_ROOT / "requirements.txt"
@@ -164,7 +202,12 @@ def _ensure_python_deps() -> int:
     except Exception:
         pass
     _say("检测到 fastapi 缺失，重新安装 Python 依赖（requirements.txt）...")
-    return _pip_install(["-r", str(req)])
+    target, cleanup = _requirements_for_install()
+    try:
+        return _pip_install(["-r", str(target)])
+    finally:
+        if cleanup is not None:
+            cleanup.unlink(missing_ok=True)
 
 
 def npm_build(npm: str) -> int:
@@ -392,33 +435,67 @@ def _try_enable_flash_attn() -> None:
 
 
 def _check_torch_cuda() -> None:
-    """启动期检查 torch 是否能用 CUDA；CPU-only torch 跑训练 / 出图会极慢。
+    """启动期检查 torch 能不能上卡；CPU-only torch 跑训练 / 出图会极慢。
 
-    四种状态：
-    - CUDA 可用                       → 一行 OK
-    - torch 是 CPU-only build + 有 GPU → 大警告 + 重装命令（最常见误装）
-    - torch 是 CPU-only build + 无 GPU → 一行 info（用户确实在 CPU 机器上）
-    - torch 是 CUDA build 但 cuda 不可用 → 警告（驱动 / WSL 问题）
+    按后端分派（后端识别一律问 `utils/accelerator.py`，见 docs/AGENTS.md）：
 
-    `torch.version.cuda` 在 CPU-only wheel 上是 None；在 cu* wheel 上是 "12.8" 等。
-    用它区分误装与驱动问题。
+    - 加速器可用（NVIDIA 或 DCU）        → 一行 OK
+    - NVIDIA：CPU-only build + 有 N 卡   → 大警告 + 重装命令（最常见误装）
+    - NVIDIA：CPU-only build + 无 GPU    → 一行 info（用户确实在 CPU 机器上）
+    - NVIDIA：CUDA build 但 cuda 不可用   → 警告（驱动 / WSL 问题）
+    - DCU：DTK build 但设备不可用         → DCU 专属排错（设备节点 / DTK 安装）
+    - CPU build 但机器上有 DCU 迹象       → 警告 venv 遮住了镜像预装的 DTK torch
+
+    历史 bug：原实现直接用 `torch.version.cuda is None` 判「CPU-only wheel」，
+    DTK wheel 的 `version.cuda` 恒为 None，于是海光机器上会被判成误装并被建议
+    `pip install torch --index-url .../cu128` —— 那条命令会覆盖掉镜像预装的 DTK
+    torch，环境不可逆报废。现在 CPU-only 的结论只在非 DCU 后端上下。
     """
-    try:
-        import torch  # noqa: PLC0415
-    except ImportError:
-        return  # _ensure_python_deps 会在更早路径处理
+    from utils.accelerator import VENDOR_LABEL, detect, probe_stdlib  # noqa: PLC0415
 
-    if torch.cuda.is_available():
-        try:
-            name = torch.cuda.get_device_name(0)
-        except Exception:  # noqa: BLE001
-            name = "?"
-        _say(f"torch {torch.__version__}（GPU: {name}）")
+    # refresh=True：本函数在 cmd_run 的 restart loop 里每轮跑一次，而同一轮的
+    # 前面刚可能发生过 `_ensure_python_deps`（补装 requirements）或
+    # `_apply_pending_install`（pip 重装 torch）—— 那之前的探测结果（尤其
+    # 「torch 没装」的 import_error）已经过期。启动期一次多余的探测代价可忽略，
+    # 拿错结论却会让整段启动诊断静默。
+    info = detect(refresh=True)
+    if info.import_error:
+        return  # torch 未装 / import 失败；_ensure_python_deps 会在更早路径处理
+
+    if info.is_gpu:
+        name = info.device_names[0] if info.device_names else "?"
+        if info.backend == "dcu":
+            # DTK 版本号是排错最关键的一条（用户报问题时先看它对不对得上镜像）
+            arch = f"，{info.gcn_arch[0]}" if info.gcn_arch else ""
+            _say(
+                f"torch {info.torch_version}（{info.vendor_label} / HIP "
+                f"{info.hip_version}，GPU: {name}{arch}）"
+            )
+        else:
+            _say(f"torch {info.torch_version}（GPU: {name}）")
         return
 
-    cuda_build = getattr(torch.version, "cuda", None)
-    if cuda_build is None:
-        # CPU-only wheel：进一步判断本机是否其实有 NVIDIA GPU（误装）
+    if info.backend == "dcu":
+        # DTK build 装着但设备用不了。**不给** pip 建议 —— DTK torch 是镜像预装的，
+        # 重装只会让事情更糟；真正的原因几乎总在容器与驱动侧。
+        print(
+            f"[studio] 警告：torch {info.torch_version}（{info.vendor_label} / HIP "
+            f"{info.hip_version}），但 torch.cuda.is_available()=False。\n"
+            f"        训练 / 出图会跑在 CPU 上，速度极慢。常见原因：\n"
+            f"        1. 容器启动没挂设备节点：需要 --device=/dev/kfd --device=/dev/dri\n"
+            f"           （另需 --group-add video，部分环境还要 --security-opt seccomp=unconfined）\n"
+            f"        2. 宿主 DCU 驱动未装 / 版本与镜像内 DTK 不匹配（hy-smi 能否正常输出）\n"
+            f"        3. DTK 运行时装得不全（ROCM_PATH / LD_LIBRARY_PATH 是否指向 DTK）\n"
+            f"        诊断：python tools/probe_accelerator.py",
+            file=sys.stderr,
+        )
+        return
+
+    if info.backend == "cpu":
+        # CPU-only wheel。先按原有 NVIDIA 口径判误装（这条路径行为保持不变），
+        # 再补一条 DCU 特有的误装形态：机器是海光的，但 venv 里的 torch 是 PyPI
+        # CPU 版（venv 没开 --system-site-packages 就会遮住镜像预装的 DTK torch，
+        # 或者曾经被 pip install -r requirements.txt 覆盖过）。
         try:
             from studio.services.runtime import onnxruntime as onnxruntime_setup  # noqa: PLC0415
             has_gpu = bool(onnxruntime_setup.detect_cuda().get("available"))
@@ -427,7 +504,7 @@ def _check_torch_cuda() -> None:
         if has_gpu:
             print(
                 f"[studio] 警告：检测到 NVIDIA GPU，但当前安装的是 CPU-only 版 PyTorch "
-                f"({torch.__version__})。\n"
+                f"({info.torch_version})。\n"
                 f"        训练 / 出图将跑在 CPU 上，速度极慢（单步常需数十秒）。\n"
                 f"        请卸载后重装 CUDA 版：\n"
                 f"          pip uninstall torch torchvision -y\n"
@@ -435,15 +512,26 @@ def _check_torch_cuda() -> None:
                 f"          pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128",
                 file=sys.stderr,
             )
-        else:
+            return
+        if probe_stdlib().backend == "dcu":
             print(
-                f"[studio] torch {torch.__version__}（CPU-only build，未检测到 NVIDIA GPU）"
+                f"[studio] 警告：检测到{VENDOR_LABEL['dcu']}硬件，但当前 venv 里的 PyTorch "
+                f"是 CPU 版（{info.torch_version}）。\n"
+                f"        训练 / 出图将跑在 CPU 上，速度极慢。DTK 版 torch 由镜像预装，"
+                f"不能用 pip 装（PyPI 上没有）。\n"
+                f"        常见原因：venv 创建时没带 --system-site-packages，"
+                f"镜像预装的 DTK torch 被遮住。\n"
+                f"        修复：删掉 venv/ 后重跑 ./studio.sh（会自动带 "
+                f"--system-site-packages 重建），或直接用镜像里的 python 跑。",
+                file=sys.stderr,
             )
+            return
+        print(f"[studio] torch {info.torch_version}（CPU-only build，未检测到 NVIDIA GPU）")
         return
 
     # CUDA build 但运行时不可用：驱动 / WSL / 容器问题
     print(
-        f"[studio] 警告：torch {torch.__version__}（CUDA {cuda_build} build），"
+        f"[studio] 警告：torch {info.torch_version}（CUDA {info.cuda_version} build），"
         f"但 torch.cuda.is_available()=False。\n"
         f"        可能原因：NVIDIA 驱动未安装 / 版本过低 / WSL 缺 CUDA 支持。",
         file=sys.stderr,
@@ -456,9 +544,14 @@ def _check_onnxruntime() -> None:
     对齐 xformers / flash-attention：未装时 silent skip（Tagging 页选 WD14 /
     CLTagger 会有徽章 + 引导按钮）。已装则打一行状态；CPU 包 + 有 GPU 走
     warn，提醒用户去 Settings 切 GPU 版。
+
+    文案里的厂商名与 EP 名按后端取（`VENDOR_LABEL` / `onnx_gpu_provider`）：DCU 上
+    GPU EP 是 MIGraphX 而不是 CUDA，且要装的是 DTK 配套的 onnxruntime（不是 PyPI
+    的 onnxruntime-gpu），照抄「去 Settings 重装 GPU 版」会把用户引到装不上的路。
     """
     try:
         from studio.services.runtime import onnxruntime as onnxruntime_setup
+        from utils.accelerator import VENDOR_LABEL, backend, onnx_gpu_provider  # noqa: PLC0415
 
         rt = onnxruntime_setup.current_runtime()
         if rt["installed"] is None:
@@ -466,8 +559,25 @@ def _check_onnxruntime() -> None:
 
         installed = rt.get("installed") or "?"
         ver = rt.get("version") or "?"
+        bk = backend()
+        vendor = VENDOR_LABEL[bk]
+        # `CUDAExecutionProvider` → `CUDA EP`、`MIGraphXExecutionProvider` →
+        # `MIGraphX EP`。这么派生而不是写死映射，是为了 NVIDIA 那行文案与改动前
+        # 逐字一致（"CUDA EP 可用"），同时新后端只要在 accelerator 里加一行即可。
+        ep = (onnx_gpu_provider() or "GPU").replace("ExecutionProvider", " EP")
         if rt.get("cuda_available"):
-            _say(f"onnxruntime: {installed}=={ver}（CUDA EP 可用）")
+            _say(f"onnxruntime: {installed}=={ver}（{ep} 可用）")
+            return
+
+        if bk == "dcu":
+            # DCU 侧没有 nvidia-smi，detect_cuda() 恒为 False，不能用它判「有没有卡」；
+            # torch 侧的后端结论才是这台机器上唯一可信的 GPU 证据。
+            _say(
+                f"检测到{vendor}但 onnxruntime 无 {ep}（installed={installed}=={ver}）。"
+                f"WD14 / CLTagger 打标会跑 CPU（较慢）。GPU 打标需要 DTK 配套的 "
+                f"onnxruntime（海光渠道发布，不是 PyPI 的 onnxruntime-gpu）。",
+                "warning",
+            )
             return
 
         cuda = onnxruntime_setup.detect_cuda()
@@ -596,11 +706,21 @@ def _apply_update_pending() -> None:
 
 def _maybe_force_torch(args: argparse.Namespace) -> int:
     """--torch <tag> 指定时，检查当前安装是否匹配；不匹配则立即重装（流式输出）。
-    仅在 launcher 启动期调一次，重装完由 restart 机制加载新 torch。"""
+    仅在 launcher 启动期调一次，重装完由 restart 机制加载新 torch。
+
+    海光 DCU 上直接拒绝（返回 1 让启动停下）：用户显式传了这个 flag，静默忽略会
+    让他以为换成功了；而真去执行会覆盖掉镜像预装的 DTK torch，环境不可逆报废。
+    """
     tag = getattr(args, 'torch', None)
     if not tag:
         return 0
     from studio.services.runtime import torch as torch_setup  # noqa: PLC0415
+    # 在 detect_torch() 之前问：can_manage_torch_install() 不会 import torch，
+    # 这样 DCU 分支从头到尾不产生 torch import 副作用（跟 pending_install 的
+    # 「pip 之前不许 import torch」约定同源）。
+    if not torch_setup.can_manage_torch_install():
+        _say(f"--torch {tag} 被拒绝：{torch_setup.DCU_REFUSE_REASON}", "error")
+        return 1
     current = torch_setup.detect_torch()
     current_build = current.get('cuda_build') or ('未安装' if not current.get('installed') else 'unknown')
     if current.get('installed') and current.get('cuda_build') == tag:
@@ -792,7 +912,8 @@ def build_parser() -> argparse.ArgumentParser:
                        help="跳过 pending pip 安装（torch 重装等），直接启动")
     p_run.add_argument("--torch", metavar="TAG",
                        help="强制指定 torch CUDA 版本（cu128/cu126/cu124/cu118/cpu），"
-                            "与当前不符时自动重装。CPU 租赁机预装 GPU torch 时使用。")
+                            "与当前不符时自动重装。CPU 租赁机预装 GPU torch 时使用。"
+                            "海光 DCU 上会被拒绝（DTK torch 由镜像预装）。")
     p_run.set_defaults(func=cmd_run)
 
     p_dev = sub.add_parser("dev", help="前后端开发模式")
@@ -806,7 +927,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_dev.add_argument("--skip-pending", action="store_true",
                        help="跳过 pending pip 安装（torch 重装等），直接启动")
     p_dev.add_argument("--torch", metavar="TAG",
-                       help="强制指定 torch CUDA 版本（cu128/cu126/cu124/cu118/cpu）")
+                       help="强制指定 torch CUDA 版本（cu128/cu126/cu124/cu118/cpu）。"
+                            "海光 DCU 上会被拒绝（DTK torch 由镜像预装）。")
     p_dev.set_defaults(func=cmd_dev)
 
     p_build = sub.add_parser("build", help="仅构建前端")

@@ -28,13 +28,39 @@ def _scaled_dot_product_attention(
         try:
             from torch.nn.attention import SDPBackend, sdpa_kernel
 
-            priority = [
-                SDPBackend.CUDNN_ATTENTION,
-                SDPBackend.FLASH_ATTENTION,
-                SDPBackend.EFFICIENT_ATTENTION,
-                SDPBackend.MATH,
-            ]
-            with sdpa_kernel(priority, set_priority=True):
+            from utils.accelerator import usable_sdpa_backends
+
+            # 只列**实测可用**的后端。`set_priority=True` 会覆盖全局
+            # enable_*_sdp 开关，所以不能盲目列全部：海光 DTK 上 flash 后端的
+            # kernel 在外部 flash_attn_2_cuda*.so 里，包没装时调用会抛
+            # RuntimeError —— 虽然下面的 except 能兜回普通 SDPA，但那是每次调用
+            # 白试一遍 + 刷一串 UserWarning。可用性判定收敛在 utils.accelerator。
+            priority = usable_sdpa_backends()
+            if priority is None:
+                # torch 太老拿不到 SDPBackend 枚举 —— 保持原有写死优先级的行为
+                priority = [
+                    SDPBackend.CUDNN_ATTENTION,
+                    SDPBackend.FLASH_ATTENTION,
+                    SDPBackend.EFFICIENT_ATTENTION,
+                    SDPBackend.MATH,
+                ]
+            elif hasattr(SDPBackend, "CUDNN_ATTENTION"):
+                # cuDNN attention 原本排在最前（NVIDIA 上最快）。usable_sdpa_backends()
+                # 不探它（HIP 上恒无实现，且枚举成员在部分 torch 版本不存在），
+                # 这里在 NVIDIA 侧补回队首，保持改动前的选择顺序。
+                from utils.accelerator import is_nvidia
+
+                if is_nvidia():
+                    priority = [SDPBackend.CUDNN_ATTENTION, *priority]
+            try:
+                ctx = sdpa_kernel(priority, set_priority=True)
+            except TypeError:
+                # `set_priority` 是 torch 2.6 新增的参数；2.5.x（含海光 DTK 配套的
+                # torch 2.5.1）上传它会 TypeError。降级成只传 backends —— 语义从
+                # 「按此顺序优先」变成「只允许这些后端」，对本调用点足够：真正要防的是
+                # 让不可用的后端（DCU 上的 flash）进入候选，而不是精确控制排序。
+                ctx = sdpa_kernel(priority)
+            with ctx:
                 return F.scaled_dot_product_attention(
                     q, k, v, attn_mask=attn_mask, dropout_p=0.0, is_causal=False
                 )

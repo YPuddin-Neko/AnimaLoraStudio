@@ -15,6 +15,14 @@ import sys
 from pathlib import Path
 
 
+#: torch 生态包：``--auto-install`` 在海光 DCU 上**不能**碰这些。
+#: DTK 的 torch / torchvision 由厂商镜像预装，wheel 不在 PyPI 上。一旦 pip 从 PyPI
+#: 装 torchvision，它会连带拉一个版本匹配的 **CPU 版 torch** 覆盖掉预装的 DTK torch
+#: —— 环境当场报废且无法用 pip 装回来，用户只能重建容器。宁可 fail-fast 让用户自己
+#: 从 DTK 渠道补，也不能自动装。
+_TORCH_FAMILY_PACKAGES = frozenset({"torch", "torchvision", "torchaudio"})
+
+
 def ensure_dependencies(auto_install: bool = False) -> None:
     """检测并可选自动安装缺失依赖。"""
     required = {
@@ -39,7 +47,25 @@ def ensure_dependencies(auto_install: bool = False) -> None:
     if not auto_install:
         print(f"Install them with:\n  {sys.executable} -m pip install {missing_list}")
         raise SystemExit(1)
-    cmd = [sys.executable, "-m", "pip", "install", *sorted(set(missing))]
+
+    # DCU 上把 torch 生态包从自动安装清单里剔掉（理由见 _TORCH_FAMILY_PACKAGES）。
+    # 只在 DCU 上 gate：NVIDIA 路径行为保持原样，避免为了这个护栏改动既有用户的体验。
+    auto_targets = sorted(set(missing))
+    from utils.accelerator import is_dcu
+
+    if is_dcu():
+        blocked = [p for p in auto_targets if p in _TORCH_FAMILY_PACKAGES]
+        if blocked:
+            print(
+                f"Refusing to auto-install on Hygon DCU: {', '.join(blocked)}\n"
+                f"  DTK torch/torchvision are preinstalled in the vendor image and are\n"
+                f"  NOT on PyPI. Installing from PyPI would pull a CPU-only torch and\n"
+                f"  overwrite the DTK build, breaking the environment beyond pip repair.\n"
+                f"  Get the matching DTK wheels from the Hygon developer channel instead."
+            )
+            raise SystemExit(1)
+
+    cmd = [sys.executable, "-m", "pip", "install", *auto_targets]
     print("Installing missing dependencies...")
     try:
         subprocess.run(cmd, check=False)

@@ -21,7 +21,12 @@ from studio.services.runtime import onnxruntime as ors
 def test_detect_cuda_no_nvidia_smi(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ors.shutil, "which", lambda _: None)
     res = ors.detect_cuda()
-    assert res == {"available": False, "driver_version": None, "gpu_name": None}
+    # 逐 key 断言而非 `==` 全等：ADR 0016 起返回值多一个 `backend` 字段（加法），
+    # 全等会把后续任何加字段都变成假失败。三个原有 key 的语义才是契约
+    # （torch.py / cli.py / tools/bench_wd14.py 在消费）。
+    assert res["available"] is False
+    assert res["driver_version"] is None
+    assert res["gpu_name"] is None
 
 
 def test_detect_cuda_present(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -29,11 +34,27 @@ def test_detect_cuda_present(monkeypatch: pytest.MonkeyPatch) -> None:
     fake = MagicMock(returncode=0, stdout="551.86, NVIDIA GeForce RTX 5090\n", stderr="")
     monkeypatch.setattr(ors.subprocess, "run", lambda *a, **k: fake)
     res = ors.detect_cuda()
-    assert res == {
-        "available": True,
-        "driver_version": "551.86",
-        "gpu_name": "NVIDIA GeForce RTX 5090",
-    }
+    assert res["available"] is True
+    assert res["driver_version"] == "551.86"
+    assert res["gpu_name"] == "NVIDIA GeForce RTX 5090"
+
+
+def test_detect_cuda_backend_and_available_are_independent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`backend`（torch build）与 `available`（硬件探针）**不能互推**。
+
+    这台机器没装 torch → backend='cpu'，但 nvidia-smi 在 → available=True。
+    这个组合正是 `torch.py` 的 `is_cpu_with_gpu` 误装诊断要抓的场景（用户有卡
+    却装了 CPU 版 torch），所以两个字段必须各自独立，不能让 backend 去覆盖
+    available 或反之。
+    """
+    monkeypatch.setattr(ors.shutil, "which", lambda _: "/usr/bin/nvidia-smi")
+    fake = MagicMock(returncode=0, stdout="551.86, NVIDIA GeForce RTX 5090\n", stderr="")
+    monkeypatch.setattr(ors.subprocess, "run", lambda *a, **k: fake)
+    res = ors.detect_cuda()
+    assert res["available"] is True
+    assert res["backend"] in {"cuda", "dcu", "cpu"}
 
 
 def test_detect_cuda_returncode_nonzero(monkeypatch: pytest.MonkeyPatch) -> None:

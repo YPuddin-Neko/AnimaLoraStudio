@@ -74,7 +74,7 @@ def available_ram_bytes() -> int | None:
 
 #: RAM 预算基底：进程/torch 运行余量（真机实测进程基底 ~4GB + 换页安全边际）
 _RAM_BASE_BYTES = 4 * 1024**3
-#: VRAM 预算基底：CUDA context + 激活余量
+#: VRAM 预算基底：设备上下文（CUDA context / DCU 上是 HIP context）+ 激活余量
 _VRAM_BASE_BYTES = 3 * 1024**3
 
 
@@ -210,6 +210,14 @@ def log_vram(stage: str, device=None) -> None:
 
     刻意同时打 torch 已分配量与**全卡**已用量：WDDM 下两者可能差很多（驱动
     侧开销 + 其他进程），只看 torch 的数会低估真实占用。查询失败静默跳过。
+
+    这里的 ``mem_get_info`` 不换成 NVML（与 :func:`gpu_free_bytes_global` 不同）：
+    日志只求量级参考，不做拦人决策，不值得为它付 NVML init 的代价。口径差异记一笔：
+    Linux（含 DCU）上它是全卡真实占用；Windows WDDM 上是每进程虚拟化视角，看不到
+    他进程——所以「全卡已用」这一栏在 WDDM 下偏小是已知的，别拿它当跨进程依据。
+
+    ``torch.cuda.*`` 在 DCU 上照常可用（DTK 把 CUDA API 映射到 HIP），本函数不需要
+    按后端分支。
     """
     try:
         import torch
@@ -236,26 +244,18 @@ def log_vram(stage: str, device=None) -> None:
 def gpu_free_bytes_global() -> int | None:
     """全卡真实空闲显存；查询失败返回 None。
 
-    必须走 NVML：WDDM 下 ``cudaMemGetInfo`` 是**每进程虚拟化视角**，
-    看不到其他进程的占用（真机实测：他进程持有 20GB 时它仍报全量
-    free）——用它做跨进程护栏形同虚设。NVML 是全卡视角。
+    委托 ``utils.accelerator.free_vram_bytes()``——按后端选查询路径这件事只在那
+    一处实现（单一权威源），这里不再自己写 NVML fallback。两条路径的取舍原样保留：
+
+    - NVIDIA **必须走 NVML**：WDDM 下 ``cudaMemGetInfo`` 是**每进程虚拟化视角**，
+      看不到其他进程的占用（真机实测：他进程持有 20GB 时它仍报全量 free）——用它
+      做跨进程护栏形同虚设。NVML 是全卡视角。
+    - 海光 DCU 走 torch ``mem_get_info`` 就够：DCU 只在 Linux 上跑，没有 WDDM 那
+      套每进程显存视角虚拟化，``mem_get_info`` 本身就是全卡口径；且 NVML 是
+      NVIDIA 专有，pynvml 在 DCU 上根本 init 不了，没有别的选择。
+
+    查询失败返回 None，调用方（``check_load_budget``）静默放行。
     """
-    try:
-        import pynvml
+    from utils.accelerator import free_vram_bytes
 
-        pynvml.nvmlInit()
-        try:
-            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-            return int(pynvml.nvmlDeviceGetMemoryInfo(handle).free)
-        finally:
-            pynvml.nvmlShutdown()
-    except Exception:
-        pass
-    try:
-        import torch
-
-        if torch.cuda.is_available():
-            return int(torch.cuda.mem_get_info()[0])
-    except Exception:
-        pass
-    return None
+    return free_vram_bytes()

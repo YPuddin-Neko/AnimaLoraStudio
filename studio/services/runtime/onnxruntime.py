@@ -29,6 +29,16 @@ PP9.5 — CUDA 共享库预加载 + session 创建 fallback：
   这条路在 ComfyUI / WD14 生态里**没人做**，但是最便宜的通用 fix。
 - 失败时 wd14_tagger 仍会捕异常降 CPU；本模块用 record_cuda_load_error 把
   原因 stash 出来给 UI 显示。
+
+海光 DCU（DTK）—— 本模块受影响最大的三处，全部按 utils.accelerator 分派：
+- **预加载整段跳过**：DCU 上没有 `site-packages/nvidia/*` 这些包（那是 NVIDIA
+  torch wheel 的依赖），而 DTK 配套的 onnxruntime 自己链 DTK 运行时，不需要任何
+  外部 preload。返回 dict 里加 `backend_skip=True` 与现有几个 *_skip 同构。
+- **GPU 包不是 onnxruntime-gpu**：那是 CUDA build。海光的 GPU EP 是 MIGraphX，
+  只在 DTK 配套的 onnxruntime 里，不在 PyPI 上 —— 所以 DCU 上 `gpu` 目标拒绝执行，
+  `auto` 装 CPU 包（见 _decide_target 里的决策说明）。
+- **GPU EP 名不是 CUDAExecutionProvider**：`current_runtime().cuda_available` 改成
+  「当前后端的 GPU EP 可用」，实际 EP 名新增 `gpu_provider` 字段透出。
 """
 from __future__ import annotations
 
@@ -40,6 +50,8 @@ import shutil
 import subprocess
 import sys
 from typing import Any, Optional
+
+from utils import accelerator
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +127,45 @@ _TORCH_NVIDIA_LIB_PKGS_LINUX: tuple[str, ...] = (
     "nvidia.cusolver",
     "nvidia.cudnn",
 )
+
+
+def _backend() -> str:
+    """当前加速器后端；探测异常兜底成 ``"cuda"``。
+
+    兜底选 cuda 是为了让探测失败时 NVIDIA 路径**逐字节保持旧行为** —— 本模块新增
+    的后端分支全部形如「是 dcu 才走新路」，兜底 cuda 等于全部不生效。
+    本模块在 import 期就会调它（_ensure_preload），所以绝不能让它抛。
+    """
+    try:
+        return accelerator.backend()
+    except Exception:  # noqa: BLE001
+        return "cuda"
+
+
+def _gpu_ep_name() -> str:
+    """当前后端的 onnxruntime GPU ExecutionProvider 名。**永不返回 None。**
+
+    只有 DCU 走 ``accelerator.onnx_gpu_provider()``（→ MIGraphX），其余后端一律
+    ``CUDAExecutionProvider``。**这里刻意不直接透传 accelerator 的三态**：那个函数
+    在 ``backend=="cpu"`` 时返回 None，而「torch 是 CPU build / 没装 torch，但
+    venv 里装着 onnxruntime-gpu 且 CUDA EP 可用」是完全合法且常见的状态（打标用
+    GPU、训练还没配好），历史上 ``cuda_available`` 在这种机器上就是 True。直接透传
+    会把它变成 False —— 一个纯 NVIDIA 侧的行为回归。
+
+    onnxruntime 的 GPU 能力与 torch build 无关，这是两个独立的包；只有「换了厂商」
+    才需要换 EP 名。
+    """
+    if _backend() == "dcu":
+        try:
+            return accelerator.onnx_gpu_provider() or "MIGraphXExecutionProvider"
+        except Exception:  # noqa: BLE001
+            return "MIGraphXExecutionProvider"
+    return "CUDAExecutionProvider"
+
+
+def _vendor_label() -> str:
+    """面向用户的后端名（报错 / 日志文案用）。"""
+    return accelerator.VENDOR_LABEL.get(_backend(), _backend())  # type: ignore[arg-type]
 
 
 def _cuda_wheels_for(major: Optional[int]) -> tuple[tuple[str, ...], str]:
@@ -216,7 +267,14 @@ def _resolve_cuda_major() -> Optional[int]:
        `cu128`→12、`cu130`→13。当前 recommend_cu_tag 表最高 cu128，故这条 fallback
        今天恒返回 12。
     3. 都拿不到（无 GPU、无 torch）→ None；调用方按 DEFAULT_CUDA_MAJOR（=12）。
+
+    DCU 上恒为 None：那里没有「CUDA 大版本」这个概念，而 fallback 那条会拿 hy-smi
+    的驱动版本（形如 "1.4.1"）喂给 recommend_cu_tag，硬凑出一个毫无意义的 cu 标签
+    显示在 UI 上。DCU 走不到任何真正用这个值的路径（gpu 目标被拒、CUDA wheel 跳过），
+    所以直接短路返回 None，让 UI 隐藏这一行。
     """
+    if _backend() == "dcu":
+        return None
     try:
         import torch  # type: ignore[import-not-found]  # noqa: PLC0415
         cuda_v = getattr(torch.version, "cuda", None)
@@ -295,7 +353,9 @@ def _preload_torch_cuda_libs() -> dict[str, Any]:
     只对**当前进程**生效；server 子进程必须自己再跑一次（本模块在 import 时
     自动跑）。
 
-    返回 `{"applied", "platform_skip", "system_cuda_skip", "preloaded", "errors", "candidates"}`：
+    返回 `{"applied", "platform_skip", "system_cuda_skip", "backend_skip",
+           "preloaded", "errors", "candidates"}`：
+    - `backend_skip=True`：非 NVIDIA 后端（海光 DCU），整体跳过 —— 见下方说明
     - `platform_skip=True`：非 Linux / 非 Windows（如 macOS），整体跳过
     - `system_cuda_skip=True`：Linux 系统 CUDA 路径，跳过 preload 让 onnxruntime
       自己 dlopen 系统提供的版本
@@ -303,12 +363,30 @@ def _preload_torch_cuda_libs() -> dict[str, Any]:
     - `errors`：尝试但失败的 (path, reason) 列表
     - `candidates`：检视的候选数（Linux: nvidia.* 子包；Windows: torch/lib 目录）
     """
+    # DCU 上整段跳过，且必须放在**平台判断之前**（DCU 也是 Linux，会落进下面那条
+    # 真正 dlopen 的分支）。两个理由：
+    # 1. `site-packages/nvidia/*` 是 NVIDIA torch wheel 的依赖包，DTK 镜像里根本
+    #    不存在 —— 走进去只是 8 次 ImportError 空转。
+    # 2. DTK 配套的 onnxruntime 自己链 DTK 运行时（libamdhip64 等，由 DTK 装在系统
+    #    ld 路径里），不存在 PP9.5 要解决的「wheel 不带 runtime so」问题；真硬塞
+    #    NVIDIA so 进全局符号表反而是引入风险。
+    if _backend() == "dcu":
+        return {
+            "applied": False,
+            "platform_skip": False,
+            "system_cuda_skip": False,
+            "backend_skip": True,
+            "preloaded": [],
+            "errors": [],
+            "candidates": 0,
+        }
     if sys.platform == "win32":
         wres = _add_torch_dll_dirs_windows()
         return {
             "applied": True,
             "platform_skip": False,
             "system_cuda_skip": False,
+            "backend_skip": False,
             "preloaded": wres["added"],
             "errors": wres["errors"],
             "candidates": wres["candidates"],
@@ -318,6 +396,7 @@ def _preload_torch_cuda_libs() -> dict[str, Any]:
             "applied": False,
             "platform_skip": True,
             "system_cuda_skip": False,
+            "backend_skip": False,
             "preloaded": [],
             "errors": [],
             "candidates": 0,
@@ -327,6 +406,7 @@ def _preload_torch_cuda_libs() -> dict[str, Any]:
             "applied": False,
             "platform_skip": False,
             "system_cuda_skip": True,
+            "backend_skip": False,
             "preloaded": [],
             "errors": [],
             "candidates": 0,
@@ -364,6 +444,7 @@ def _preload_torch_cuda_libs() -> dict[str, Any]:
         "applied": True,
         "platform_skip": False,
         "system_cuda_skip": False,
+        "backend_skip": False,
         "preloaded": preloaded,
         "errors": errors,
         "candidates": candidates,
@@ -385,6 +466,7 @@ def _ensure_preload() -> dict[str, Any]:
             "applied": False,
             "platform_skip": False,
             "system_cuda_skip": False,
+            "backend_skip": False,
             "not_installed_skip": True,
             "preloaded": [],
             "errors": [],
@@ -392,7 +474,13 @@ def _ensure_preload() -> dict[str, Any]:
         }
         return _PRELOAD_RESULT
     _PRELOAD_RESULT = _preload_torch_cuda_libs()
-    if sys.platform == "win32" and _PRELOAD_RESULT["preloaded"]:
+    if _PRELOAD_RESULT.get("backend_skip"):
+        logger.info(
+            "[onnx_setup] 后端为 %s，跳过 NVIDIA CUDA 库预加载"
+            "（DTK 配套 onnxruntime 自带运行时依赖）",
+            _vendor_label(),
+        )
+    elif sys.platform == "win32" and _PRELOAD_RESULT["preloaded"]:
         logger.info(
             "[onnx_setup] DLL 搜索路径已加入 torch/lib（onnxruntime-gpu CUDA dlopen 用）"
         )
@@ -440,13 +528,47 @@ _ensure_preload()
 
 
 def detect_cuda() -> dict[str, Any]:
-    """运行 nvidia-smi 探针。返回 {"available": bool, "driver_version": str|None, "gpu_name": str|None}。
+    """GPU 硬件探针。返回 ``{"available", "driver_version", "gpu_name", "backend"}``。
 
     nvidia-smi 不需要 root，是最低成本的 GPU 检测；找不到 / 跑失败都视作无 GPU。
+
+    **函数名与前三个 key 刻意不改**：``torch.py`` / ``cli.py`` / ``tools/bench_wd14.py``
+    都在消费它，改名等于同时改三个不属于本次范围的文件。语义从「nvidia-smi 探针」
+    放宽成「当前后端的 GPU 探针」——DCU 上走 ``accelerator.probe_stdlib()``（hy-smi /
+    rocm-smi / ``/dev/kfd``），这样 ``cli.py`` 的启动期 `has_gpu` 判断与
+    ``_decide_target("auto")`` 在 DCU 上也能得到正确答案，而不是「没 GPU」。
+
+    ``backend`` 是**新增**字段（加法，老消费方不受影响），值为 ``cuda`` / ``dcu``
+    / ``cpu``，让 UI 能把「NVIDIA 驱动」那行标签换成正确的厂商名。
     """
+    if _backend() == "dcu":
+        # DCU：nvidia-smi 不存在，probe_stdlib() 会依次试 hy-smi / rocm-smi /
+        # /dev/kfd。它每次真跑 smi（不缓存），调用频率是页面刷新级，可接受。
+        try:
+            probe = accelerator.probe_stdlib()
+        except Exception as exc:  # noqa: BLE001  探测失败不该让 status endpoint 500
+            logger.debug("DCU 硬件探测失败: %s", exc)
+            return {
+                "available": False, "driver_version": None,
+                "gpu_name": None, "backend": "dcu",
+            }
+        # backend=="dcu" 已由 torch 侧确认（_backend() 读的是 torch.version.hip），
+        # 所以这里 available 只表示「smi / 设备节点也能确认」；probe 退化成 cpu
+        # 说明容器没挂 /dev/kfd 或 DTK 装得不全，报 False 让 UI 提示排查。
+        return {
+            "available": probe.backend == "dcu",
+            "driver_version": probe.driver_version,
+            "gpu_name": probe.gpu_name,
+            "backend": "dcu",
+        }
+
+    # 注意 backend 与 available 是**两个独立事实**，不要互推：backend 来自 torch
+    # build（cpu 版 torch → "cpu"），available 来自硬件探针。两者不一致正是
+    # torch.py 的 `is_cpu_with_gpu` 误装诊断要抓的场景。
+    bk = _backend()
     nv = shutil.which("nvidia-smi")
     if not nv:
-        return {"available": False, "driver_version": None, "gpu_name": None}
+        return {"available": False, "driver_version": None, "gpu_name": None, "backend": bk}
     try:
         out = subprocess.run(
             [
@@ -461,16 +583,16 @@ def detect_cuda() -> dict[str, Any]:
         )
     except (subprocess.SubprocessError, OSError) as exc:
         logger.debug("nvidia-smi exec failed: %s", exc)
-        return {"available": False, "driver_version": None, "gpu_name": None}
+        return {"available": False, "driver_version": None, "gpu_name": None, "backend": bk}
     if out.returncode != 0:
-        return {"available": False, "driver_version": None, "gpu_name": None}
+        return {"available": False, "driver_version": None, "gpu_name": None, "backend": bk}
     line = (out.stdout or "").strip().splitlines()
     if not line:
-        return {"available": False, "driver_version": None, "gpu_name": None}
+        return {"available": False, "driver_version": None, "gpu_name": None, "backend": bk}
     parts = [p.strip() for p in line[0].split(",", 1)]
     driver = parts[0] if parts else None
     name = parts[1] if len(parts) > 1 else None
-    return {"available": True, "driver_version": driver, "gpu_name": name}
+    return {"available": True, "driver_version": driver, "gpu_name": name, "backend": bk}
 
 
 def current_runtime() -> dict[str, Any]:
@@ -493,12 +615,22 @@ def current_runtime() -> dict[str, Any]:
     # 检测「pip 装的包」与「进程里已 import 的 native 模块」不一致 —— onnxruntime
     # 是 C extension，pip 卸装重装不会热替换已 import 的 .pyd，必须重启才换 EP。
     #
+    # 当前后端的 GPU EP 名：DCU→MIGraphXExecutionProvider，其余→CUDAExecutionProvider。
+    # 下面的 cuda_available 与「装了 CPU 包却还有加速 EP」判定都锚定它，不再硬编码。
+    gpu_provider = _gpu_ep_name()
+
     # 判定只看「装的包类型 ↔ 进程里实际加载的 EP」，**不比版本号字符串**：
     # onnxruntime-directml 的 dist 版本（如 1.24.4）与它内部捆绑的 onnxruntime 核心
     # 版本（ort.__version__，如 1.27.0）是两条独立版本线、天然不相等；比版本号会让
     # DirectML 用户永久误报「需重启」，重启多少次都消不掉。EP 一致性才是可靠信号，
     # 也正是本功能的目的（让 EP 切换生效）。
-    _ACCEL_EPS = ("CUDAExecutionProvider", "DmlExecutionProvider")
+    #
+    # 加速 EP 集合按后端拼：DCU 上把 MIGraphX 也算进去，这样「从 DTK 配套 onnxruntime
+    # 换成 PyPI CPU 包但没重启」同样能被识别成 restart_required。CUDA EP 保留在集合里
+    # （DCU 上它永远不会出现，留着无副作用，且 NVIDIA 路径逐字节不变）。
+    _ACCEL_EPS = tuple(dict.fromkeys(
+        ["CUDAExecutionProvider", "DmlExecutionProvider", gpu_provider]
+    ))
     restart_required = False
     if installed_pkg is not None and process_version is not None:
         if installed_pkg == GPU_PACKAGE and "CUDAExecutionProvider" not in providers:
@@ -527,8 +659,17 @@ def current_runtime() -> dict[str, Any]:
         "installed": installed_pkg,
         "version": installed_ver or process_version,
         "providers": providers,
-        "cuda_available": "CUDAExecutionProvider" in providers,
+        # 语义已放宽成「**当前后端的** GPU EP 可用」（DCU 上 = MIGraphX EP）。key 名
+        # 保持 cuda_available 不改：前端 / cli.py / tools/diagnose_onnx_gpu.py 都在读它，
+        # 改名的收益（名字更准）远小于同步改动的代价。实际 EP 名见 gpu_provider。
+        "cuda_available": gpu_provider in providers,
         "directml_available": "DmlExecutionProvider" in providers,
+        # 当前后端期望的 GPU EP 名（DCU=MIGraphX，其余=CUDA）。UI 用它把「CUDA」
+        # 字样换成实际 EP 名，避免在 DCU 上显示 CUDA 误导用户。
+        "gpu_provider": gpu_provider,
+        # 后端标识 + 面向用户的厂商名（加法）。前端据此置灰不适用的装包按钮。
+        "backend": _backend(),
+        "vendor_label": _vendor_label(),
         # 平台标识：前端按平台 disable DirectML/GPU 按钮（DirectML 仅 Windows；
         # CUDA runtime wheel 仅 Linux 有；CPU 全平台可用）
         "platform": sys.platform,
@@ -577,6 +718,21 @@ def _pip(args: list[str], *, mirror: str = "") -> tuple[int, str]:
     return out.returncode, text
 
 
+def _dcu_migraphx_active() -> bool:
+    """DCU 上当前进程是否已有可用的 MIGraphX EP（= DTK 配套 onnxruntime 装好了）。
+
+    是「装包会不会造成破坏」的判据，不是能力查询：为 True 时任何 pip 装包都会先
+    ``uninstall onnxruntime``（三个互斥包同名），把镜像里那个自带 MIGraphX EP 的
+    DTK build 卸掉，再从 PyPI 装回一个纯 CPU build —— GPU 打标能力就这么没了，
+    而且 pip 装不回来（DTK wheel 不在 PyPI 上）。
+    """
+    try:
+        import onnxruntime as ort  # type: ignore[import-not-found]  # noqa: PLC0415
+        return "MIGraphXExecutionProvider" in ort.get_available_providers()
+    except Exception:  # noqa: BLE001  未装 / import 失败都算「没有可保护的东西」
+        return False
+
+
 def _decide_target(target: str) -> str:
     """auto/gpu/cpu/directml → 实际包名（带版本约束）。
 
@@ -587,7 +743,12 @@ def _decide_target(target: str) -> str:
     - Windows + GPU → DirectML（绕开 CUDA dlopen 问题，跨厂商）
     - Linux + GPU → onnxruntime-gpu（native CUDA EP 最优），版本约束按 torch major
     - 无 GPU → CPU 包
+
+    **DCU 上 gpu 目标抛 RuntimeError、auto 落到 CPU 包** —— 决策理由见
+    :func:`_decide_target_dcu`。
     """
+    if _backend() == "dcu":
+        return _decide_target_dcu(target)
     if target == "gpu":
         return _gpu_version_spec_for(_resolve_cuda_major())
     if target == "cpu":
@@ -601,6 +762,49 @@ def _decide_target(target: str) -> str:
                 return f"{DIRECTML_PACKAGE}{DIRECTML_VERSION_SPEC}"
             return _gpu_version_spec_for(_resolve_cuda_major())
         return f"{CPU_PACKAGE}{CPU_VERSION_SPEC}"
+    raise ValueError(f"非法 target: {target!r}（应为 auto/gpu/cpu/directml）")
+
+
+def _decide_target_dcu(target: str) -> str:
+    """DCU 上的目标决策：``gpu`` 拒绝、``auto`` / ``cpu`` 给 CPU 包、``directml`` 拒绝。
+
+    **为什么 gpu 拒绝而不是静默降 CPU**：``onnxruntime-gpu`` 是 CUDA build，装到
+    DCU 上 import 期就 dlopen 挂 libcudart，而且它与 CPU 包**同名互斥** —— 装它等于
+    先把能用的包卸掉，再换一个 import 不起来的，打标功能直接归零（比降 CPU 更糟）。
+    静默降 CPU 也不行：用户明确点了「装 GPU 版」，给他一个 CPU 包却报成功，他会一直
+    以为打标在跑 GPU、然后困惑于为什么这么慢。抛错 + 说清「GPU 打标要从 DTK 渠道装
+    配套 onnxruntime」才是能让他真正解决问题的信息。
+
+    **为什么 auto 给 CPU 包而不是拒绝**：``auto`` 的语义是「你别管，给我一个能用的」，
+    它同时是 UI 上的主按钮和 ``cli.py`` 启动期缺包时的建议路径 —— 必须**永远能产出一个
+    可用状态**。DCU 上唯一能靠 pip 拿到的可用包就是 CPU 版；装上后打标能跑（慢但可用），
+    这比「点了主按钮报错、功能完全不可用」好。上层 UI 同时显示「GPU 打标需从 DTK 渠道
+    装配套 onnxruntime」，用户想要 GPU 有明确的下一步。
+
+    ``directml`` 同样拒绝：DirectML 是 Windows DX12 后端，DCU 只有 Linux。
+    """
+    if target == "cpu":
+        return f"{CPU_PACKAGE}{CPU_VERSION_SPEC}"
+    if target == "auto":
+        return f"{CPU_PACKAGE}{CPU_VERSION_SPEC}"
+    if target == "gpu":
+        raise RuntimeError(
+            f"当前后端是 {_vendor_label()}，不能安装 onnxruntime-gpu。\n"
+            "onnxruntime-gpu 是 NVIDIA CUDA build（链接 libcudart / libcudnn），"
+            "在 DCU 上 import 就会失败；而且它与 CPU 版 onnxruntime 同名互斥，"
+            "装它会先把当前能用的包卸掉 —— 结果是打标功能完全不可用。\n"
+            "DCU 上要用 GPU 打标，需从 DTK 渠道安装海光配套的 onnxruntime"
+            "（自带 MIGraphXExecutionProvider，PyPI 上没有这个 build）：\n"
+            "  1. 从光合开发者社区 / DTK 配套仓库取与镜像 DTK 版本匹配的 onnxruntime 包\n"
+            "  2. pip install 该包（装完重启 Studio，C extension 不能热替换）\n"
+            "  3. 本页会自动识别 MIGraphX EP 并显示为 GPU 可用\n"
+            "只想先把打标跑起来的话，点「自动检测」装 CPU 版即可（慢但可用）。"
+        )
+    if target == "directml":
+        raise RuntimeError(
+            f"当前后端是 {_vendor_label()}，不能安装 onnxruntime-directml。"
+            "DirectML 是 Windows 上的 DX12 后端，DCU 只有 Linux 环境。"
+        )
     raise ValueError(f"非法 target: {target!r}（应为 auto/gpu/cpu/directml）")
 
 
@@ -629,13 +833,28 @@ def _install_cuda_runtime_wheels(major: Optional[int] = None) -> dict[str, Any]:
     **回滚本次刚装的包**（保持 venv 不被污染）。
 
     cuDNN 单独处理：原本就有就不动（避免撞 torch 锁的版本）；没有才补。
+
+    DCU 上整段跳过（``backend_skip=True``）：这些 ``nvidia-*`` wheel 与 DCU 毫无关系，
+    装进去只是白占几个 GB 磁盘 + 污染 venv。实际走不到这里（DCU 的 gpu 目标已被
+    _decide_target_dcu 拒掉、CPU 路径本就不调本函数），保留这道判断是防御性的
+    —— 万一将来有别的调用点，不该在 DCU 上偷偷装 NVIDIA 包。
     """
+    if _backend() == "dcu":
+        return {
+            "installed": [],
+            "skipped": [],
+            "platform_skip": False,
+            "backend_skip": True,
+            "cuda_major": None,
+            "stdout": "non-nvidia backend; skip nvidia cuda runtime wheels",
+        }
     if not sys.platform.startswith("linux"):
         # Windows / macOS：nvidia CUDA runtime wheel 不可用；用户应靠系统 CUDA Toolkit
         return {
             "installed": [],
             "skipped": [],
             "platform_skip": True,
+            "backend_skip": False,
             "cuda_major": major,
             "stdout": "non-linux platform; skip nvidia cuda runtime wheels",
         }
@@ -660,6 +879,7 @@ def _install_cuda_runtime_wheels(major: Optional[int] = None) -> dict[str, Any]:
             "installed": [],
             "skipped": skipped,
             "platform_skip": False,
+            "backend_skip": False,
             "cuda_major": major,
             "stdout": "all CUDA runtime wheels already present",
         }
@@ -679,6 +899,7 @@ def _install_cuda_runtime_wheels(major: Optional[int] = None) -> dict[str, Any]:
         "installed": targets,
         "skipped": skipped,
         "platform_skip": False,
+        "backend_skip": False,
         "cuda_major": major,
         "stdout": out,
     }
@@ -696,7 +917,24 @@ def install_runtime(target: str = "auto") -> dict[str, Any]:
     **重要**：onnxruntime 是 C extension，pip 卸装重装后**当前进程**里已 import 的
     .pyd/.so 不会被热替换 —— 必须重启 Studio 才能切换 EP。所以本函数不再尝试 reload；
     返回 `restart_required=True` 让 UI 提示用户重启。
+
+    DCU 上：``gpu`` / ``directml`` 目标被 _decide_target_dcu 拒掉（抛 RuntimeError）；
+    已装 DTK 配套 onnxruntime 时**任何**装包请求都被拒（见下方护栏）。
     """
+    # 护栏：DCU 上已经有可用的 MIGraphX EP 时，绝不能走 pip —— 第一步 uninstall 就会
+    # 把镜像/DTK 装的那个包卸掉（三个互斥包与它同名），然后从 PyPI 换回一个纯 CPU
+    # build，GPU 打标能力永久丢失且 pip 装不回来（DTK wheel 不在 PyPI 上），只能重建
+    # 容器。这与 accelerator.should_manage_torch_install() 保护 DTK torch 是同一类问题。
+    if _backend() == "dcu" and _dcu_migraphx_active():
+        raise RuntimeError(
+            f"当前已装 DTK 配套的 onnxruntime（MIGraphXExecutionProvider 可用），"
+            f"{_vendor_label()} 上不执行任何 pip 装包。\n"
+            "onnxruntime / onnxruntime-gpu / onnxruntime-directml 三个包与它**同名互斥**，"
+            "装包第一步的 pip uninstall 会把它卸掉，之后只能从 PyPI 装回纯 CPU build"
+            "（DTK wheel 不在 PyPI 上，pip 装不回来，只能重建容器）。\n"
+            "当前状态就是 DCU 上的最佳状态，不需要任何操作。"
+        )
+
     spec = _decide_target(target)
     rc1, log1 = _pip(["uninstall", "-y", *_MUTUALLY_EXCLUSIVE_PACKAGES])
     rc2, log2 = _pip(["install", "--upgrade", spec])

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import types
 from pathlib import Path
 from typing import Any
 
@@ -295,17 +296,30 @@ def test_test_pytest_failure_short_circuits(
 
 
 class _FakeTorchVersion:
-    def __init__(self, cuda):
+    def __init__(self, cuda, hip=None):
         self.cuda = cuda
+        # 必须显式存在：`utils.accelerator.detect()` 判定顺序是 hip 优先，读不到这个
+        # 属性会抛 AttributeError 被兜底 except 吞掉，整段探测静默降级（ADR 0016）。
+        self.hip = hip
 
 
 class _FakeTorch:
-    """最小 torch 替身：cuda.is_available / get_device_name + version.cuda + __version__。"""
-    def __init__(self, *, available: bool, cuda_build, version: str = "2.5.0", device_name: str = "RTX 5090"):
+    """最小 torch 替身，覆盖 `utils.accelerator.detect()` 实际读取的全部接口。
+
+    `_check_torch_cuda()` 自 ADR 0016 起不再自己读 `torch.version.*`，而是走
+    `accelerator.detect()`。那个函数除了 `is_available()` / `get_device_name()`
+    还会调 `device_count()` 与 `get_device_properties()` 拿卡数与 gfx 架构 ——
+    替身缺这两个方法时异常被兜底 except 吞掉，`device_names` 留空，断言里的卡名
+    就变成 `?`。所以替身要跟着那个函数的真实读取面走，不能只喂旧接口。
+
+    `hip=` 传值即模拟海光 DTK wheel（同时 `cuda_build=None`、版本串带 dtk 后缀）。
+    """
+    def __init__(self, *, available: bool, cuda_build, version: str = "2.5.0",
+                 device_name: str = "RTX 5090", hip=None, gcn_arch=None):
         self._available = available
         self._device_name = device_name
         self.__version__ = version
-        self.version = _FakeTorchVersion(cuda_build)
+        self.version = _FakeTorchVersion(cuda_build, hip)
         # 简化 cuda 命名空间
         outer = self
         class _Cuda:
@@ -315,12 +329,31 @@ class _FakeTorch:
             @staticmethod
             def get_device_name(_idx):
                 return outer._device_name
+            @staticmethod
+            def device_count():
+                return 1 if outer._available else 0
+            @staticmethod
+            def get_device_properties(_idx):
+                # gcnArchName 只在 HIP build 上存在；NVIDIA 侧不设这个属性，
+                # 让 accelerator 的 getattr(..., None) 走到与真实 wheel 一致的分支。
+                props = types.SimpleNamespace(total_memory=8 * 1024 ** 3)
+                if gcn_arch:
+                    props.gcnArchName = gcn_arch
+                return props
         self.cuda = _Cuda()
 
 
 def _install_fake_torch(monkeypatch: pytest.MonkeyPatch, torch_module) -> None:
-    """把 _FakeTorch 注入 sys.modules，让 `_check_torch_cuda` 内部 `import torch` 拿到它。"""
+    """把 _FakeTorch 注入 sys.modules，让 `accelerator.detect()` 拿到它。
+
+    同时清 `utils.accelerator` 的进程内后端缓存：`detect()` 刻意缓存结果（生产环境
+    torch build 在进程生命周期内不变），不清则**第二个用例开始**看到的是上一个用例
+    的 fake（或宿主机真实后端），断言全部错位。用 monkeypatch.setattr 而非直接赋值，
+    保证用例结束自动复原、不泄漏给别的测试文件。
+    """
     import sys as _sys
+    from utils import accelerator as _accel
+    monkeypatch.setattr(_accel, "_CACHE", None)
     monkeypatch.setitem(_sys.modules, "torch", torch_module)
 
 
@@ -420,6 +453,61 @@ def test_check_torch_cuda_warns_on_cuda_build_but_unavailable(
     assert "is_available()=False" in out.err
     # 该路径不应给出 pip install 重装建议（torch 装得没问题，是驱动 / WSL 问题）
     assert "pip install torch" not in out.err
+
+
+def test_check_torch_cuda_ok_on_dcu(
+    monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """海光 DTK wheel + 设备可用 → 一行 OK，带卡名与 HIP 版本，无 stderr。
+
+    DTK wheel 的特征组合：`version.cuda is None` + `version.hip` 有值 +
+    版本串带本地标签。历史 bug 正是在这个组合上把 DCU 判成 CPU-only 误装
+    （见 ADR 0016），所以这条要把「不误判」钉死。
+    """
+    _install_fake_torch(
+        monkeypatch,
+        _FakeTorch(
+            available=True, cuda_build=None, hip="6.3.42134-abc",
+            version="2.9.0+das.dtk2604", device_name="Hygon BW1000",
+            gcn_arch="gfx928",
+        ),
+    )
+    cli._check_torch_cuda()
+    out = capsys.readouterr()
+    assert "Hygon BW1000" in out.out
+    assert "6.3.42134-abc" in out.out          # HIP 版本是排错第一手信息
+    assert "gfx928" in out.out
+    assert out.err == ""
+    # 绝不能把 DCU 说成 CPU-only（那会连带弹重装建议）
+    assert "CPU-only" not in out.out
+
+
+def test_check_torch_cuda_dcu_unavailable_never_suggests_cuda_reinstall(
+    monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """DTK wheel 但设备不可用 → DCU 专属排错，**绝不**建议 pip 重装 torch。
+
+    这是本次移植最危险的回归点：DTK torch 由厂商镜像预装、不在 PyPI 上，任何
+    `pip install torch` 都会把它换成 CPU / NVIDIA 版，环境不可逆报废（用户只能
+    重建容器）。所以这里断言的重点是**输出里没有**那些命令，而不只是有没有提示。
+    """
+    _install_fake_torch(
+        monkeypatch,
+        _FakeTorch(
+            available=False, cuda_build=None, hip="6.3.42134-abc",
+            version="2.9.0+das.dtk2604",
+        ),
+    )
+    cli._check_torch_cuda()
+    out = capsys.readouterr()
+    assert "is_available()=False" in out.err
+    # DCU 特有的真实原因：容器没挂设备节点是最常见的一种
+    assert "/dev/kfd" in out.err
+    # 破坏性建议的三种写法都不许出现
+    assert "pip install torch" not in out.err
+    assert "pip uninstall" not in out.err
+    assert "download.pytorch.org" not in out.err
+    assert "cu128" not in out.err
 
 
 # ---------------------------------------------------------------------------

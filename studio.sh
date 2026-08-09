@@ -16,6 +16,8 @@
 #                     Tags: cu128 cu126 cu124 cu118 cpu
 #                     Use this on CPU-only rentals when you want GPU torch pre-installed
 #                     for a later GPU machine.  Example: ./studio.sh --torch=cu128
+#                     REFUSED on Hygon DCU boxes (DTK torch ships inside the vendor
+#                     image and cannot be reinstalled with pip).
 #
 #   subcommand: run (default) | dev | build | test
 #
@@ -39,6 +41,29 @@
 # NOTE: shell echo messages are kept in plain ASCII/English so non-UTF-8
 #       locales don't render them as garbled bytes. Python-side messages are
 #       UTF-8 (PYTHONUTF8=1 / PYTHONIOENCODING=utf-8 below).
+#
+# HYGON DCU (DTK) NOTE -- the single most destructive failure mode of this
+# script on a DCU box, and how it is prevented:
+#
+#   The DTK build of torch/torchvision ships INSIDE the vendor container image
+#   (e.g. pytorch:2.9.0-ubuntu22.04-dtk26.04-py3.11). Those wheels do not exist
+#   on PyPI and are tied to the DTK runtime in the image. A plain
+#   `pip install -r requirements.txt` sees `torch>=2.0.0`, pulls the PyPI CPU
+#   wheel, and overwrites them -- unrecoverable via pip, the user has to rebuild
+#   the container.
+#
+#   Two things go wrong independently, so we fix both:
+#     1. `python -m venv venv` hides system site-packages by default, so the
+#        pre-installed DTK torch is invisible inside venv/ and pip happily
+#        "installs the missing torch". -> create the venv with
+#        --system-site-packages on DCU.
+#     2. Even with torch visible, a transitive dep resolution could still try to
+#        touch torch/torchvision. -> feed pip a filtered requirements copy with
+#        those two lines removed (_prepare_requirements below).
+#
+#   Backend detection is asked of tools/select_torch_index.py --backend, which
+#   forwards to utils/accelerator.py (single source of truth for the repo).
+#   NVIDIA / CPU paths are unchanged: same commands, same order, same output.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR" || { echo "studio.sh: cannot cd to $SCRIPT_DIR" >&2; exit 1; }
@@ -50,6 +75,12 @@ cd "$SCRIPT_DIR" || { echo "studio.sh: cannot cd to $SCRIPT_DIR" >&2; exit 1; }
 # when stdin is a TTY so CI / piped invocations don't hang.
 _pause_if_tty_on_error() {
     local rc=$?
+    # Drop the filtered requirements temp file (DCU only; see
+    # _prepare_requirements). Done in the trap rather than inline so every exit
+    # path is covered, including the setup-time `exit 1`s.
+    if [ -n "$_REQ_FILTERED" ]; then
+        rm -f "$_REQ_FILTERED"
+    fi
     # 130 = SIGINT (Ctrl+C), 143 = SIGTERM — user wanted to kill, don't make
     # them press Enter to dismiss.
     if [ "$rc" -eq 0 ] || [ "$rc" -eq 130 ] || [ "$rc" -eq 143 ]; then
@@ -84,6 +115,54 @@ done
 
 _TENCENT="https://mirrors.cloud.tencent.com/pypi/simple/"
 _REQ_MARKER="venv/.studio-requirements.sha256"
+
+# Accelerator backend: cuda | dcu | cpu. Empty until _detect_backend runs.
+_BACKEND=""
+# Path of the filtered requirements temp file, if one was generated (DCU only).
+_REQ_FILTERED=""
+
+_detect_backend() {
+    # Usage: _detect_backend <python>
+    # Memoized: probing runs nvidia-smi / hy-smi, so only pay for it on the paths
+    # that actually install packages (fresh venv, stale dep sync). The plain
+    # launch path must stay as fast as before.
+    [ -n "$_BACKEND" ] && return 0
+    _BACKEND="$("$1" tools/select_torch_index.py --backend 2>/dev/null || true)"
+    # Empty means the helper itself failed (missing file / broken interpreter).
+    # Assume cuda: that is the pre-DCU behaviour of this script, so a broken
+    # probe degrades to "exactly what we did before" instead of something new.
+    [ -z "$_BACKEND" ] && _BACKEND="cuda"
+    [ "$_BACKEND" = "dcu" ] && echo "[studio] setup: Hygon DCU (DTK) detected; PyTorch is managed by the container image, not by pip"
+    return 0
+}
+
+_prepare_requirements() {
+    # Sets _REQ_ARG to the requirements file pip should be given.
+    # cuda / cpu: requirements.txt unchanged.
+    # dcu: a filtered copy under tmp/ with the torch + torchvision lines dropped,
+    #      because those two are pre-installed DTK wheels that pip must never
+    #      touch (see the HYGON DCU NOTE at the top of this file).
+    # requirements.txt itself is NEVER rewritten -- it stays the correct
+    # constraint set for NVIDIA users, and check_requirements_changed.py hashes
+    # the original file (torch being unmanaged on DCU is intentional, so the
+    # marker should keep tracking upstream edits to the real file).
+    # Sets a global instead of echoing, so the temp path is visible to the EXIT
+    # trap that removes it (a $(...) subshell assignment would be lost).
+    _REQ_ARG="requirements.txt"
+    [ "$_BACKEND" != "dcu" ] && return 0
+    if [ -z "$_REQ_FILTERED" ]; then
+        mkdir -p tmp
+        _REQ_FILTERED="tmp/requirements.dcu.txt"
+        # Anchor on the line start and require a version-spec / EOL right after
+        # the name: a bare `^torch` prefix match would also eat `torchsde`,
+        # which is a pure-Python package that we DO need from PyPI.
+        grep -Ev '^[[:space:]]*(torch|torchvision)[[:space:]]*([<>=!~;[].*)?$' \
+            requirements.txt > "$_REQ_FILTERED" || true
+        echo "[studio] setup: torch/torchvision removed from the pip requirement list (image-provided DTK wheels)"
+    fi
+    _REQ_ARG="$_REQ_FILTERED"
+    return 0
+}
 
 _pip_install() {
     # Usage: _pip_install [pip args...]
@@ -146,8 +225,30 @@ else
         echo "studio.sh: no Python 3.10+ found on PATH (need one of python3.10/3.11/3.12/3.13)" >&2
         exit 1
     fi
+    # Probe with the bootstrap interpreter: the venv does not exist yet, and the
+    # helper is stdlib-only so any Python can run it.
+    _detect_backend "$BOOTSTRAP_PY"
+
+    if [ "$_BACKEND" = "dcu" ] && [ -n "$_TORCH_TAG" ]; then
+        echo "studio.sh: --torch=$_TORCH_TAG is not supported on Hygon DCU." >&2
+        echo "  The DTK build of torch is pre-installed in the container image and is not" >&2
+        echo "  published on PyPI. Installing a PyPI wheel would replace it with a CPU or" >&2
+        echo "  NVIDIA build and break the environment beyond pip repair (container rebuild" >&2
+        echo "  required). To change torch version, use a container image with the DTK" >&2
+        echo "  version you want." >&2
+        exit 1
+    fi
+
+    _VENV_ARGS=()
+    if [ "$_BACKEND" = "dcu" ]; then
+        # Without this the pre-installed DTK torch is invisible inside venv/ and
+        # pip would "helpfully" install the PyPI CPU wheel over it. This is the
+        # main reason DCU needs a different venv creation call at all.
+        _VENV_ARGS+=(--system-site-packages)
+        echo "[studio] setup: creating venv with --system-site-packages so the image's DTK torch stays visible"
+    fi
     echo "[studio] No venv found. Creating venv/ via $BOOTSTRAP_PY ..."
-    "$BOOTSTRAP_PY" -m venv venv || { echo "studio.sh: failed to create venv" >&2; exit 1; }
+    "$BOOTSTRAP_PY" -m venv "${_VENV_ARGS[@]}" venv || { echo "studio.sh: failed to create venv" >&2; exit 1; }
     PYTHON="venv/bin/python"
 
     _pip_install --upgrade pip || { echo "studio.sh: failed to upgrade pip" >&2; exit 1; }
@@ -157,7 +258,12 @@ else
     # installing torch from PyTorch's CUDA index FIRST, the requirements.txt
     # constraint is already satisfied and pip won't replace it.
     # --torch=<tag> overrides auto-detection (useful on CPU-only rentals).
-    if [ -n "$_TORCH_TAG" ]; then
+    #
+    # On DCU this whole step is skipped: select_torch_index.py prints nothing
+    # there by design, and --torch was already rejected above.
+    if [ "$_BACKEND" = "dcu" ]; then
+        echo "[studio] setup: skipping torch install (DTK torch comes from the container image)"
+    elif [ -n "$_TORCH_TAG" ]; then
         _TORCH_INDEX="https://download.pytorch.org/whl/$_TORCH_TAG"
         echo "[studio] setup: --torch=$_TORCH_TAG specified; installing torch from $_TORCH_INDEX"
         if ! _pip_install torch torchvision --index-url "$_TORCH_INDEX"; then
@@ -176,7 +282,8 @@ else
 
     if [ -f requirements.txt ]; then
         echo "[studio] Installing Python dependencies..."
-        _pip_install -r requirements.txt || { echo "studio.sh: pip install failed" >&2; exit 1; }
+        _prepare_requirements
+        _pip_install -r "$_REQ_ARG" || { echo "studio.sh: pip install failed" >&2; exit 1; }
     else
         echo "studio.sh: requirements.txt not found, skipping dependency install" >&2
     fi
@@ -190,7 +297,13 @@ fi
 _STALE="$("$PYTHON" tools/check_requirements_changed.py --marker "$_REQ_MARKER" 2>/dev/null || echo missing)"
 if [ "$_STALE" = "stale" ]; then
     echo "[studio] requirements.txt changed since last sync; installing new deps (no upgrade)..."
-    if _pip_install -r requirements.txt; then
+    # Backend probe happens here (not at script start) so the normal launch path
+    # pays no smi call. On DCU this is what keeps a dep sync from overwriting the
+    # image's DTK torch -- the marker is also stale on every OLD venv that
+    # predates this check, so this path is hit on real DCU upgrades too.
+    _detect_backend "$PYTHON"
+    _prepare_requirements
+    if _pip_install -r "$_REQ_ARG"; then
         "$PYTHON" tools/check_requirements_changed.py --marker "$_REQ_MARKER" --update-marker >/dev/null 2>&1 || true
         echo "[studio] dep sync complete"
     else

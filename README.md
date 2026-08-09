@@ -26,7 +26,7 @@
 
 ## 快速开始
 
-**先决条件**（需自备）：NVIDIA GPU + CUDA · Python 3.10+ · Node.js 18+ · Git。
+**先决条件**（需自备）：NVIDIA GPU + CUDA（或海光 DCU + DTK，见[硬件要求](#硬件要求)）· Python 3.10+ · Node.js 18+ · Git。
 
 ```bash
 git clone https://github.com/WalkingMeatAxolotl/AnimaLoraStudio
@@ -35,17 +35,50 @@ studio.bat          # Windows
 ./studio.sh         # Linux / macOS
 ```
 
-首次运行自动建 `venv/` → 按 GPU 驱动装对应 CUDA torch → 构建前端 → 起后端 → 开浏览器到 <http://127.0.0.1:8765/>，并弹引导 modal 一键装 Anima 入门套件。打开后去 **设置 → 训练** 的模型下载中心按模型族下载权重（默认落 `./models/`）。
+首次运行自动建 `venv/` → 按 GPU 驱动装对应 CUDA torch（海光 DCU 上跳过，用镜像预装的 DTK torch）→ 构建前端 → 起后端 → 开浏览器到 <http://127.0.0.1:8765/>，并弹引导 modal 一键装 Anima 入门套件。打开后去 **设置 → 训练** 的模型下载中心按模型族下载权重（默认落 `./models/`）。
 
 → 完整步骤（启动选项 / 模型下载 / 国内镜像 / 流水线 walkthrough）见 **[上手教程](docs/user-guide/getting-started.md)**。
 
 ## 硬件要求
 
-- **GPU**：NVIDIA（A 卡 / Apple Silicon 不支持），按模型族分档：
+- **GPU**：NVIDIA 或**海光 DCU**（AMD Radeon / Apple Silicon 不支持），按模型族分档：
   - **Anima**：**16 GB+ 显存推荐**（RTX 4060Ti 16G / 4070Ti / 4080 / 3090 / 4090 / 5090 等）；**8 GB 极限可跑**（需关 sample 输出 + 减小 batch / 分辨率，速度明显下降）。
   - **Krea 2**（12.9B）：**训练**用官方 fp8 底模 24 GB 级可跑，bf16 底模需 32 GB；**出图**用 fp8 底模 16 GB 起（「省显存」档），bf16 底模建议 32 GB。开 **Block 交换**（fp8 底模换出全部层）：**训练**下探到 **12 GB**（整卡约 10 GB，16 GB 更从容），**出图**下探到 **8 GB**（1024² 整卡约 6.3 GB），代价是速度约慢 4% 与相应的内存占用。
 - **RAM**：16 GB+；Krea 2 建议 32 GB+（加载 26.3 GB 单文件权重时内存峰值约等于文件大小）；开 Block 交换按换出层数额外常驻（fp8 底模全换出约 11 GB）
 - **存储**：SSD 强烈推荐（latent cache + sample 输出 IO 频繁）；Krea 2 权重体积大（Raw / Turbo bf16 各 26.3 GB、官方 fp8 各 13.1 GB、文本编码器 5.2–8.9 GB），预留磁盘空间
+
+### 海光 DCU
+
+DTK 是 ROCm 分支，训练链路与 NVIDIA 共用同一套代码（`torch.cuda.*` 经 HIP 映射），
+显存档位参照上面的分档。已在 `pytorch:2.9.0-ubuntu22.04-dtk26.04-py3.11` 镜像 + BW1000 验证。
+
+与 NVIDIA 的差异：
+
+- **PyTorch 由镜像预装，不要用 pip 重装**。DTK wheel 不在 PyPI 上，`pip install torch`
+  会把它换成 CPU 版、环境报废且装不回来。Studio 已自动拦住这条路（Settings 的重装按钮
+  置灰、`--torch=<tag>` 拒绝、首装不碰 torch），但手动执行 pip 时请自己注意。
+- **加速库从光合开发者社区装，不走 pip 自动安装**。flash-attn 与 xformers 海光都有配套
+  wheel，但**必须与镜像的 DTK 版本和 torch 版本都对齐**（文件名形如
+  `flash_attn-2.8.3+das.opt1.dtk2604.torch251-cp311-cp311-manylinux_2_28_x86_64.whl`）。
+  手动 `pip install <wheel 路径>` 后重启即自动识别，无需改设置。
+- **不装加速库也能训练**，attention 退到 PyTorch SDPA 的 math 后端（启动期自动探测并
+  关掉不可用的后端）。代价是更慢、长序列更吃显存。装上 flash-attn 后自动恢复快路径，
+  无需改配置。
+- 已验证组合：`pytorch:2.5.1-ubuntu22.04-dtk26.04-py3.11` + BW1000（64GB×2）+
+  flash-attn 2.6.1 + xformers 0.0.33（均为 `+das.opt1.dtk2604.torch251` 配套版本）。
+  该组合下 bf16 训练、fp8 底模、block swap、flash attention、NaViT 打包全部可用。
+- **NaViT 打包需要 xformers**（依赖其块对角 varlen 内核）。装了海光配套 xformers 即可用；
+  没装就关掉它，改用 ARB 分桶路径（功能等价、速度略低）。
+- **打标默认跑 CPU**。onnxruntime 的 GPU EP 在 DCU 上是 MIGraphX，需装 DTK 配套包。
+
+环境自查：
+
+```bash
+python tools/probe_accelerator.py    # 后端识别、设备信息、fp8 / SDPA / block swap 实测
+bash tools/find_flash_attn.sh        # 找本机有没有现成的 flash-attn 包 / .so
+```
+
+详见 [ADR 0016](docs/adr/0016-dual-accelerator-backend-hygon-dcu.md)。
 
 ## 文档
 

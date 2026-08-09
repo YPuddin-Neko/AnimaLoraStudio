@@ -154,17 +154,18 @@ def _log_vram_watermark(stage: str, *, peak_label: str = "") -> None:
             peak = torch.cuda.max_memory_allocated() / 1e9
             line += f" | {peak_label}峰值={peak:.1f}GB"
             torch.cuda.reset_peak_memory_stats()
-        try:
-            import pynvml
+        # 全卡已用量：走 accelerator（按后端选 NVML / torch mem_get_info）。
+        # 原实现直接 import pynvml —— NVIDIA 专有，海光 DCU 上 nvmlInit() 必失败，
+        # 于是这一栏在 DCU 上永远缺失（不崩，但少了判断「这张卡够不够」的关键读数）。
+        # 委托给单一权威源后两个后端都有数：DCU 走 torch mem_get_info，Linux 上它
+        # 本就是全卡口径。查询失败仍静默省略该栏，不阻塞训练。
+        from utils.accelerator import device_stats
 
-            pynvml.nvmlInit()
-            try:
-                info = pynvml.nvmlDeviceGetMemoryInfo(
-                    pynvml.nvmlDeviceGetHandleByIndex(0))
-                line += f" 全卡={info.used / 1e9:.1f}GB"
-            finally:
-                pynvml.nvmlShutdown()
-        except Exception:
+        try:
+            stats = device_stats()
+            if stats:
+                line += f" 全卡={stats[0].vram_used_gb:.1f}GB"
+        except Exception:  # noqa: BLE001  日志不阻塞训练
             pass
         logger.info(line)
     except Exception:

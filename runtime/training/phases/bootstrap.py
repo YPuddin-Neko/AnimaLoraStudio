@@ -62,6 +62,54 @@ def _maybe_apply_pause_snapshot(args, resume_state_path: Path) -> None:
         args.sample_prompts = sp
 
 
+def _check_navit_prerequisites(args) -> None:
+    """NaViT 打包需要**可用的** xformers —— 启动期 fail-fast，不留到 forward 才炸。
+
+    NaViT 走块对角 varlen 注意力，实现依赖 xformers 的 ``BlockDiagonalMask``
+    （``modeling/anima/cosmos_predict2_modeling.py`` 的 ``torch_attention_op``）。
+    schema 侧已把 ``attention_backend`` 钉成 ``xformers``，但那只保证配置自洽，
+    **不保证包真的装了且能调用**：
+
+    - 没装 xformers → ``set_attention_backend("xformers")`` 静默返回 ``"none"``，
+      模型照常加载，直到第一个 step 进 attention 才抛 RuntimeError。用户此时
+      已经等完了权重加载 + latent 缓存，白等好几分钟。
+    - 海光 DCU 上 xformers **根本装不了**（官方只发 CUDA wheel），所以 DCU 用户
+      无论如何都要关掉 NaViT。给他们看「装 xformers」的建议是误导，要单独给文案。
+
+    SDPA 不是可行替代：它只吃 dense 加性 mask，块对角在 SDPA 上要展开成
+    ``[B, 1, S, S]`` 的 O(S²) 张量，正好抵消打包省下来的算力与显存
+    （token_budget=16384 时单个 mask 就是几百 MB），且会把 SDPA 顶到 math 后端。
+    """
+    if not bool(getattr(args, "navit_packing", False)):
+        return
+    try:
+        import xformers.ops  # noqa: F401
+        return
+    except Exception as exc:  # noqa: BLE001  未装 / ABI 不匹配 / import 期崩都算不可用
+        reason = f"{type(exc).__name__}: {exc}"
+
+    from utils.accelerator import detect
+
+    info = detect()
+    if info.backend == "dcu":
+        # 注意措辞：DCU 上 xformers **不是装不上**（海光在光合社区发布配套 wheel，
+        # 与 DTK / torch 版本严格配套），只是不能靠 pip 自动装。早期版本这里写的是
+        # 「装不上、请关掉 navit」，会让本来能用的用户白白放弃功能。
+        raise RuntimeError(
+            f"navit_packing=True 需要 xformers 的块对角 varlen 内核，但当前 import 失败。\n"
+            f"  当前后端 {info.vendor_label}：公开源上没有 DCU 版 xformers，需从光合开发者"
+            f"社区取与镜像 DTK / torch 版本匹配的 wheel 手动 pip install\n"
+            f"  （文件名形如 xformers-0.0.33+das.opt1.dtk2604.torch251-py3-none-any.whl）。\n"
+            f"  不想装就关掉 navit_packing，改用 ARB 分桶路径（功能等价、速度略低）。\n"
+            f"  底层原因：{reason}"
+        )
+    raise RuntimeError(
+        f"navit_packing=True 需要 xformers，但当前 import 失败。\n"
+        f"  请安装（设置 → 训练 → xformers 一键装），或关闭 navit_packing。\n"
+        f"  底层原因：{reason}"
+    )
+
+
 def _resolve_sample_seed(args) -> None:
     """sample_seed=0 → 训练开始时随机抽一次写回 args，并 log。
 
@@ -164,8 +212,23 @@ def run(ctx: TrainingContext) -> None:
     np.random.seed(args.seed)
 
     _resolve_sample_seed(args)
+    _check_navit_prerequisites(args)
 
-    ctx.device = "cuda" if torch.cuda.is_available() else "cpu"
+    # HIP build（海光 DCU）上同样是 "cuda" —— ROCm 把 CUDA 设备 API 整套复用，
+    # 写 "hip" 会 RuntimeError。判定收敛在 utils.accelerator（单一权威源），
+    # 这里不要改回自己读 torch.version.*。
+    from utils.accelerator import configure_sdpa, detect as _detect_accelerator
+
+    ctx.device = _detect_accelerator().torch_device
+
+    # 关掉本机实测不可用的 SDPA 后端。**必须在任何 forward 之前**，且必须在
+    # ctx.device 定好之后（探测要真跑一次小 SDPA，需要设备就绪）。
+    #
+    # 为什么训练启动期就得做：海光 DTK 的 torch 开着 flash 后端但 kernel 在外部
+    # flash_attn_2_cuda*.so 里，包没装时 SDPA 的默认 dispatch 会先试 flash、抛
+    # RuntimeError 且**不回落** —— 也就是第一个 attention 就崩。见 configure_sdpa()。
+    # NVIDIA 上本调用只做探测、不改任何开关。
+    configure_sdpa()
     if args.mixed_precision == "bf16":
         ctx.dtype = torch.bfloat16
     elif args.mixed_precision == "fp16":

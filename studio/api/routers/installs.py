@@ -19,6 +19,13 @@
 
 合一 router 而非 5 router：路由数少（每域 2）+ 共用 install 模式 / 共享
 restart_required 语义，单独 router 太碎。前端 Settings 页也是装在一个抽屉里。
+
+**后端能力透出**：前四个域的 GET / POST 响应里都带一个 `accelerator` 块
+（`schemas.installs.accelerator_block()`），内含 backend / vendor_label / 各安装
+能力开关。**刻意不新增端点**：一来 `tests/_snapshots/studio_routes.json` 是路由
+快照，加端点必然失配；二来前端本来就在这四个 section 各拉一次 status，把后端信息
+搭车带回去比多一次请求好。前端据此置灰不适用的按钮 —— 但那只是体验优化，真正的
+拦截在各 service 的 install() 里（同样问 utils.accelerator）。
 """
 from __future__ import annotations
 
@@ -32,6 +39,8 @@ from ..schemas.installs import (
     LLMModelsRefreshRequest,
     TorchReinstallRequest,
     WD14InstallRequest,
+    accelerator_block,
+    merge_accelerator_block,
 )
 from ... import secrets
 from ...domain.errors import DomainError, ValidationError
@@ -51,9 +60,16 @@ router = APIRouter()
 
 @router.get("/api/wd14/runtime")
 def wd14_runtime() -> dict[str, Any]:
-    """返回 onnxruntime 当前装的是哪个包 + 可用 EP + nvidia-smi 检测结果。"""
+    """返回 onnxruntime 当前装的是哪个包 + 可用 EP + GPU 硬件检测 + 后端能力。
+
+    `cuda_detect` 在 DCU 上走 hy-smi / rocm-smi（service 内部按后端分派），key 不变。
+    """
     rt = onnxruntime_setup.current_runtime()
-    return {**rt, "cuda_detect": onnxruntime_setup.detect_cuda()}
+    return {
+        **rt,
+        "cuda_detect": onnxruntime_setup.detect_cuda(),
+        "accelerator": accelerator_block(),
+    }
 
 
 @router.post("/api/wd14/install")
@@ -64,6 +80,10 @@ def wd14_install(body: WD14InstallRequest) -> dict[str, Any]:
     onnxruntime 是 C extension，装完后**必须重启 Studio** 才能切换 EP（pip 卸装
     重装不能热替换已 import 的 .pyd/.so）。返回 `restart_required=True` 让前端
     显式提示。
+
+    DCU 上 service 层会拒绝 `gpu` / `directml`（CUDA / DX12 build），以及「已装 DTK
+    配套 onnxruntime 时的任何装包」（pip 会把它卸掉且装不回来）—— 都走下面那条
+    RuntimeError → 500，message 里带完整原因与下一步。
     """
     if body.target not in ("auto", "gpu", "cpu", "directml"):
         raise ValidationError(
@@ -83,6 +103,7 @@ def wd14_install(body: WD14InstallRequest) -> dict[str, Any]:
         **res,
         **rt,
         "cuda_detect": onnxruntime_setup.detect_cuda(),
+        "accelerator": accelerator_block(),
         "stdout_tail": tail,
     }
 
@@ -96,8 +117,16 @@ def torch_status() -> dict[str, Any]:
 
     UI 用 `is_cpu_with_gpu` 决定是否显著提示「检测到 GPU 但装的是 CPU 版」。
     `is_cuda_build_unavailable` 标志驱动 / WSL 问题（不是 pip 能修的，UI 给文档链接）。
+
+    `accelerator` 块在这里尤其关键：DCU 上 `capabilities.manage_torch_install=False`，
+    前端必须据此置灰「重装 PyTorch」—— DTK torch 由镜像预装，pip 覆盖会直接报废
+    环境且装不回来（见 utils.accelerator.should_manage_torch_install）。
+    torch service 自己已经会带一份 `accelerator`（AcceleratorInfo.as_dict()）以及
+    `can_manage_torch_install` / `manage_disabled_reason` / `is_backend_unavailable`。
+    这里只把 `capabilities` 子对象补进去（`merge_accelerator_block`），让四个域的
+    `accelerator` **形状一致** —— 前端一个 TS 类型吃全部端点，不必按端点分叉。
     """
-    return torch_setup.current_status()
+    return merge_accelerator_block(torch_setup.current_status())
 
 
 @router.post("/api/torch/reinstall")
@@ -143,6 +172,10 @@ def flash_attn_status() -> dict[str, Any]:
     任何意外异常都包成 fetch_error 返回 200 —— 这是 Settings 页 mount 就拉的诊断
     数据，宁可降级显示「无法拉候选」也不要 500 把整段 UI 打成「加载失败」让用户
     误以为后端坏了。真出问题靠 server log 里的 traceback 排查。
+
+    DCU 上 `env.supports_prebuilt_wheels=False`、candidates 恒为空且 fetch_error
+    为 null（不是拉取失败，UI 不该显示网络排错文案）；前端据此显示「此后端不支持
+    自动安装，需从 DTK 渠道装」。
     """
     try:
         status = flash_attention_setup.current_status()
@@ -152,7 +185,13 @@ def flash_attn_status() -> dict[str, Any]:
             {"url": c["url"], "name": c["name"], "notes": c["notes"], "usable": c["usable"]}
             for c in candidates[:20]
         ]
-        return {**status, "env": env, "candidates": slim, "fetch_error": fetch_error}
+        return {
+            **status,
+            "env": env,
+            "candidates": slim,
+            "fetch_error": fetch_error,
+            "accelerator": accelerator_block(),
+        }
     except Exception as exc:  # noqa: BLE001
         # logger.exception 把 traceback 落盘 + 带 trace_id（trace middleware bound）
         import logging  # noqa: PLC0415
@@ -169,9 +208,16 @@ def flash_attn_status() -> dict[str, Any]:
                 "torch_ver": None,
                 "torch_cuda_build": None,
                 "platform": None,
+                "backend": None,
+                "vendor_label": None,
+                "hip_ver": None,
+                # 兜底给 True：诊断挂掉时不该顺手把安装按钮永久置灰，用户至少还能
+                # 手动粘 URL 自救；真在 DCU 上点了，service 层的拦截会给明确报错。
+                "supports_prebuilt_wheels": True,
             },
             "candidates": [],
             "fetch_error": f"诊断失败：{type(exc).__name__}: {exc}",
+            "accelerator": accelerator_block(),
         }
 
 
@@ -193,12 +239,15 @@ def flash_attn_install(body: FlashAttnInstallRequest) -> dict[str, Any]:
 
 @router.get("/api/xformers/status")
 def xformers_status() -> dict[str, Any]:
-    """返回 xformers 安装状态。
+    """返回 xformers 安装状态 + 后端能力。
 
     比 flash_attention/status 简洁很多 —— xformers 走 PyPI 直装，不需要 GitHub
     候选 wheel 列表 / 环境检测细节（status 里 installed/version 已经够用）。
+
+    `accelerator.capabilities.xformers=False`（DCU）时前端置灰安装按钮并说明
+    「DCU 走 SDPA 是正常路径」——不是能力缺失，见 xformers service 的 install()。
     """
-    return xformers_setup.current_status()
+    return {**xformers_setup.current_status(), "accelerator": accelerator_block()}
 
 
 @router.post("/api/xformers/install")

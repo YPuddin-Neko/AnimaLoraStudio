@@ -12,6 +12,13 @@
   —— 不带 `--upgrade`；显式 reinstall 强制走指定 index-url
 - 驱动版本 → cu wheel 映射保守取「该驱动能跑的最高 cu」（NVIDIA 向下兼容文档）
 - timeout 30 分钟（torch + cuda 依赖 ~3 GB，慢网常见）
+
+**后端边界（海光 DCU 移植）**：本 service 的整套「卸装重装」能力**只对 NVIDIA
+成立**。海光 DTK 的 torch wheel 由厂商镜像预装、不在 PyPI 上，pip 覆盖会直接
+报废环境（装不回来，用户只能重建容器）。所以 DCU 上：`reinstall()` /
+`_decide_target_tag()` 抛 RuntimeError 拒绝执行，`current_status()` 回
+`can_manage_torch_install=False` 让 UI 置灰按钮。判定一律问
+`utils/accelerator.py`，不在本文件自己读 `torch.version.hip`。
 """
 from __future__ import annotations
 
@@ -24,6 +31,8 @@ import sysconfig
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from typing import Any, Optional
+
+from utils import accelerator
 
 from . import onnxruntime as onnxruntime_setup
 
@@ -45,6 +54,21 @@ _DRIVER_TO_BEST_CU: tuple[tuple[float, str], ...] = (
 
 PYPI_INDEX_BASE = "https://download.pytorch.org/whl"
 
+#: DCU 上 `cuda_build` 取这个值。DTK wheel 的 `torch.__version__` 形如
+#: `2.9.0+das.dtk2604`，既不是 `cu\d+` 也不是 `cpu`，用厂商工具链名标识最直白。
+#: 前端只用它做展示 / 高亮，重装按钮由 `can_manage_torch_install` 单独管。
+DTK_BUILD_TAG = "dtk"
+
+#: DCU 上拒绝重装时的说明。抽成常量供 `reinstall()` / `_decide_target_tag()` /
+#: `current_status()` 共用一份措辞（UI 和 CLI 看到的原因要一致）。
+DCU_REFUSE_REASON = (
+    "当前是海光 DCU (DTK) 环境，本项目不接管 PyTorch 安装。"
+    "DTK 版 torch 由厂商镜像预装，wheel 不在 PyPI 上，"
+    "任何 pip install/uninstall torch 都会把它替换成 PyPI 的 CPU 版或 NVIDIA 版，"
+    "环境会直接报废且无法用 pip 装回来（只能重建容器）。"
+    "要换 torch 版本请换用对应 DTK 版本的官方镜像。"
+)
+
 
 def _index_url_for(tag: str) -> Optional[str]:
     """`cu128` → `https://download.pytorch.org/whl/cu128`；`cpu` → 同；非法 → None。"""
@@ -53,8 +77,32 @@ def _index_url_for(tag: str) -> Optional[str]:
     return f"{PYPI_INDEX_BASE}/{tag}"
 
 
+def can_manage_torch_install() -> bool:
+    """本进程是否可以替用户装 / 重装 torch。`utils.accelerator` 策略的薄壳。
+
+    存在的唯一理由是**避免为了判后端而 import torch**：
+    `accelerator.should_manage_torch_install()` 内部走 `detect()` → `import torch`，
+    而本 service 的调用点（`pending_install.apply_pending` → `reinstall`）明确要求
+    「在任何 import torch 之前跑」—— Windows 上 torch 的 `.pyd` 一旦被本进程加载，
+    pip uninstall 就撞 `[WinError 5]` 并在 site-packages 留 `~orch` 僵尸目录
+    （见 `_cleanup_zombie_dirs` 与 `pending_install` 顶部注释）。
+
+    所以分两条路，都问 `utils/accelerator.py`，不自己判 `torch.version.hip`：
+    - torch 已在本进程 import 过 → 直接问权威 API（不产生新的 import 副作用）
+    - 还没 import → 用纯 stdlib 的 `probe_stdlib()`（跑 smi / 看 /dev/kfd）
+    """
+    if "torch" in sys.modules:
+        return accelerator.should_manage_torch_install()
+    return accelerator.probe_stdlib().backend != "dcu"
+
+
 def recommend_cu_tag(driver_version: Optional[str]) -> str:
-    """根据 NVIDIA 驱动版本返回推荐 cu tag；驱动太旧 / 没驱动 → 'cpu'。"""
+    """根据 NVIDIA 驱动版本返回推荐 cu tag；驱动太旧 / 没驱动 → 'cpu'。
+
+    **仅对 NVIDIA 有意义**：入参是 nvidia-smi 报的驱动版本，出参是 PyTorch 官方
+    CUDA wheel 的 index tag。DCU 上不要调它（调用方先过
+    :func:`can_manage_torch_install`），否则会给出「装 cpu wheel」这种破坏性建议。
+    """
     if not driver_version:
         return "cpu"
     try:
@@ -72,12 +120,32 @@ def detect_torch() -> dict[str, Any]:
 
     `cuda_build`：
     - 'cu128' / 'cu126' / 'cu124' / 'cu118' —— PyTorch CUDA wheel
-    - 'cpu' —— CPU-only wheel（torch.version.cuda is None）
+    - 'dtk' —— 海光 DTK wheel（HIP build，:data:`DTK_BUILD_TAG`）
+    - 'cpu' —— CPU-only wheel（既无 version.cuda 也无 version.hip）
     - None —— torch 未装
 
     `cuda_available` 表示 `torch.cuda.is_available()` —— 装了 CUDA wheel 也可能因驱动 /
-    WSL 问题为 False。
+    WSL 问题为 False。DCU 上这个名字照用（HIP build 复用整套 `torch.cuda` API），
+    False 通常意味着容器没挂 /dev/kfd 或 DTK 装得不全。
+
+    历史 bug：原实现只用 `re.search(r"\\+(cu\\d+|cpu)$", torch.__version__)` +
+    `torch.version.cuda is None` 判 build，DTK wheel（版本形如 `2.9.0+das.dtk2604`、
+    `version.cuda` 恒为 None）会被判成 `cuda_build='cpu'`，连带触发「检测到 GPU 但装了
+    CPU 版 torch」误报和「重装 cu128」这种对 DTK 环境**破坏性**的建议。现在后端一律
+    问 `utils/accelerator.py`。
+
+    新增字段（`backend` / `vendor_label` / `cuda_version` / `hip_version`）是加法，
+    原有 5 个 key 语义不变 —— 下游有 `/api/torch/status` 端点、cli.py、前端。
     """
+    # 先问后端（进程内缓存的权威事实），再补 dist-info 视角的安装状态。
+    info = accelerator.detect()
+    backend_fields: dict[str, Any] = {
+        "backend": info.backend,
+        "vendor_label": info.vendor_label,
+        "cuda_version": info.cuda_version,
+        "hip_version": info.hip_version,
+    }
+
     try:
         installed_version = _pkg_version("torch")
     except PackageNotFoundError:
@@ -87,6 +155,7 @@ def detect_torch() -> dict[str, Any]:
             "cuda_build": None,
             "cuda_available": False,
             "device_name": None,
+            **backend_fields,
         }
 
     cuda_build: Optional[str] = None
@@ -94,19 +163,25 @@ def detect_torch() -> dict[str, Any]:
     device_name: Optional[str] = None
     try:
         import torch  # type: ignore[import-not-found]  # noqa: PLC0415
-        # torch.__version__ 形如 "2.5.0+cu128" / "2.5.0+cpu" / "2.5.0"
-        m = re.search(r"\+(cu\d+|cpu)$", torch.__version__)
-        if m:
-            cuda_build = m.group(1)
+        if info.backend == "dcu":
+            cuda_build = DTK_BUILD_TAG
         else:
-            # 兼容旧 build 没 + 后缀的情况，靠 torch.version.cuda
-            cuda_v = getattr(torch.version, "cuda", None)
-            if cuda_v is None:
-                cuda_build = "cpu"
+            # 以下是 wheel tag 的**字符串推导**，不是后端判定（后端已由上面的
+            # accelerator.detect() 定了，DTK 走不到这里）。所以照旧读
+            # torch.version.cuda —— 逐字保持 NVIDIA 路径原有行为。
+            # torch.__version__ 形如 "2.5.0+cu128" / "2.5.0+cpu" / "2.5.0"
+            m = re.search(r"\+(cu\d+|cpu)$", torch.__version__)
+            if m:
+                cuda_build = m.group(1)
             else:
-                # cuda_v 形如 "12.8"；映射到 wheel tag
-                clean = cuda_v.replace(".", "")
-                cuda_build = f"cu{clean}"
+                # 兼容旧 build 没 + 后缀的情况，靠 torch.version.cuda
+                cuda_v = getattr(torch.version, "cuda", None)
+                if cuda_v is None:
+                    cuda_build = "cpu"
+                else:
+                    # cuda_v 形如 "12.8"；映射到 wheel tag
+                    clean = cuda_v.replace(".", "")
+                    cuda_build = f"cu{clean}"
         cuda_available = bool(torch.cuda.is_available())
         if cuda_available:
             try:
@@ -122,23 +197,58 @@ def detect_torch() -> dict[str, Any]:
         "cuda_build": cuda_build,
         "cuda_available": cuda_available,
         "device_name": device_name,
+        **backend_fields,
     }
 
 
 def current_status() -> dict[str, Any]:
-    """打包给 UI 用：torch 状态 + 驱动检测 + 推荐 cu tag。"""
+    """打包给 UI 用：torch 状态 + 驱动检测 + 推荐 cu tag + 诊断 flag。
+
+    两个误装诊断 flag（`is_cpu_with_gpu` / `is_cuda_build_unavailable`）语义是
+    **NVIDIA 口径**，DCU 上按后端 gate 掉恒为 False：
+
+    - `is_cpu_with_gpu` 的证据是 nvidia-smi 探到卡（`cuda_detect.available`），
+      DCU 机器上没有 nvidia-smi，本来就不会命中；显式 gate 是为了「同机既有 N 卡
+      又有 DCU」这种畸形环境不误报。
+    - `is_cuda_build_unavailable` 会命中：DTK build 的 `cuda_build='dtk'` 不在
+      `(None, 'cpu')` 里，容器忘挂 /dev/kfd 时 `cuda_available=False`。但它的 UI
+      文案是「NVIDIA 驱动 / WSL 问题」，对 DCU 是误导 —— 改由新增的
+      `is_backend_unavailable` 承接（后端中立），前端按 backend 选文案。
+
+    新增字段（加法，不动原有 key）：
+    - `can_manage_torch_install`：False 时 UI 必须置灰「重装 PyTorch」整段
+    - `manage_disabled_reason`：置灰原因（DCU 时为 :data:`DCU_REFUSE_REASON`）
+    - `is_backend_unavailable`：装了 GPU build 但设备不可用（后端中立版）
+    - `accelerator`：`AcceleratorInfo.as_dict()` 全量（卡名 / gfx arch / import_error）
+    """
     torch_state = detect_torch()
+    # 用 .get 而不是下标：detect_torch 的返回是公开 dict 契约，`backend` 是本次
+    # 新加的 key，替身实现 / 老调用方可能只给原来那 5 个。缺失时按可管理处理，
+    # 也就是保持 NVIDIA 既有行为不变。
+    manageable = torch_state.get("backend") != "dcu"
+
     cuda_detect = onnxruntime_setup.detect_cuda()
-    recommended = recommend_cu_tag(cuda_detect.get("driver_version"))
+    # DCU 上不问 recommend_cu_tag：它只懂 NVIDIA 驱动版本，会回 'cpu'，而 UI 若
+    # 照着它渲染就变成推荐用户装 CPU wheel —— 在 DTK 镜像上是破坏性操作。
+    # key 仍保留（前端 TorchStatus 类型要求非空），值走 'cpu' 且按钮已被置灰。
+    recommended = recommend_cu_tag(cuda_detect.get("driver_version")) if manageable else "cpu"
 
     # 误装诊断：装了 CPU wheel 但有 NVIDIA GPU → UI 应该显著提示
     is_cpu_with_gpu = (
-        torch_state["installed"]
+        manageable
+        and torch_state["installed"]
         and torch_state["cuda_build"] == "cpu"
         and cuda_detect["available"]
     )
     # 装了 CUDA wheel 但 cuda.is_available()=False → 驱动 / WSL 问题，不是 pip 能修的
     is_cuda_build_unavailable = (
+        manageable
+        and torch_state["installed"]
+        and torch_state["cuda_build"] not in (None, "cpu")
+        and not torch_state["cuda_available"]
+    )
+    # 后端中立版：DCU 上容器没挂 /dev/kfd 或 DTK 装不全也走这条
+    is_backend_unavailable = bool(
         torch_state["installed"]
         and torch_state["cuda_build"] not in (None, "cpu")
         and not torch_state["cuda_available"]
@@ -150,6 +260,10 @@ def current_status() -> dict[str, Any]:
         "recommended_cu_tag": recommended,
         "is_cpu_with_gpu": is_cpu_with_gpu,
         "is_cuda_build_unavailable": is_cuda_build_unavailable,
+        "is_backend_unavailable": is_backend_unavailable,
+        "can_manage_torch_install": manageable,
+        "manage_disabled_reason": None if manageable else DCU_REFUSE_REASON,
+        "accelerator": accelerator.detect().as_dict(),
     }
 
 
@@ -190,7 +304,12 @@ def _decide_target_tag(target: str) -> str:
     """auto / cu128 / cu126 / cu124 / cu118 / cpu → 实际 cu tag。
 
     'auto' → 用 nvidia-smi 推荐；其它直传。非法值抛 ValueError。
+    DCU 上抛 RuntimeError —— 这里是 `/api/torch/reinstall` 写 pending marker **之前**
+    的关卡，在这一步拒掉能保证 marker 根本不会落盘（不留一个下次启动就会破坏
+    环境的定时炸弹）。
     """
+    if not can_manage_torch_install():
+        raise RuntimeError(DCU_REFUSE_REASON)
     if target == "auto":
         return recommend_cu_tag(onnxruntime_setup.detect_cuda().get("driver_version"))
     if target in SUPPORTED_INDEX_TAGS:
@@ -243,7 +362,15 @@ def reinstall(target: str = "auto", stream: bool = False) -> dict[str, Any]:
     进程的 `/api/torch/reinstall` 端点里同步跑（那里只写 marker）。
 
     自愈：每次都先清 site-packages 里 `~*` 僵尸目录（之前失败留下的状态）。
+
+    **DCU 上直接抛 RuntimeError**（见 :data:`DCU_REFUSE_REASON`）。这里的 guard 是
+    最后一道：调用方（`/api/torch/reinstall` 的 `_decide_target_tag`、cli.py 的
+    `--torch`）都已各自拒过一次，但 `pending_install` 的 marker 是文件，可能是
+    换机器 / 手改 / 老版本留下的，落到 DCU 上执行就是不可逆破坏。
     """
+    if not can_manage_torch_install():
+        raise RuntimeError(DCU_REFUSE_REASON)
+
     tag = _decide_target_tag(target)
     index_url = _index_url_for(tag)
 

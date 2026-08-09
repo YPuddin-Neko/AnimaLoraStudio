@@ -3,8 +3,14 @@
 供 topbar 实时小组件按 2-3s 轮询使用。
 
 设计：
-    - pynvml 懒初始化一次；失败 (无 NVIDIA / 驱动缺失 / 库未装) 永久标记，
-      之后所有调用直接返回 gpu=None — 不重试、不刷日志。
+    - GPU 段委托 ``utils.accelerator.device_stats()``（单一权威源）：NVIDIA 走
+      NVML（利用率 / 温度齐全），海光 DCU 走 torch ``mem_get_info``（NVML 是
+      NVIDIA 专有，DCU 上根本 init 不了，只有显存拿得到）。本模块**不**自己判
+      后端、不自己碰 pynvml。
+    - 首次探测失败 (无加速器 / 驱动缺失 / 库未装) **永久标记**，之后直接返回
+      gpu=None — 不重试、不刷日志。这是 2-3s 轮询的热路径，而
+      ``device_stats()`` 自身无缓存、每次调用都会重试 NVML init，CPU 机器上放
+      任它跑就是每 2.5s 一次无谓的 init + 一行日志。
     - psutil 几乎不会失败；仍 try/except 兜底，让前端轮询不会因偶发问题挂掉。
     - 模块无状态导出，调用 collect_stats() 即可。
 """
@@ -17,6 +23,8 @@ from typing import Any, Callable, Optional
 
 import psutil
 
+from utils import accelerator
+
 logger = logging.getLogger(__name__)
 
 # psutil.cpu_percent(interval=None) 第一次调用返回 0.0 (无 baseline)，
@@ -25,32 +33,35 @@ logger = logging.getLogger(__name__)
 psutil.cpu_percent(interval=None)
 
 
-# ── NVML 懒初始化 ─────────────────────────────────────────────────────
-_nvml_lock = threading.Lock()
-_nvml_state: dict[str, Any] = {"inited": False, "ok": False}
-
-
-def _ensure_nvml() -> bool:
-    with _nvml_lock:
-        if _nvml_state["inited"]:
-            return _nvml_state["ok"]
-        _nvml_state["inited"] = True
-        try:
-            import pynvml  # type: ignore[import-untyped]
-            pynvml.nvmlInit()
-            _nvml_state["ok"] = True
-        except Exception as e:
-            _nvml_state["ok"] = False
-            logger.info("pynvml unavailable; GPU stats disabled (%s)", e)
-        return _nvml_state["ok"]
+# ── GPU 探测闩锁 ──────────────────────────────────────────────────────
+#: ``disabled`` 一旦置 True 就不再调 ``device_stats()``；``ever_ok`` 记录是否曾
+#: 成功过。两个字段而不是一个的原因：要区分「这台机器没有加速器」与「有卡但这
+#: 一拍查询抖了一下」。前者第一次就失败 → 永久关掉（CPU 机器不该每 2.5s 试一
+#: 次 NVML init 并刷日志，原 pynvml 实现刻意做了这件事，语义在此保留）；后者曾
+#: 经成功过 → 只是本拍返回 None，下一拍照常重试，不能因为一次抖动就让 GPU pill
+#: 永久消失。
+_probe_lock = threading.Lock()
+_probe_state: dict[str, Any] = {"disabled": False, "ever_ok": False}
 
 
 # ── 数据结构 ─────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class GpuStats:
+    """单卡快照。字段名与顺序即 API 的 JSON key 与顺序（``asdict`` 直出），
+    前端 ``api/client.ts`` 在消费——**只加不改**。
+
+    与 ``accelerator.DeviceStats`` 字段同名但**不复用**它：那是 utils 层的内部
+    结构，字段顺序不同（JSON key 顺序会变），且 API schema 该由 studio 层自己
+    拥有，免得 utils 的重构直接漏到前端契约上。
+
+    ``util_pct`` 可能为 None：DCU 上利用率要靠解析 hy-smi 文本，没有稳定的机器
+    可读接口，accelerator 侧当前不报（详 ``accelerator._torch_device_stats``）。
+    """
+
     index: int
     name: str
-    util_pct: int
+    #: 加速器利用率百分比；DCU 上暂为 None（前端需按可缺失渲染）
+    util_pct: Optional[int]
     vram_used_gb: float
     vram_total_gb: float
     temp_c: Optional[int] = None
@@ -61,7 +72,8 @@ class SystemStats:
     cpu_pct: float
     ram_used_gb: float
     ram_total_gb: float
-    # None = NVML 不可用；[] = NVML 可用但 0 卡 (前端两种都隐藏 GPU pill)
+    # None = 查不到加速器（无卡 / 驱动缺失 / torch 不可用）；[] = 后端可用但 0 卡
+    # (前端两种都隐藏 GPU pill)
     gpu: Optional[list[GpuStats]]
 
 
@@ -71,35 +83,43 @@ def _bytes_to_gb(n: int) -> float:
 
 
 def _collect_gpu() -> Optional[list[GpuStats]]:
-    if not _ensure_nvml():
+    """逐卡快照；查不到返回 None（前端隐藏 GPU pill），0 卡返回 []。
+
+    闩锁语义见 ``_probe_state``。``device_stats()`` 内部已把所有失败吃成 None，
+    所以这里只需处理三态映射；外层 try/except 只兜底真正意外的异常（例如
+    accelerator 自身抛了没预料到的东西），失败同样走闩锁判定。
+    """
+    if _probe_state["disabled"]:
         return None
     try:
-        import pynvml  # type: ignore[import-untyped]
-        count = pynvml.nvmlDeviceGetCount()
-        out: list[GpuStats] = []
-        for i in range(count):
-            h = pynvml.nvmlDeviceGetHandleByIndex(i)
-            name = pynvml.nvmlDeviceGetName(h)
-            if isinstance(name, bytes):
-                name = name.decode(errors="replace")
-            mem = pynvml.nvmlDeviceGetMemoryInfo(h)
-            util = pynvml.nvmlDeviceGetUtilizationRates(h)
-            try:
-                temp = pynvml.nvmlDeviceGetTemperature(h, pynvml.NVML_TEMPERATURE_GPU)
-            except Exception:
-                temp = None
-            out.append(GpuStats(
-                index=i,
-                name=name,
-                util_pct=int(util.gpu),
-                vram_used_gb=_bytes_to_gb(mem.used),
-                vram_total_gb=_bytes_to_gb(mem.total),
-                temp_c=int(temp) if temp is not None else None,
-            ))
-        return out
-    except Exception:
+        stats = accelerator.device_stats()
+    except Exception:  # noqa: BLE001  采集不该让轮询接口 500
         logger.exception("gpu stats collection failed")
+        stats = None
+
+    if stats is None:
+        # 只有「从未成功过」才永久关闭；日志一行，且靠锁保证只打一次。
+        with _probe_lock:
+            if not _probe_state["ever_ok"] and not _probe_state["disabled"]:
+                _probe_state["disabled"] = True
+                logger.info(
+                    "加速器指标不可用，GPU 监控已关闭（后端: %s）",
+                    accelerator.detect().vendor_label,
+                )
         return None
+
+    _probe_state["ever_ok"] = True
+    return [
+        GpuStats(
+            index=d.index,
+            name=d.name,
+            util_pct=d.util_pct,
+            vram_used_gb=d.vram_used_gb,
+            vram_total_gb=d.vram_total_gb,
+            temp_c=d.temp_c,
+        )
+        for d in stats
+    ]
 
 
 def collect_stats() -> SystemStats:

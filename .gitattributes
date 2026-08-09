@@ -10,3 +10,10 @@
 
 # PowerShell tolerates LF on modern Windows; keep normalization.
 *.ps1 text eol=crlf
+
+# Shell scripts must stay LF even in Windows working copies. A CRLF .sh copied
+# to Linux fails at the shebang: the kernel reads the interpreter as `bash\r`
+# and reports `/usr/bin/env: 'bash\r': No such file or directory` -- which
+# looks like a syntax error but is not. Hit for real when tools/*.sh were
+# copied from a Windows checkout into the DCU container.
+*.sh text eol=lf

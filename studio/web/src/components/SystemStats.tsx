@@ -101,12 +101,17 @@ export default function SystemStats() {
       />
       {gpu0 && (
         <>
-          <Pill
-            label="GPU"
-            value={`${gpu0.util_pct}%`}
-            pct={gpu0.util_pct}
-            tooltip={`GPU 利用率 · ${gpuLabel}`}
-          />
+          {/* 利用率可能拿不到（DCU 上后端不报，见 GpuStats.util_pct）——整个 pill
+              隐藏而不是显示 "null%" / "0%"。0% 是合法读数，不能拿来兜底缺失值。
+              VRAM pill 不受影响：显存在两个后端上都可靠。 */}
+          {gpu0.util_pct != null && (
+            <Pill
+              label="GPU"
+              value={`${gpu0.util_pct}%`}
+              pct={gpu0.util_pct}
+              tooltip={`GPU 利用率 · ${gpuLabel}`}
+            />
+          )}
           <Pill
             label="VRAM"
             value={fmtGb(gpu0.vram_used_gb, gpu0.vram_total_gb)}

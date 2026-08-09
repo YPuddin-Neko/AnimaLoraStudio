@@ -592,7 +592,7 @@ export function ONNXRuntimeSection() {
 
   const install = async (target: 'auto' | 'gpu' | 'cpu' | 'directml') => {
     const confirmKey = target === 'auto'
-      ? 'settings.confirmInstallOnnxAuto'
+      ? (isDcu ? 'settings.confirmInstallOnnxAutoDcu' : 'settings.confirmInstallOnnxAuto')
       : target === 'gpu'
         ? 'settings.confirmInstallOnnxGpu'
         : target === 'directml'
@@ -610,6 +610,9 @@ export function ONNXRuntimeSection() {
         installed: result.installed, version: result.version, providers: result.providers,
         cuda_available: result.cuda_available,
         directml_available: result.directml_available,
+        gpu_provider: result.gpu_provider,
+        backend: result.backend, vendor_label: result.vendor_label,
+        accelerator: result.accelerator,
         platform: result.platform,
         restart_required: result.restart_required,
         cuda_load_error: result.cuda_load_error, preload: result.preload, cuda_detect: result.cuda_detect,
@@ -629,18 +632,29 @@ export function ONNXRuntimeSection() {
   const notInstalled = !!rt && rt.installed === null
   const gpuAccel = !!rt && (rt.cuda_available || rt.directml_available)
   const isWindows = !rt || rt.platform === 'win32'
+  // 后端判定一律用 backend === 'dcu'（确定态）。'cpu' 是不确定态（torch 未装 /
+  // import 失败的 NVIDIA 机器也报 cpu），按它置灰会误伤首装流程。
+  const isDcu = rt?.backend === 'dcu'
+  const vendor = rt?.vendor_label ?? ''
+  // DCU 上 GPU EP 只能靠 DTK 配套 onnxruntime（PyPI 装不到）；已经装上了就别让
+  // 用户去点任何 pip 按钮 —— 那会把它卸掉且装不回来（后端也有同一道拦截）。
+  const dcuGpuReady = isDcu && rt?.cuda_available === true
   // mismatched: 装了某个包 + 有 GPU 但没用上任何加速 EP（CUDA 或 DirectML）。
   // 未装由 notInstalled 接管；已装且已经在用 DirectML 不算 mismatch。
   const mismatched = !!rt && rt.installed !== null && cuda.available && !gpuAccel
-  // 默认状态正常时整体折叠；未装 / 有错 / mismatch / 需重启时自动展开
+  // 默认状态正常时整体折叠；未装 / 有错 / mismatch / 需重启时自动展开。
+  // DCU 上 mismatched 恒真（有卡但只有 CPU EP 是那里的常态，GPU EP 要另外装），
+  // 不该把这个 section 永久钉在展开态 —— 该说的话由 dcu 专属提示一句带过。
   const hasIssue = !!error || (rt && (
-    notInstalled || !!rt.cuda_load_error || rt.restart_required || mismatched
+    notInstalled || !!rt.cuda_load_error || rt.restart_required || (mismatched && !isDcu)
   ))
 
-  // summary 里显示一行简短状态，用户不展开就能扫到
+  // summary 里显示一行简短状态，用户不展开就能扫到。EP 名按后端取（DCU 显示
+  // MIGraphX，不能硬编码 CUDA）。
+  const gpuEpShort = (rt?.gpu_provider ?? 'CUDAExecutionProvider').replace('ExecutionProvider', '')
   const epShort = !rt
     ? '?'
-    : rt.cuda_available ? 'CUDA' : rt.directml_available ? 'DirectML' : 'CPU'
+    : rt.cuda_available ? gpuEpShort : rt.directml_available ? 'DirectML' : 'CPU'
   const statusLabel = error
     ? `⚠ ${t('settings.statusLoadFailed')}`
     : !rt
@@ -651,7 +665,7 @@ export function ONNXRuntimeSection() {
           ? `⚠ ${t('settings.cudaLoadFailed')}`
           : rt.restart_required
             ? `⚠ ${t('settings.restartStudioRequired')}`
-            : mismatched
+            : mismatched && !isDcu
               ? `⚠ ${t('settings.gpuRunningCpuEp')}`
               : `${epShort} · ${rt.installed ?? '?'}`
   const statusOk = rt && !hasIssue
@@ -674,10 +688,12 @@ export function ONNXRuntimeSection() {
               <div className="flex items-center gap-2 flex-wrap">
                 <span className="text-fg-tertiary shrink-0">runtime:</span>
                 <code className="font-mono text-fg-primary">{rt.installed ?? t('settings.notInstalledParen')}{rt.version ? `==${rt.version}` : ''}</code>
-                <StatusLabel bg={gpuAccel ? 'bg-ok-soft' : 'bg-warn-soft'} fg={gpuAccel ? 'text-ok' : 'text-warn'} text={rt.cuda_available ? 'CUDA' : rt.directml_available ? 'DirectML' : 'CPU only'} />
+                <StatusLabel bg={gpuAccel ? 'bg-ok-soft' : 'bg-warn-soft'} fg={gpuAccel ? 'text-ok' : 'text-warn'} text={rt.cuda_available ? gpuEpShort : rt.directml_available ? 'DirectML' : 'CPU only'} />
               </div>
               <div className="text-fg-tertiary">EP: <code className="text-fg-secondary font-mono">{(rt.providers ?? []).map((p) => p.replace('ExecutionProvider', '')).join(' / ') || '(none)'}</code></div>
-              <div className="text-fg-tertiary">{t('settings.gpuDetect')}: <span className="text-fg-secondary">{cuda.available ? `${cuda.gpu_name ?? '?'} (driver ${cuda.driver_version ?? '?'})` : t('settings.noNvidiaGpu')}</span></div>
+              <div className="text-fg-tertiary">{t('settings.gpuDetect')}: <span className="text-fg-secondary">{cuda.available
+                ? `${cuda.gpu_name ?? '?'} (driver ${cuda.driver_version ?? '?'})`
+                : isDcu ? t('settings.noVendorGpu', { vendor }) : t('settings.noNvidiaGpu')}</span></div>
               {rt.torch_cuda_major != null && (
                 <div className="text-fg-tertiary">
                   {t('settings.torchCudaMajor')}: <span className="text-fg-secondary font-mono">{rt.torch_cuda_major}</span>
@@ -695,10 +711,25 @@ export function ONNXRuntimeSection() {
             )}
             {!rt.restart_required && notInstalled && (
               <div className="rounded-sm border border-info bg-info-soft px-2 py-1.5 text-info text-xs">
-                {cuda.available ? t('settings.onnxNotInstalledHintGpu') : t('settings.onnxNotInstalledHintCpu')}
+                {isDcu
+                  ? t('settings.onnxNotInstalledHintDcu', { vendor })
+                  : cuda.available ? t('settings.onnxNotInstalledHintGpu') : t('settings.onnxNotInstalledHintCpu')}
               </div>
             )}
-            {!rt.restart_required && mismatched && (
+            {/* DCU 上「有卡但只有 CPU EP」是常态而非故障：GPU EP（MIGraphX）只在 DTK
+                配套的 onnxruntime 里，PyPI 装不到。所以这里换成中性说明 + 明确的下一步，
+                而不是 NVIDIA 那条「展开候选装 DirectML / CUDA 版」（在 DCU 上全是死路）。 */}
+            {!rt.restart_required && isDcu && !rt.cuda_available && rt.installed !== null && (
+              <div className="rounded-sm border border-info bg-info-soft px-2 py-1.5 text-info text-xs">
+                {t('settings.onnxDcuCpuEpHint', { vendor })}
+              </div>
+            )}
+            {!rt.restart_required && dcuGpuReady && (
+              <div className="rounded-sm border border-ok bg-ok-soft px-2 py-1.5 text-ok text-xs">
+                {t('settings.onnxDcuGpuReady', { ep: gpuEpShort })}
+              </div>
+            )}
+            {!rt.restart_required && mismatched && !isDcu && (
               <div className="rounded-sm border border-info bg-info-soft px-2 py-1.5 text-info text-xs">
                 {t('settings.onnxCpuEpWarning')}
               </div>
@@ -713,7 +744,12 @@ export function ONNXRuntimeSection() {
             )}
 
             <div className="flex gap-1.5 items-center flex-wrap">
-              <button onClick={() => install('auto')} disabled={busy !== null} className="btn btn-primary btn-sm">
+              {/* dcuGpuReady 时禁用**全部**装包按钮：pip 的第一步 uninstall 会把 DTK
+                  配套包卸掉（三个互斥包与它同名），之后只能从 PyPI 装回纯 CPU build，
+                  GPU 打标能力永久丢失。后端 install_runtime() 有同一道拦截兜底。 */}
+              <button onClick={() => install('auto')} disabled={busy !== null || dcuGpuReady}
+                title={dcuGpuReady ? t('settings.onnxDcuAlreadyOptimal') : undefined}
+                className="btn btn-primary btn-sm">
                 {busy === 'auto' ? t('settings.installingPackage') : t('settings.autoDetectInstall')}
               </button>
               <button onClick={() => void refresh()} disabled={busy !== null} title={t('settings.refreshStatus')}
@@ -728,30 +764,36 @@ export function ONNXRuntimeSection() {
                 <div className="flex gap-1.5 items-center flex-wrap">
                   <button
                     onClick={() => install('directml')}
-                    disabled={busy !== null || !isWindows}
-                    title={isWindows ? t('settings.directmlPackageHint') : t('settings.directmlWinOnlyHint')}
+                    disabled={busy !== null || !isWindows || isDcu}
+                    title={isDcu
+                      ? t('settings.onnxDcuNoDirectml', { vendor })
+                      : isWindows ? t('settings.directmlPackageHint') : t('settings.directmlWinOnlyHint')}
                     className="btn btn-secondary btn-sm"
                   >
                     {busy === 'directml' ? t('settings.installingPackage') : t('settings.reinstallDirectml')}
                   </button>
+                  {/* onnxruntime-gpu 是 NVIDIA CUDA build：DCU 上装了 import 就挂，而且
+                      会把当前能用的包卸掉 → 打标彻底不可用。这里硬置灰，别让用户点。 */}
                   <button
                     onClick={() => install('gpu')}
-                    disabled={busy !== null}
-                    title={t('settings.cudaPackageHint')}
+                    disabled={busy !== null || isDcu}
+                    title={isDcu ? t('settings.onnxDcuNoGpuPackage', { vendor }) : t('settings.cudaPackageHint')}
                     className="btn btn-secondary btn-sm"
                   >
                     {busy === 'gpu' ? t('settings.installingPackage') : t('settings.reinstallGpu')}
                   </button>
                   <button
                     onClick={() => install('cpu')}
-                    disabled={busy !== null}
-                    title={t('settings.cpuPackageHint')}
+                    disabled={busy !== null || dcuGpuReady}
+                    title={dcuGpuReady ? t('settings.onnxDcuAlreadyOptimal') : t('settings.cpuPackageHint')}
                     className="btn btn-secondary btn-sm"
                   >
                     {busy === 'cpu' ? t('settings.installingPackage') : t('settings.reinstallCpu')}
                   </button>
                 </div>
-                <span className="text-[10px] text-fg-tertiary">{t('settings.onnxForceHint')}</span>
+                <span className="text-[10px] text-fg-tertiary">
+                  {isDcu ? t('settings.onnxForceHintDcu') : t('settings.onnxForceHint')}
+                </span>
               </div>
             )}
           </>
@@ -812,7 +854,20 @@ export function PyTorchSection() {
     }
   }
 
-  const hasIssue = !!error || (status && (status.is_cpu_with_gpu || status.is_cuda_build_unavailable || !status.installed))
+  // 后端判定用确定态 'dcu'；'cpu' 是不确定态（torch 未装 / import 失败也报 cpu），
+  // 拿它置灰会误伤 NVIDIA 首装流程。
+  const isDcu = status?.accelerator?.backend === 'dcu'
+  const vendor = status?.accelerator?.vendor_label ?? ''
+  // DTK torch 由厂商镜像预装、wheel 不在 PyPI 上：任何 pip install/uninstall torch
+  // 都会把它换成 CPU / NVIDIA 版，环境直接报废且装不回来（只能重建容器）。所以
+  // DCU 上整段重装 UI 必须置灰。判据取后端给的 can_manage_torch_install（单一权威源
+  // 是 utils/accelerator.py），缺字段时默认 true = 旧行为。
+  const canManage = status?.can_manage_torch_install ?? true
+  // DCU 上「装了 GPU build 但设备不可用」用后端中立的 is_backend_unavailable，
+  // 原 is_cuda_build_unavailable 的文案是 NVIDIA 驱动 / WSL 口径，对 DCU 是误导。
+  const backendUnavailable = status?.is_backend_unavailable
+    ?? status?.is_cuda_build_unavailable ?? false
+  const hasIssue = !!error || (status && (status.is_cpu_with_gpu || backendUnavailable || !status.installed))
   const statusOk = status?.cuda_available && !error
   const statusLabel = error
     ? t('settings.loadFailedShort')
@@ -823,9 +878,10 @@ export function PyTorchSection() {
         : status.is_cpu_with_gpu
           ? t('settings.cpuBuildMisinstalled')
           : !status.cuda_available && status.cuda_build !== 'cpu'
-            ? t('settings.cudaUnavailableDriver')
+            ? (isDcu ? t('settings.backendUnavailableShort') : t('settings.cudaUnavailableDriver'))
             : status.cuda_available
-              ? `CUDA ✓ ${status.cuda_build}`
+              // DCU 上不能显示 "CUDA ✓"：那会让用户以为装了 NVIDIA 版。显示厂商名。
+              ? `${isDcu ? vendor : 'CUDA'} ✓ ${status.cuda_build}`
               : `CPU ${status.cuda_build}`
 
   return (
@@ -857,11 +913,22 @@ export function PyTorchSection() {
             </div>
             <div className="flex gap-4 flex-wrap">
               <span className="text-fg-tertiary">
-                {t('settings.driverLabel')}:{' '}
+                {/* 驱动标签按厂商取：DCU 上写「NVIDIA 驱动」是错的，版本号也来自 hy-smi。 */}
+                {isDcu ? t('settings.driverOfVendor', { vendor }) : t('settings.driverLabel')}:{' '}
                 <code className="text-fg-secondary font-mono">
                   {status.cuda_detect.driver_version ?? t('settings.notDetected')}
                 </code>
               </span>
+              {isDcu && status.accelerator?.hip_version && (
+                <span className="text-fg-tertiary">
+                  HIP: <code className="text-fg-secondary font-mono">{status.accelerator.hip_version}</code>
+                </span>
+              )}
+              {isDcu && (status.accelerator?.gcn_arch?.length ?? 0) > 0 && (
+                <span className="text-fg-tertiary">
+                  arch: <code className="text-fg-secondary font-mono">{status.accelerator!.gcn_arch.join(' / ')}</code>
+                </span>
+              )}
               {status.cuda_detect.gpu_name && !status.cuda_available && (
                 <span className="text-fg-tertiary">
                   {t('settings.systemGpu')}:{' '}
@@ -882,17 +949,36 @@ export function PyTorchSection() {
             </div>
           )}
 
-          {/* CUDA build 但运行时不可用：驱动 / WSL 问题 */}
-          {status.is_cuda_build_unavailable && (
+          {/* GPU build 但运行时不可用。NVIDIA：驱动 / WSL 问题；DCU：容器多半没挂
+              /dev/kfd 或 DTK 装得不全 —— 两套文案完全不同，不能共用一条。 */}
+          {backendUnavailable && (
             <div className="rounded-sm border border-warn bg-warn-soft px-2 py-1.5 text-warn text-xs">
-              <Trans
-                i18nKey="settings.torchCudaUnavailableWarning"
-                components={{ code: <code className="font-mono" /> }}
-              />
+              {isDcu ? (
+                <Trans
+                  i18nKey="settings.torchDcuUnavailableWarning"
+                  values={{ vendor }}
+                  components={{ code: <code className="font-mono" /> }}
+                />
+              ) : (
+                <Trans
+                  i18nKey="settings.torchCudaUnavailableWarning"
+                  components={{ code: <code className="font-mono" /> }}
+                />
+              )}
             </div>
           )}
 
-          {/* 操作按钮 */}
+          {/* DCU：本项目不接管 torch 安装。原因用后端给的 manage_disabled_reason
+              （与 CLI 文案同一份措辞），不在前端再写一遍。 */}
+          {!canManage && (
+            <div className="rounded-sm border border-info bg-info-soft px-2 py-1.5 text-info text-xs">
+              {status.manage_disabled_reason ?? t('settings.torchManageDisabled', { vendor })}
+            </div>
+          )}
+
+          {/* 操作按钮。canManage=false（DCU）时整段重装 UI 不渲染 —— 置灰按钮还留在
+              那儿会让用户反复试着点；这里的正确交互是「这个功能在此环境不存在」。 */}
+          {canManage && (<>
           <div className="flex gap-1.5 items-center flex-wrap">
             <button
               onClick={() => void reinstall('auto')}
@@ -913,9 +999,18 @@ export function PyTorchSection() {
               {advancedOpen ? '▾' : '▸'} {t('settings.advancedManualCuda')}
             </button>
           </div>
+          </>)}
+          {/* 不接管安装时仍保留刷新入口：用户挂载了 /dev/kfd 重启容器后要能重新检测 */}
+          {!canManage && (
+            <div className="flex gap-1.5 items-center flex-wrap">
+              <button onClick={() => void refresh()} disabled={busy}
+                title={t('settings.refreshStatus')}
+                className="btn btn-secondary btn-sm">↻ {t('settings.refreshStatus')}</button>
+            </div>
+          )}
 
           {/* 手动选版本 */}
-          {advancedOpen && (
+          {canManage && advancedOpen && (
             <div className="flex flex-col gap-1.5 pt-2 border-t border-subtle text-xs">
               <p className="text-fg-tertiary m-0">
                 {t('settings.manualCudaHint')}
@@ -1002,9 +1097,18 @@ export function FlashAttentionSection() {
   const bestCandidate = usable[0] ?? null
   // CPU 版 torch 装不了 flash_attn —— UI 必须显著提示用户先去 PyTorch 那栏重装。
   // 否则用户只会看到「未找到 wheel」/「Internal Server Error」这种误导信息。
+  // 注意 DCU 上 torch_cuda_build 是 'dtk' 而非 'cpu'，不会误命中这条（那条提示
+  // 会让用户去 pip 覆盖 DTK torch = 报废环境）。
   const isCpuTorch = env?.torch_cuda_build === 'cpu'
-  const hasIssue = !!error || (status && !status.installed)
-  const canAutoInstall = !isCpuTorch && !!env?.torch_tag && !!env?.platform && usable.length > 0
+  // 本后端有没有可自动匹配的 prebuilt wheel。缺字段（老后端 / 诊断兜底）默认 true
+  // = 旧行为。DCU 上为 false：那套 wheel 全是 CUDA build，装了 import 必挂。
+  const supportsPrebuilt = env?.supports_prebuilt_wheels ?? true
+  const vendor = env?.vendor_label ?? status?.accelerator?.vendor_label ?? ''
+  // 不支持自动安装时不该把 section 钉在展开态：flash_attn 未装在 DCU 上是正常状态
+  // （要装得从 DTK 渠道手动装），不是待修复问题。
+  const hasIssue = !!error || (status && !status.installed && supportsPrebuilt)
+  const canAutoInstall = supportsPrebuilt && !isCpuTorch
+    && !!env?.torch_tag && !!env?.platform && usable.length > 0
 
   const statusLabel = error
     ? t('settings.loadFailedShort')
@@ -1040,21 +1144,34 @@ export function FlashAttentionSection() {
             </div>
             <div className="flex gap-4 flex-wrap">
               <span className="text-fg-tertiary">Python: <code className="text-fg-secondary font-mono">{env.python_tag}</code></span>
-              <span className="text-fg-tertiary">CUDA: <code className="text-fg-secondary font-mono">{env.cuda_tag ?? t('settings.notDetected')}</code></span>
+              {/* DCU 上没有 CUDA 版本可言，显示 HIP 版本才是对的信息 */}
+              {supportsPrebuilt ? (
+                <span className="text-fg-tertiary">CUDA: <code className="text-fg-secondary font-mono">{env.cuda_tag ?? t('settings.notDetected')}</code></span>
+              ) : (
+                <span className="text-fg-tertiary">HIP: <code className="text-fg-secondary font-mono">{env.hip_ver ?? t('settings.notDetected')}</code></span>
+              )}
               <span className="text-fg-tertiary">PyTorch: <code className="text-fg-secondary font-mono">{env.torch_tag ?? t('settings.notDetected')}</code></span>
               <span className="text-fg-tertiary">{t('settings.platform')}: <code className="text-fg-secondary font-mono">{env.platform ?? t('settings.unsupported')}</code></span>
             </div>
           </div>
 
+          {/* 后端不支持这条 wheel 供应链（DCU）：最优先显示，且屏蔽掉下面所有
+              CUDA 口径的提示 —— 那些在 DCU 上全是噪音甚至误导。 */}
+          {!supportsPrebuilt && (
+            <div className="rounded-sm border border-info bg-info-soft px-2 py-1.5 text-info text-xs">
+              {t('settings.flashAttnBackendUnsupported', { vendor })}
+            </div>
+          )}
+
           {/* CPU 版 torch：根本装不了 flash_attn，优先显示这条 */}
-          {isCpuTorch && (
+          {supportsPrebuilt && isCpuTorch && (
             <div className="rounded-sm border border-warn bg-warn-soft px-2 py-1.5 text-warn text-xs">
               {t('settings.flashAttnNeedsCudaTorch')}
             </div>
           )}
 
           {/* GitHub API 失败 */}
-          {!isCpuTorch && fetchError && (
+          {supportsPrebuilt && !isCpuTorch && fetchError && (
             <div className="rounded-sm border border-err bg-err-soft px-2 py-1.5 text-err text-xs">
               {t('settings.githubApiFailed')}
               <code className="block mt-0.5 break-all">{fetchError}</code>
@@ -1062,13 +1179,16 @@ export function FlashAttentionSection() {
           )}
 
           {/* 没匹配 wheel */}
-          {!isCpuTorch && !canAutoInstall && !fetchError && env.platform && env.torch_tag && (
+          {supportsPrebuilt && !isCpuTorch && !canAutoInstall && !fetchError && env.platform && env.torch_tag && (
             <div className="rounded-sm border border-warn bg-warn-soft px-2 py-1.5 text-warn text-xs">
               {t('settings.noWheelForPython', { python: env.python_tag })}
             </div>
           )}
 
-          {/* 操作按钮 */}
+          {/* 操作按钮。supportsPrebuilt=false 时整段安装 UI（含候选列表 / 手动 URL）
+              不渲染：那些入口在 DCU 上通向的都是 CUDA wheel，给了等于埋坑。上面的状态
+              卡照常显示 —— flash_attn 可能已经从 DTK 渠道装上了，用户要能看到版本。 */}
+          {supportsPrebuilt && (<>
           <div className="flex gap-1.5 items-center flex-wrap">
             <button
               onClick={() => void install(null)}
@@ -1087,9 +1207,17 @@ export function FlashAttentionSection() {
               {candidatesOpen ? '▾' : '▸'} {t('settings.candidateWheels', { n: usable.length })}
             </button>
           </div>
+          </>)}
+          {!supportsPrebuilt && (
+            <div className="flex gap-1.5 items-center flex-wrap">
+              <button onClick={() => void refresh()} disabled={busy}
+                title={t('settings.refreshStatus')}
+                className="btn btn-secondary btn-sm">↻ {t('settings.refreshStatus')}</button>
+            </div>
+          )}
 
           {/* 候选列表 + 手动 URL */}
-          {candidatesOpen && (
+          {supportsPrebuilt && candidatesOpen && (
             <div className="flex flex-col gap-2 pt-2 border-t border-subtle">
               {candidates.length === 0 ? (
                 <p className="text-xs text-fg-tertiary m-0">{t('settings.wheelQueryFailed')}</p>
@@ -1187,14 +1315,22 @@ export function XformersSection() {
     }
   }
 
+  // 后端判定用确定态 'dcu'。DCU 上 xformers 官方 wheel 不存在（只发 CUDA build），
+  // 但这**不是能力缺失**：那里 attention 走 PyTorch SDPA 就是正常路径，DTK 有对应
+  // HIP kernel。文案必须说清这点，否则用户会以为环境缺东西、反复折腾装包。
+  const isDcu = status?.accelerator?.backend === 'dcu'
+  const vendor = status?.accelerator?.vendor_label ?? ''
   const statusLabel = error
     ? t('settings.loadFailedShort')
     : !status
       ? t('settings.loadingStatus')
       : status.installed
         ? t('settings.installedVersion', { version: status.version ?? '?' })
-        : t('settings.notInstalledShort')
-  const statusOk = status?.installed && !error
+        : isDcu
+          // 「不适用」而非「未安装」：后者暗示用户该去装，在 DCU 上是错误引导
+          ? t('settings.notApplicableShort')
+          : t('settings.notInstalledShort')
+  const statusOk = (status?.installed || isDcu) && !error
   const hasIssue = !!error
 
   return (
@@ -1207,6 +1343,9 @@ export function XformersSection() {
           <p><Trans i18nKey="settings.xformersHelp1" components={{ strong: <strong />, code: <code /> }} /></p>
           <p>{t('settings.xformersHelp2')}</p>
           <p>{t('settings.xformersHelp3')}</p>
+          {/* 设置项说明一律进 ⓘ tooltip（docs/design/ui-info-design.md）；
+              DCU 专属那段也放这里，正文只留一条 banner + 置灰按钮。 */}
+          {isDcu && <p>{t('settings.xformersHelpDcu', { vendor })}</p>}
         </InfoButton>
         <span className={`ml-auto text-xs font-mono ${statusOk ? 'text-ok' : 'text-warn'}`}>{statusLabel}</span>
       </summary>
@@ -1224,10 +1363,17 @@ export function XformersSection() {
             {status.installed && <StatusLabel bg="bg-ok-soft" fg="text-ok" text={t('settings.installed')} />}
           </div>
 
+          {isDcu && (
+            <div className="rounded-sm border border-info bg-info-soft px-2 py-1.5 text-info text-xs">
+              {t('settings.xformersBackendUnsupported', { vendor })}
+            </div>
+          )}
+
           <div className="flex gap-2">
             <button
               onClick={() => void install()}
-              disabled={busy}
+              disabled={busy || isDcu}
+              title={isDcu ? t('settings.xformersDcuDisabledHint', { vendor }) : undefined}
               className="btn btn-primary btn-sm"
             >
               {busy

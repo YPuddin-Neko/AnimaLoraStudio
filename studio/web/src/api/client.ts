@@ -15,7 +15,12 @@ export interface HealthResponse {
 export interface GpuStats {
   index: number
   name: string
-  util_pct: number
+  /**
+   * 加速器利用率百分比。**可能为 null**：海光 DCU 上利用率要靠解析 hy-smi 文本
+   * （没有稳定的机器可读接口），后端当前不报；NVIDIA 走 NVML 恒有值。
+   * 渲染时按可缺失处理（与 temp_c 同）。
+   */
+  util_pct: number | null
   vram_used_gb: number
   vram_total_gb: number
   temp_c: number | null
@@ -25,7 +30,7 @@ export interface SystemStats {
   cpu_pct: number
   ram_used_gb: number
   ram_total_gb: number
-  /** null = NVML 不可用 (无 NVIDIA / 驱动缺失)；[] = NVML 可用但 0 卡。两种都不显示 GPU pill。 */
+  /** null = 查不到加速器 (无卡 / 驱动缺失 / torch 不可用)；[] = 后端可用但 0 卡。两种都不显示 GPU pill。 */
   gpu: GpuStats[] | null
 }
 
@@ -425,24 +430,82 @@ export interface CLTaggerConfig {
   batch_size: number
 }
 
+/** 加速器后端标识。'cuda' = NVIDIA、'dcu' = 海光 DCU (DTK/HIP)、'cpu' = 无加速器。
+ *  权威源是后端 `utils/accelerator.py`；前端只消费，不自己按版本串推断。 */
+export type AcceleratorBackend = 'cuda' | 'dcu' | 'cpu'
+
+/** 各装包能力开关。**前端置灰按钮时不要直接用这些 bool**，见下方说明。 */
+export interface AcceleratorCapabilities {
+  /** 本项目是否该替用户装 / 重装 torch。DCU 上 false（DTK torch 由镜像预装，
+   *  pip 覆盖会报废环境且装不回来）。PyTorch section 据此置灰整段重装 UI。 */
+  manage_torch_install: boolean
+  /** GitHub prebuilt flash_attn wheel 那条路是否可用（那些 wheel 是 CUDA build）。 */
+  prebuilt_flash_attn_wheels: boolean
+  /** xformers 是否可用（官方只发 CUDA wheel）。 */
+  xformers: boolean
+  /** 当前后端的 onnxruntime GPU EP 名；null = 没有 GPU EP，打标只能跑 CPU。 */
+  onnx_gpu_provider: string | null
+}
+
+/** 当前进程看到的加速器事实（后端 `AcceleratorInfo.as_dict()` + capabilities）。
+ *
+ *  **置灰按钮请判 `backend === 'dcu'`，不要判 capabilities 里的 bool**：那几个
+ *  bool 的语义是「确认可用」（只有 cuda 为 true），而 `cpu` 是**不确定态** ——
+ *  torch 还没装好 / import 失败的 NVIDIA 机器也报 cpu，那种机器历史上是能正常
+ *  用这些安装按钮的（首装流程就靠它）。按 capabilities 置灰会把它们一起关掉。 */
+export interface AcceleratorInfo {
+  backend: AcceleratorBackend
+  /** 面向用户的厂商名："NVIDIA CUDA" / "海光 DCU (DTK)" / "CPU"。文案里显示这个，
+   *  不要前端自己拼 —— 后端 VENDOR_LABEL 是唯一来源。 */
+  vendor_label: string
+  torch_version: string | null
+  /** torch.version.cuda（NVIDIA wheel 才有）。 */
+  cuda_version: string | null
+  /** torch.version.hip（DTK / ROCm wheel 才有）。 */
+  hip_version: string | null
+  /** torch.cuda.is_available()。DCU 上同样是这个 API（HIP 复用 CUDA 命名）。 */
+  available: boolean
+  device_count: number
+  device_names: string[]
+  /** HIP 侧 gcnArchName（如 gfx928）；NVIDIA 上为空数组。 */
+  gcn_arch: string[]
+  /** torch 装了但 import 失败时的原因（DLL / so 缺失等）。 */
+  import_error: string | null
+  capabilities: AcceleratorCapabilities
+}
+
 /** PR-S2 — PyTorch 安装状态 + 驱动检测 + 推荐 cu tag。 */
 export type TorchCuTag = 'cu128' | 'cu126' | 'cu124' | 'cu118' | 'cpu'
+/** torch build 标签：CUDA wheel 的 cuXXX / 'cpu'，或海光 DTK wheel 的 'dtk'。 */
+export type TorchBuildTag = TorchCuTag | 'dtk'
 export interface TorchStatus {
   installed: boolean
   version: string | null              // "2.5.0+cu128"
-  cuda_build: TorchCuTag | null       // 解析自 +suffix
+  cuda_build: TorchBuildTag | null    // 解析自 +suffix；DCU 上是 'dtk'
   cuda_available: boolean             // torch.cuda.is_available()
-  device_name: string | null          // "NVIDIA GeForce RTX 5090"
+  device_name: string | null          // "NVIDIA GeForce RTX 5090" / "Hygon BW1000"
   cuda_detect: {
     available: boolean
     driver_version: string | null
     gpu_name: string | null
+    /** 探针所属后端（DCU 上走 hy-smi / rocm-smi 而非 nvidia-smi）。 */
+    backend?: AcceleratorBackend
   }
-  recommended_cu_tag: TorchCuTag      // 按驱动版本推荐
-  /** 装了 CPU wheel 但有 NVIDIA GPU → 误装，UI 显示「重装为 CUDA 版」红色提示。 */
+  recommended_cu_tag: TorchCuTag      // 按驱动版本推荐；DCU 上无意义（勿显示）
+  /** 装了 CPU wheel 但有 NVIDIA GPU → 误装，UI 显示「重装为 CUDA 版」红色提示。
+   *  语义是 NVIDIA 口径，DCU 上后端已 gate 成恒 false。 */
   is_cpu_with_gpu: boolean
-  /** 装了 CUDA wheel 但 cuda.is_available()=False → 驱动 / WSL 问题，pip 修不了。 */
+  /** 装了 CUDA wheel 但 cuda.is_available()=False → 驱动 / WSL 问题，pip 修不了。
+   *  同为 NVIDIA 口径；后端中立版见 is_backend_unavailable。 */
   is_cuda_build_unavailable: boolean
+  /** 装了 GPU build 但设备不可用（后端中立）。DCU 上通常是容器没挂 /dev/kfd
+   *  或 DTK 装得不全 —— 文案要按 backend 选，别套用 NVIDIA 驱动那套。 */
+  is_backend_unavailable?: boolean
+  /** false → UI 必须置灰「重装 PyTorch」整段（DCU）。 */
+  can_manage_torch_install?: boolean
+  /** 置灰原因（人话，直接显示给用户）；可管理时为 null。 */
+  manage_disabled_reason?: string | null
+  accelerator?: AcceleratorInfo
 }
 /** torch reinstall 总是 deferred：server 写 marker，下次 launcher 启动时跑 pip。
  *  这样避开 Windows 上 torch .pyd 已被 server 进程加载、pip 无法 replace 的死锁。 */
@@ -464,9 +527,19 @@ export interface FlashAttnEnv {
   torch_tag: string | null           // torch2.5
   torch_ver: string | null
   /** 'cu128' / 'cu130' = CUDA 版 torch；'cpu' = CPU 版（装不了 flash_attn）；
-   *  null = torch 未装 / 检测失败。UI 用 'cpu' 触发「先重装 CUDA 版」提示。 */
+   *  'dtk' = 海光 DTK wheel（与 TorchStatus.cuda_build 同一套标签）；
+   *  null = torch 未装 / 检测失败。UI 用 'cpu' 触发「先重装 CUDA 版」提示 ——
+   *  注意 DCU 上是 'dtk' 而非 'cpu'，那条提示在 DTK 环境是破坏性误导。 */
   torch_cuda_build: string | null
   platform: 'linux_x86_64' | 'win_amd64' | null
+  /** 当前后端；null = 状态端点整体降级（诊断失败兜底）。 */
+  backend?: AcceleratorBackend | null
+  vendor_label?: string | null
+  /** DTK 的 HIP 版本；NVIDIA 上 null。仅展示排错用。 */
+  hip_ver?: string | null
+  /** false → 本后端没有可自动匹配的 prebuilt wheel（DCU）。candidates 恒为空且
+   *  fetch_error 为 null —— UI 要显示「需从 DTK 渠道装」而不是网络排错文案。 */
+  supports_prebuilt_wheels?: boolean
 }
 export interface FlashAttnCandidate {
   url: string
@@ -480,6 +553,7 @@ export interface FlashAttnStatus {
   env: FlashAttnEnv
   candidates: FlashAttnCandidate[]   // 按 score 降序，最多 20
   fetch_error: string | null         // GitHub API 限流 / 网络异常
+  accelerator?: AcceleratorInfo
 }
 export interface FlashAttnInstallResult {
   installed: boolean
@@ -489,14 +563,23 @@ export interface FlashAttnInstallResult {
   restart_required: boolean
 }
 
-/** onnxruntime 装包状态 + nvidia-smi 检测 + 平台标识（前端用来按平台 disable 按钮）。 */
+/** onnxruntime 装包状态 + GPU 硬件检测 + 平台标识（前端用来按平台 disable 按钮）。 */
 export interface WD14Runtime {
   installed: 'onnxruntime' | 'onnxruntime-gpu' | 'onnxruntime-directml' | null
   version: string | null
   providers: string[]
+  /** **语义是「当前后端的 GPU EP 可用」**，不只是 CUDA：DCU 上等价于
+   *  MIGraphXExecutionProvider 在 providers 里。key 名保持历史值不改（多处在读）；
+   *  想显示实际 EP 名用 gpu_provider。 */
   cuda_available: boolean
   /** DirectML EP 可用（Windows + 装了 onnxruntime-directml 时为 true）。 */
   directml_available: boolean
+  /** 当前后端期望的 GPU EP 名：'CUDAExecutionProvider' / 'MIGraphXExecutionProvider'。
+   *  UI 用它替掉硬编码的「CUDA」字样，避免在 DCU 上显示 CUDA 误导用户。 */
+  gpu_provider?: string | null
+  backend?: AcceleratorBackend
+  vendor_label?: string
+  accelerator?: AcceleratorInfo
   /** 后端 sys.platform：'win32' / 'linux' / 'darwin' 等。Settings UI 据此 disable
    *  跨平台不可用的按钮（DirectML 仅 Windows；GPU + nvidia-* wheel 仅 Linux 最优）。 */
   platform: string
@@ -514,6 +597,8 @@ export interface WD14Runtime {
   preload?: {
     applied: boolean
     platform_skip: boolean
+    /** 非 NVIDIA 后端（DCU）→ 整段跳过：nvidia/* 包不存在，DTK onnxruntime 也不需要。 */
+    backend_skip?: boolean
     preloaded: string[]
     errors: [string, string][]
     candidates: number
@@ -522,6 +607,8 @@ export interface WD14Runtime {
     available: boolean
     driver_version: string | null
     gpu_name: string | null
+    /** 探针所属后端（DCU 上走 hy-smi / rocm-smi 而非 nvidia-smi）。 */
+    backend?: AcceleratorBackend
   }
 }
 
@@ -536,6 +623,8 @@ export interface WD14InstallResult extends WD14Runtime {
     installed: string[]
     skipped: string[]
     platform_skip: boolean
+    /** 非 NVIDIA 后端（DCU）→ 跳过：这些 nvidia-* wheel 与 DCU 无关。 */
+    backend_skip?: boolean
     stdout?: string
     error?: string
   } | null
@@ -1641,6 +1730,9 @@ export interface DaemonStatus {
 export interface XformersStatus {
   installed: boolean
   version: string | null
+  /** DCU 上 capabilities.xformers=false（官方只发 CUDA wheel）→ UI 置灰安装按钮
+   *  并说明「走 SDPA 是正常路径」。 */
+  accelerator?: AcceleratorInfo
 }
 
 export interface XformersInstallResult {

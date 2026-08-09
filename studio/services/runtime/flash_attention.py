@@ -10,8 +10,16 @@ wheel 命名规律（mjun0812/flash-attention-prebuild-wheels）：
 - CUDA：精确 > 同大版本（cu132 → 接受 cu130，CUDA 小版本向下兼容）
 - Python：必须精确（cp312 wheel 无法在 cp313 上运行，ABI 不同）
 
+**后端边界**：以上整套只对 NVIDIA CUDA 成立。海光 DCU（DTK）上这些 wheel 名里带
+``cu126`` / ``cu130`` 标签、链接的是 CUDA runtime，装了也 import 不起来；海光的
+flash-attn 走 DTK 自家渠道单独发布，与这条 GitHub 供应链不通用。所以 DCU 上
+``detect_env()`` 不做 wheel 匹配、``install()`` 直接拒绝，判定一律问
+:func:`utils.accelerator.supports_prebuilt_flash_attn_wheels`（不在本模块自己读
+``torch.version.hip``）。装好后本项目照常能用 —— 训练侧只
+``from flash_attn import flash_attn_func``，不关心它从哪来。
+
 公开 API（也是 server 端点 / CLI 用的入口）：
-- `detect_env()` — 当前 Python / CUDA / PyTorch / 平台
+- `detect_env()` — 当前 Python / CUDA / PyTorch / 平台 / 后端
 - `current_status()` — flash_attn 是否已装 + 版本
 - `find_candidates(env)` — GitHub releases 列表（带 score / usable / notes）
 - `find_best_wheel(env)` — 最优可用 wheel URL
@@ -29,6 +37,8 @@ import sys
 import urllib.request
 from typing import Any, Optional
 
+from utils import accelerator
+
 logger = logging.getLogger(__name__)
 
 FA_RELEASES_URL = (
@@ -36,14 +46,53 @@ FA_RELEASES_URL = (
 )
 
 
+def _accel_facts() -> dict[str, Any]:
+    """从 ``utils.accelerator`` 取本模块需要的后端事实。
+
+    异常兜底成 **CUDA 语义**：本函数服务的是 status endpoint 与装包决策，
+    「宁可降级显示也不能 500」（见 :func:`detect_env` 里那段 except 说明）。
+    兜底选 cuda 而不是 cpu，是为了让探测失败时 NVIDIA 路径逐字节保持旧行为
+    —— 新增的后端分支只在**确认是 DCU** 时才生效。
+
+    ``supports_prebuilt_wheels`` 的判据是 **``backend != "dcu"``**，而不是直接透传
+    ``accelerator.supports_prebuilt_flash_attn_wheels()``（后者只在 ``cuda`` 时为
+    True）。差别在 ``backend == "cpu"`` 这一档：那既包括「真 CPU 机器」也包括
+    **torch 还没装好的 NVIDIA 机器**，而后者历史上是能正常用本页的（detect_env 会
+    退到 nvidia-smi 拿 cuda_tag，让用户先选个候选 wheel）。直接透传会把这类机器的
+    安装入口一并关掉 —— 纯 NVIDIA 侧的行为回归。真正的 CPU-torch 拦截另有其人：
+    install() 里 ``torch_cuda_build == "cpu"`` 那条 pre-check。
+    """
+    try:
+        info = accelerator.detect()
+        return {
+            "backend": info.backend,
+            "vendor_label": info.vendor_label,
+            "hip_ver": info.hip_version,
+            "supports_prebuilt_wheels": info.backend != "dcu",
+        }
+    except Exception:  # noqa: BLE001
+        return {
+            "backend": "cuda",
+            "vendor_label": accelerator.VENDOR_LABEL["cuda"],
+            "hip_ver": None,
+            "supports_prebuilt_wheels": True,
+        }
+
+
 def detect_env() -> dict[str, Any]:
-    """检测当前 Python / CUDA / PyTorch / 平台。
+    """检测当前 Python / CUDA / PyTorch / 平台 / 后端。
 
     各字段在不可获取时为 None。`platform` 仅返回 `linux_x86_64` / `win_amd64`，
     其它平台（macOS arm64 / linux aarch64）目前没 prebuilt wheel。
+
+    `supports_prebuilt_wheels=False`（DCU）时后面几个 CUDA 字段全为 None 且
+    **不跑 nvidia-smi** —— DCU 机器上没这个命令，跑它只是白等一次
+    ``shutil.which`` 失败；UI 靠这个 flag 显示「此后端不支持自动安装 flash_attn」，
+    而不是拿一堆 None 让用户以为是检测挂了。
     """
     vi = sys.version_info
     python_tag = f"cp{vi.major}{vi.minor}"
+    accel = _accel_facts()
 
     syst = platform.system().lower()
     mach = platform.machine().lower()
@@ -89,6 +138,18 @@ def detect_env() -> dict[str, Any]:
                 # cu128 → 12.8、cu130 → 13.0（最后一位 minor，其余 major）
                 if len(num) >= 2:
                     cuda_ver = f"{num[:-1]}.{num[-1]}"
+        elif accel["backend"] == "dcu":
+            # DTK wheel 的版本串形如 `2.9.0+das.opt...dtk...`：既没 `+cu` 也没
+            # `+cpu`，而 `torch.version.cuda` 恒为 None —— 落到下面那条 else 会被
+            # 判成 `torch_cuda_build="cpu"`，UI 就会弹「PyTorch 是 CPU 版，请先重装
+            # CUDA 版」。那条提示在 DTK 镜像上是**破坏性误导**（pip 覆盖预装 torch
+            # 会报废环境，见 accelerator.should_manage_torch_install）。
+            #
+            # 标签值与 `torch_setup.DTK_BUILD_TAG` 对齐（同一个 'dtk' 字符串会出现
+            # 在 /api/torch/status 的 cuda_build 里，前端两处按同一个值判）。这里写
+            # 字面量而不 import torch_setup：只为一个常量拉进 torch_setup →
+            # onnxruntime_setup 整条 import 链不值得。
+            torch_cuda_build = "dtk"
         else:
             # 没 +cu/+cpu 后缀的老 build，靠 torch.version.cuda 判
             cuda_v = getattr(getattr(torch, "version", None), "cuda", None)
@@ -109,23 +170,28 @@ def detect_env() -> dict[str, Any]:
     # 历史只挡 (subprocess.SubprocessError, OSError)；Windows 中文 locale (cp936)
     # 下 text=True 解码 nvidia-smi 输出可能抛 UnicodeDecodeError（非上述子类），
     # 直接 500。改用 errors='replace' 避免，并把 except 兜底放宽到 Exception。
-    try:
-        r = subprocess.run(
-            ["nvidia-smi"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-            errors="replace",
-        )
-        if r.returncode == 0:
-            m = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", r.stdout)
-            if m:
-                driver_cuda_ver = f"{m.group(1)}.{m.group(2)}"
-                if cuda_tag is None:
-                    cuda_tag = f"cu{m.group(1)}{m.group(2)}"
-                    cuda_ver = driver_cuda_ver
-    except Exception:  # noqa: BLE001
-        pass
+    #
+    # DCU 上整段跳过：机器上装的是 hy-smi，没有 nvidia-smi；而且这里唯一的用途是
+    # 给 CUDA wheel 匹配兜底 cuda_tag，DCU 根本不做 wheel 匹配。硬件信息由
+    # accelerator.probe_stdlib() 那条路负责（本模块不需要）。
+    if accel["supports_prebuilt_wheels"]:
+        try:
+            r = subprocess.run(
+                ["nvidia-smi"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                errors="replace",
+            )
+            if r.returncode == 0:
+                m = re.search(r"CUDA Version:\s*(\d+)\.(\d+)", r.stdout)
+                if m:
+                    driver_cuda_ver = f"{m.group(1)}.{m.group(2)}"
+                    if cuda_tag is None:
+                        cuda_tag = f"cu{m.group(1)}{m.group(2)}"
+                        cuda_ver = driver_cuda_ver
+        except Exception:  # noqa: BLE001
+            pass
 
     return {
         "python_tag": python_tag,
@@ -136,6 +202,14 @@ def detect_env() -> dict[str, Any]:
         "torch_ver": torch_ver,
         "torch_cuda_build": torch_cuda_build,
         "platform": plat,
+        # 后端三字段（加法，NVIDIA 上恒为 cuda / "NVIDIA CUDA" / True，UI 走原分支）
+        "backend": accel["backend"],
+        "vendor_label": accel["vendor_label"],
+        # DTK 的 HIP 版本（形如 "6.3.42134-..."），NVIDIA 上 None；仅供展示排错
+        "hip_ver": accel["hip_ver"],
+        # False → 本后端没有可自动匹配的 prebuilt wheel（当前只有 DCU）。UI 据此
+        # 把安装按钮置灰并显示「需从 DTK 渠道手动装」，而不是让用户点了报 500。
+        "supports_prebuilt_wheels": accel["supports_prebuilt_wheels"],
     }
 
 
@@ -188,6 +262,12 @@ def find_candidates(
     torch_tag = env.get("torch_tag")
     cuda_tag = env.get("cuda_tag")
     python_tag = env.get("python_tag")
+
+    # 后端不支持这条 wheel 供应链（DCU）→ 空列表且 **fetch_error=None**：这不是
+    # 「拉取失败」，UI 不该显示网络排错文案，由 env.supports_prebuilt_wheels 那条
+    # 专门的说明接管。默认 True 保证老调用方（含单测里手搓的 env dict）行为不变。
+    if not env.get("supports_prebuilt_wheels", True):
+        return [], None
 
     if not plat:
         return [], None
@@ -291,14 +371,35 @@ def install(url: Optional[str] = None) -> dict[str, Any]:
 
     同步 pip install，可能需要几分钟（远端 wheel ~150MB）。flash_attn 是 C extension，
     pip 重装后必须重启进程才能切换；返回 `restart_required=True` 让 UI 提示。
+
+    DCU 上直接抛 RuntimeError —— 见函数体内说明。
     """
     env = detect_env()
+
+    # 后端不支持这条供应链时**无条件**拒绝，显式 URL 也拦：这些 wheel 名里带
+    # cuXXX、链接的是 CUDA runtime，在 DCU 上 pip 能装进去但 import 必挂
+    # （undefined symbol / libcudart 缺失），装完还会让 current_status() 报
+    # 「已安装」→ 训练侧 `from flash_attn import ...` 才炸，排错成本远高于现在拒绝。
+    if not env.get("supports_prebuilt_wheels", True):
+        raise RuntimeError(
+            f"当前后端是 {env.get('vendor_label') or '非 NVIDIA'}，不支持自动安装 flash_attn。\n"
+            "GitHub 上那套 prebuilt wheel（mjun0812/flash-attention-prebuild-wheels）"
+            "全部是 CUDA build（文件名带 cu126 / cu130，链接 CUDA runtime），"
+            "装到 DCU 上 import 会直接失败。\n"
+            "海光的 flash-attn 走 DTK 自家渠道单独发布：请从光合开发者社区 / DTK 配套"
+            "仓库取与镜像 DTK 版本匹配的 flash-attn 包，手动 pip install。\n"
+            "装好后本项目照常识别并使用（训练侧只做 `from flash_attn import flash_attn_func`，"
+            "不关心它从哪个渠道来），无需再改任何设置。"
+        )
 
     if url is None:
         # CPU 版 torch 装不了 flash_attn —— flash_attn 是 CUDA C extension，必须配
         # CUDA 版 torch。auto 路径先 pre-check 给清楚错误，否则 find_best_wheel 会因
         # cuda_tag 来自 nvidia-smi（cu130）而误报「未找到 wheel」，让用户误以为是
         # 网络/仓库问题。显式 URL 路径不挡，留给强制安装。
+        #
+        # 注意这条**只在 CUDA 后端**才可能命中：DCU 已在上面 return，且 DTK torch 的
+        # torch_cuda_build 是 'hip' 而非 'cpu'（detect_env 里专门处理过），不会误报。
         if env.get("torch_cuda_build") == "cpu":
             raise RuntimeError(
                 "PyTorch 是 CPU 版（torch+cpu），无法安装 flash_attn。"

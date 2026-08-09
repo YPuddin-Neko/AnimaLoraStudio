@@ -26,7 +26,7 @@
 
 ## Quick start
 
-**Prerequisites** (install yourself): NVIDIA GPU + CUDA · Python 3.10+ · Node.js 18+ · Git.
+**Prerequisites** (install yourself): NVIDIA GPU + CUDA (or Hygon DCU + DTK, see [Hardware requirements](#hardware-requirements)) · Python 3.10+ · Node.js 18+ · Git.
 
 ```bash
 git clone https://github.com/WalkingMeatAxolotl/AnimaLoraStudio
@@ -41,11 +41,49 @@ First run automatically creates `venv/` → installs GPU-matched CUDA torch → 
 
 ## Hardware requirements
 
-- **GPU**: NVIDIA (AMD / Apple Silicon not supported), per family:
+- **GPU**: NVIDIA or **Hygon DCU** (AMD Radeon / Apple Silicon not supported), per family:
   - **Anima**: **16 GB+ VRAM recommended** (RTX 4060Ti 16G / 4070Ti / 4080 / 3090 / 4090 / 5090, etc.); **8 GB barely works** (turn off sample output + reduce batch / resolution; noticeably slower).
   - **Krea 2** (12.9B): **training** runs on 24 GB-class GPUs with the official fp8 base model, or 32 GB for bf16; **generation** with an fp8 base runs from 16 GB (on the "save VRAM" policy), bf16 bases want 32 GB. With **block swap** (all blocks swapped out on an fp8 base), **training** reaches **12 GB** (about 10 GB total GPU usage; 16 GB is roomier) and **generation** reaches **8 GB** (about 6.3 GB total at 1024²), at the cost of about 4% speed plus the matching RAM.
 - **RAM**: 16 GB+; 32 GB+ recommended for Krea 2 (loading a 26.3 GB single-file checkpoint peaks at roughly file size in RAM); block swap holds the swapped-out blocks resident (about 11 GB with all blocks on an fp8 base)
 - **Storage**: SSD strongly recommended (frequent latent-cache + sample IO); budget disk space for Krea 2 weights (Raw / Turbo bf16 26.3 GB each, official fp8 13.1 GB each, text encoder 5.2–8.9 GB)
+
+### Hygon DCU
+
+DTK is a ROCm fork, so the training path shares the same code as NVIDIA (`torch.cuda.*`
+maps onto HIP) and the VRAM tiers above apply unchanged. Verified on the
+`pytorch:2.9.0-ubuntu22.04-dtk26.04-py3.11` image with a BW1000.
+
+Differences from NVIDIA:
+
+- **PyTorch ships with the image — never reinstall it via pip.** The DTK wheel is not on
+  PyPI; `pip install torch` replaces it with a CPU build, breaking the environment beyond
+  pip repair. Studio blocks this automatically (reinstall button disabled, `--torch=<tag>`
+  refused, first-run setup leaves torch alone), but mind it when running pip by hand.
+- **Acceleration libraries come from the Hygon developer channel, not pip.** Hygon ships
+  both flash-attn and xformers builds, but they must match **both** the image's DTK version
+  and its torch version (filenames look like
+  `flash_attn-2.8.3+das.opt1.dtk2604.torch251-cp311-cp311-manylinux_2_28_x86_64.whl`).
+  Install with `pip install <wheel path>` and restart; detection is automatic.
+- **Training works without them** — attention falls back to PyTorch SDPA's math backend
+  (unusable backends are probed and disabled at startup). It is slower and uses more VRAM on
+  long sequences; installing flash-attn restores the fast path automatically, no config
+  change needed.
+- Verified combination: `pytorch:2.5.1-ubuntu22.04-dtk26.04-py3.11` + BW1000 (64 GB × 2) +
+  flash-attn 2.6.1 + xformers 0.0.33 (both `+das.opt1.dtk2604.torch251` builds). bf16
+  training, fp8 base models, block swap, flash attention and NaViT packing all work there.
+- **NaViT packing requires xformers** (its block-diagonal varlen kernel). Available once the
+  Hygon xformers build is installed; otherwise disable it and use the ARB bucketing path.
+- **Tagging runs on CPU by default.** The GPU EP on DCU is MIGraphX, which needs the
+  DTK-matched onnxruntime package.
+
+To check your environment:
+
+```bash
+python tools/probe_accelerator.py    # backend, devices, measured fp8 / SDPA / block-swap
+bash tools/find_flash_attn.sh        # locate any flash-attn package / .so already on disk
+```
+
+See [ADR 0016](docs/adr/0016-dual-accelerator-backend-hygon-dcu.md).
 
 ## Documentation
 

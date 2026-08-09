@@ -17,16 +17,24 @@ import os
 import sys
 from pathlib import Path
 
-# 小显存优化：减少 CUDA 显存碎片，缓解 8GB 卡 LoKr full-matrix OOM。
-# - 必须在 torch 链式 import 之前设置：torch 在 import 阶段就读 PYTORCH_CUDA_ALLOC_CONF
-#   并缓存，之后再改无效。
+# 小显存优化：减少显存碎片，缓解 8GB 卡 LoKr full-matrix OOM。
+# - 必须在 torch 链式 import 之前设置：torch 在 import 阶段就读 alloc conf 并缓存，
+#   之后再改无效。**正因为如此，这里不能用 utils.accelerator.detect()**（它 import
+#   torch）—— 只能靠设备节点这种 stdlib 级别的信号判断后端。
 # - expandable_segments 的 CUDA backend 实现需要 PYTORCH_C10_DRIVER_API_SUPPORTED 宏，
 #   PyTorch 的 c10/cuda/CMakeLists.txt 把该宏 gate 在 `if(NOT WIN32)`，因此 Windows wheel
 #   不包含该 backend，运行时会 emit `TORCH_WARN_ONCE("expandable_segments not supported
 #   on this platform")` 并强制 disable。为避免 Windows 用户看无用 warning，只在 Linux 设。
+# - 海光 DCU（DTK / HIP build）上同名变量按 HIP 前缀读：ROCm 系的
+#   `PYTORCH_HIP_ALLOC_CONF` 优先于 `PYTORCH_CUDA_ALLOC_CONF`。两个都 setdefault 是
+#   刻意的：DTK 各版本对两个名字的接受度不完全一致，设成同值则无论走哪条都正确，
+#   而在 NVIDIA build 上 HIP 那个变量会被直接忽略、无副作用。实际生效的是哪一个可用
+#   `python tools/probe_accelerator.py` 的 `memory.alloc_conf_env` 段确认。
 # - setdefault 不覆盖用户已显式设置的值。
 if sys.platform.startswith("linux"):
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+    if os.path.exists("/dev/kfd"):  # HSA kernel driver = ROCm / DTK 栈
+        os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:True")
 
 # 脚本在 runtime/ 下按裸脚本启动（`python runtime/anima_train.py`）。
 # 把仓库根 + runtime/ 注入 sys.path，让 `import utils.*` / `import train_monitor` /
