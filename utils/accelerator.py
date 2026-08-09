@@ -603,36 +603,48 @@ def probe_sdpa_backends() -> dict[str, bool]:
 
     result = {"flash": False, "mem_efficient": False, "math": False, "default": False}
     try:
+        import warnings
+
         import torch
         import torch.nn.functional as F
 
         if not torch.cuda.is_available():
             _SDPA_CACHE = result
             return result
-        probe = torch.randn(*_SDPA_PROBE_SHAPE, device="cuda", dtype=torch.bfloat16)
 
-        def _works(q, ctx=None) -> bool:
-            """跑一次 SDPA，成功即该后端可用。``ctx=None`` 表示测默认 dispatch。"""
-            try:
-                if ctx is None:
-                    F.scaled_dot_product_attention(q, q, q)
-                else:
-                    with ctx:
+        # 整段静音 UserWarning。本函数**故意**去调用注定失败的后端，torch 于是逐条
+        # 抱怨（"Flash attention kernel not used because…"、"Torch was not compiled
+        # with cuDNN attention"…）。这些警告对探测本身是预期结果、不是问题，但直接
+        # 喷到训练日志里会让用户以为环境坏了 —— 真机上一次探测刷了 8 行。
+        # 探测结论该怎么告知用户由 configure_sdpa() 统一负责（分级 warn / debug）。
+        #
+        # 只包探测这一段：出了这个 with，后续训练里真正的 attention 警告照常可见。
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            probe = torch.randn(*_SDPA_PROBE_SHAPE, device="cuda", dtype=torch.bfloat16)
+
+            def _works(q, ctx=None) -> bool:
+                """跑一次 SDPA，成功即该后端可用。``ctx=None`` 表示测默认 dispatch。"""
+                try:
+                    if ctx is None:
                         F.scaled_dot_product_attention(q, q, q)
-                return True
-            except Exception:  # noqa: BLE001  探测失败即「不可用」，这是本函数的语义
-                return False
+                    else:
+                        with ctx:
+                            F.scaled_dot_product_attention(q, q, q)
+                    return True
+                except Exception:  # noqa: BLE001  探测失败即「不可用」，这是本函数的语义
+                    return False
 
-        from torch.nn.attention import SDPBackend, sdpa_kernel
+            from torch.nn.attention import SDPBackend, sdpa_kernel
 
-        result["default"] = _works(probe)
-        for name, backend in (
-            ("flash", SDPBackend.FLASH_ATTENTION),
-            ("mem_efficient", SDPBackend.EFFICIENT_ATTENTION),
-            ("math", SDPBackend.MATH),
-        ):
-            result[name] = _works(probe, sdpa_kernel(backend))
-        del probe
+            result["default"] = _works(probe)
+            for name, backend in (
+                ("flash", SDPBackend.FLASH_ATTENTION),
+                ("mem_efficient", SDPBackend.EFFICIENT_ATTENTION),
+                ("math", SDPBackend.MATH),
+            ):
+                result[name] = _works(probe, sdpa_kernel(backend))
+            del probe
     except Exception as exc:  # noqa: BLE001  torch 太老没 sdpa_kernel / 设备问题
         logger.debug("SDPA 后端探测失败: %s", exc)
 

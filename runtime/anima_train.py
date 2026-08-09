@@ -25,16 +25,20 @@ from pathlib import Path
 #   PyTorch 的 c10/cuda/CMakeLists.txt 把该宏 gate 在 `if(NOT WIN32)`，因此 Windows wheel
 #   不包含该 backend，运行时会 emit `TORCH_WARN_ONCE("expandable_segments not supported
 #   on this platform")` 并强制 disable。为避免 Windows 用户看无用 warning，只在 Linux 设。
-# - 海光 DCU（DTK / HIP build）上同名变量按 HIP 前缀读：ROCm 系的
-#   `PYTORCH_HIP_ALLOC_CONF` 优先于 `PYTORCH_CUDA_ALLOC_CONF`。两个都 setdefault 是
-#   刻意的：DTK 各版本对两个名字的接受度不完全一致，设成同值则无论走哪条都正确，
-#   而在 NVIDIA build 上 HIP 那个变量会被直接忽略、无副作用。实际生效的是哪一个可用
-#   `python tools/probe_accelerator.py` 的 `memory.alloc_conf_env` 段确认。
-# - setdefault 不覆盖用户已显式设置的值。
-if sys.platform.startswith("linux"):
+# - 海光 DCU（DTK / HIP build）上**不设**：真机实测（DTK 26.04 / torch 2.5.1）HIP
+#   allocator 不支持这个选项，设了会 emit
+#   `UserWarning: expandable_segments not supported on this platform`
+#   （来自 c10/hip/HIPAllocatorConfig.h）然后强制 disable —— 也就是有噪音没收益。
+#   注意 DTK 会把 `PYTORCH_CUDA_ALLOC_CONF` 也喂给 HIP allocator（HIP build 复用
+#   CUDA 命名），所以两个变量都得跳过，只跳 HIP 那个不管用。
+#   小显存碎片优化在 DCU 上的替代手段是 block swap（本项目已支持），而 DCU 卡普遍
+#   显存大（BW1000 有 64GB），碎片压力本身也小得多。
+# - setdefault 不覆盖用户已显式设置的值：想在 DTK 上强试可以自己 export。
+if sys.platform.startswith("linux") and not os.path.exists("/dev/kfd"):
+    # /dev/kfd = HSA kernel driver，ROCm / DTK 栈的标志。用设备节点而非
+    # utils.accelerator.detect() 判断，是因为后者 import torch —— 而本段必须在
+    # torch import 之前跑完（torch 在 import 阶段读 alloc conf 并缓存）。
     os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-    if os.path.exists("/dev/kfd"):  # HSA kernel driver = ROCm / DTK 栈
-        os.environ.setdefault("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:True")
 
 # 脚本在 runtime/ 下按裸脚本启动（`python runtime/anima_train.py`）。
 # 把仓库根 + runtime/ 注入 sys.path，让 `import utils.*` / `import train_monitor` /
