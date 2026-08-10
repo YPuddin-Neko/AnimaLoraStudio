@@ -1468,6 +1468,16 @@ class Supervisor:
             return
         slot.cancel_pending = True
         proc = slot.proc
+        # 先写停止标记再发信号（多卡）。torchrun 下 SIGTERM 打在 elastic agent 上，
+        # agent 转手强杀 worker 并抛 SignalException + 30 行 traceback —— 用户看着
+        # 像崩溃，而这是正常取消（真机实测）。标记让 worker 在自己的检查点上干净
+        # 退出，30s grace 内 agent 见到子进程正常退出就不会走强杀那条路。
+        #
+        # 单卡也写：多一条冗余通道无害，理由同 _send_pause_signal。
+        # 标记语义是「请停下」而非「请暂停」—— 训练循环里见到它会存 epoch 末备份走
+        # paused，启动期见到它直接退出。这里 cancel_pending 已先置上，_finish_slot
+        # 会按 canceled 收尾，与用户按下的意图一致。
+        self._write_pause_marker(slot.id if slot.kind == "task" else None)
         self._send_terminate_signal(proc)
 
         grace = self._grace

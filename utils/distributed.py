@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -301,6 +302,46 @@ def clear_pause_marker() -> None:
         marker.unlink(missing_ok=True)
     except OSError as exc:
         logger.warning("删除暂停标记失败（下次 resume 可能立刻再暂停）: %s", exc)
+
+
+def exit_if_pause_requested(emit=None) -> None:
+    """启动期的暂停检查点：见到标记就**直接退出**，不保 state。
+
+    与训练循环里那条轮询的区别在于**语义**，不只是位置：
+
+    训练循环里 pause = 「存最近一次 epoch 末备份 → 退出 → 标 paused → 可续训」。
+    启动期还没有任何 epoch 末备份（``ctx.last_auto_epoch_state_path`` 是 None），
+    按 ADR 0006 Addendum 1 那就等价于 cancel。所以这里不走 ``handle_interrupt``
+    （它要 ctx、要 emit pause_state、要 wandb finish），直接 ``sys.exit(0)`` —— 少一层
+    间接就少一处能在半初始化状态下出错的地方（此刻 optimizer / dataloader / wandb
+    可能都还不存在）。
+
+    为什么启动期也需要能停：12.9B 模型的加载 + VAE 缓存 + 文本编码器缓存在真机上是
+    **分钟级**的（真机日志里从 bootstrap 到进训练循环约 20 秒，但冷缓存首次跑要长
+    得多）。这段时间里用户唯一的选择是「取消」，而取消走 SIGTERM → torchrun 的
+    elastic agent 抛 SignalException + 30 行 traceback，看着像崩溃。给一条干净的
+    退出路径。
+
+    ``emit`` 传 ``ctx.emit`` 时消息会进 task log；启动早期 ctx 还没有就传 None，
+    退到 logger。
+
+    **所有 rank 都要调**，且必须在各 rank 会经过的同一位置 —— 只有部分 rank 退出会
+    让其余 rank 卡在下一个集合操作上。
+    """
+    if not pause_requested():
+        return
+    msg = "启动期收到停止请求（尚无 epoch 末备份，任务将标记为已取消）"
+    if is_main():
+        clear_pause_marker()
+        if emit is not None:
+            emit(msg)
+        else:
+            logger.info(msg)
+    else:
+        logger.info("rank %d: %s", rank(), msg)
+    # 不 destroy() 进程组：正常退出时 anima_train.main() 的 finally 会做，
+    # 这里重复调是幂等的但没必要；异常路径也由那个 finally 兜住。
+    sys.exit(0)
 
 
 def topology_summary() -> str:

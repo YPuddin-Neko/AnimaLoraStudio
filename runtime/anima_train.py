@@ -147,12 +147,28 @@ def main():
     #
     # destroy() 幂等且吞掉自身异常，所以放在 finally 里不会盖掉真正的训练异常
     # （单进程下它整个是 no-op，这段对不开多卡的用户零影响）。
+    # 启动期的停止检查点。每个 phase 在真机上都是数十秒到分钟级（12.9B 权重加载、
+    # VAE latent 缓存、文本编码器缓存），这段时间里用户没有干净的停止方式 —— 只能
+    # 取消，而取消走 SIGTERM，torchrun 的 elastic agent 会抛 SignalException 加
+    # 30 行 traceback，看着像崩溃（真机实测）。
+    #
+    # 放在 phase **之间**而不是 phase 内部：粒度够用（响应延迟 = 一个 phase），而且
+    # 天然保证所有 rank 在同一位置检查 —— phase 边界是各 rank 必然都会经过的点，
+    # 塞进 phase 内部就得逐个确认那里是不是所有 rank 都走到。
+    #
+    # 传 ctx.emit 让消息进 task log；bootstrap 之前 ctx 还没 emit 能力，所以第一个
+    # 检查点在 bootstrap 之后。
     try:
         phases.bootstrap.run(ctx)
+        distributed.exit_if_pause_requested(ctx.emit)
         phases.models.run(ctx)
+        distributed.exit_if_pause_requested(ctx.emit)
         phases.dataset.run(ctx)
+        distributed.exit_if_pause_requested(ctx.emit)
         phases.text_cache.run(ctx)
+        distributed.exit_if_pause_requested(ctx.emit)
         phases.models.finish(ctx)
+        distributed.exit_if_pause_requested(ctx.emit)
         phases.optimizer.run(ctx)
         phases.resume.run(ctx)
         loop.run(ctx)
