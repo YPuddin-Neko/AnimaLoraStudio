@@ -261,6 +261,37 @@ class _DDPAdapterSync(torch.nn.Module):
         return step_fn(self._dit[0], *args, **kwargs)
 
 
+def _needs_find_unused_parameters(args) -> bool:
+    """本次配置下是否真可能有 adapter 参数不参与某一步的前向。
+
+    只有 ``lora_module_dropout > 0`` 会造成这种情况：LyCORIS 的 stochastic depth
+    按**每个模块、每一步**独立掷骰子决定要不要整块跳过，被跳过的模块该步没有梯度，
+    而各 rank 的随机数不同步 —— 跳的不是同一批。此时若 ``find_unused_parameters=False``，
+    DDP 会等一个永远不来的梯度，抛「Expected to have finished reduction in the
+    prior iteration」。
+
+    另外两个 dropout **不算**，区别很关键：
+    - ``lora_dropout`` 丢的是**输入特征**（对激活做 mask），参数照常参与矩阵乘，
+      梯度照常产生（只是数值上被 mask 影响）。
+    - ``lora_rank_dropout`` 丢的是 rank 维度的一部分。LyCORIS 实现是对中间激活乘
+      mask，``lora_down`` / ``lora_up`` 两个张量整体仍在计算图里 —— 参数粒度上没有
+      「未参与」。DDP 看的是参数粒度，所以不受影响。
+
+    T-LoRA 也不算：它按 timestep 改的是 **rank mask buffer** 的内容，参与前向的
+    参数张量集合不变（见 ``broadcast_buffers=False`` 那段说明）。
+
+    SRA 同理不算：它的 projection MLP 压根不在 DDP 的同步集合里（``_DDPAdapterSync``
+    只收 ``injector.get_params()``），不存在「注册了但没用」。
+
+    误判成本不对称，所以这里的默认取向是「拿不到配置就开着」：多花点时间总比训练
+    崩掉好。
+    """
+    try:
+        return float(getattr(args, "lora_module_dropout", 0.0) or 0.0) > 0.0
+    except (TypeError, ValueError):
+        return True
+
+
 def _wrap_ddp(ctx: TrainingContext) -> None:
     """多卡时把 adapter 参数包进 DDP；单进程 no-op（``ctx.ddp_model`` 保持 None）。
 
@@ -276,13 +307,11 @@ def _wrap_ddp(ctx: TrainingContext) -> None:
     ``distributed.init()`` 已经 set_device 过，这里再显式声明一次让 DDP 自己的
     输入搬运和 reduction 流都落在正确的卡上。
 
-    ``find_unused_parameters=True``：保守起见开着。LoRA 训练下基座 frozen、只有
-    adapter 有梯度，理论上每步都全用；但 LyCORIS 的 ``module_dropout`` > 0 会
-    **按 rank 各自随机**跳过若干适配器模块 —— 那些模块本步没有梯度，而各 rank 跳的
-    还不是同一批。关着（False）时 DDP 会等一个永远不来的梯度，抛
-    「Expected to have finished reduction in the prior iteration」。代价是每步多一次
-    autograd 图遍历（PyTorch 文档称开销可观）。确认 module_dropout=0 且没有条件分支
-    之后可以改成 False 提速。
+    ``find_unused_parameters``：**按 ``lora_module_dropout`` 决定**，见
+    :func:`_needs_find_unused_parameters`。开着的代价是每步多一次 autograd 图全图
+    遍历（PyTorch 文档称开销可观，真机上 DDP 也会主动警告「没找到未用参数，考虑
+    关掉」）；关错了则会抛「Expected to have finished reduction in the prior
+    iteration」。所以判据必须精确对应「本步是否真可能有参数不参与前向」。
 
     ``broadcast_buffers=False``：DiT 用 LayerNorm/RMSNorm，没有 BatchNorm 那种需要
     跨 rank 校正的 running stats，每步广播 buffer 纯属浪费带宽。更要紧的是
@@ -314,12 +343,15 @@ def _wrap_ddp(ctx: TrainingContext) -> None:
         _DDPAdapterSync(ctx.model, trainable),
         device_ids=[local_rank],
         output_device=local_rank,
-        find_unused_parameters=True,
+        find_unused_parameters=_needs_find_unused_parameters(ctx.args),
         broadcast_buffers=False,
     )
     logger.info(
-        "DDP 已就绪：同步 %d 个 adapter 参数张量（%.1fM），基座权重 frozen 不参与通信",
+        "DDP 已就绪：同步 %d 个 adapter 参数张量（%.1fM），基座权重 frozen 不参与通信"
+        "%s",
         len(trainable), sum(p.numel() for p in trainable) / 1e6,
+        "，find_unused_parameters 已开（lora_module_dropout>0）"
+        if _needs_find_unused_parameters(ctx.args) else "",
     )
 
 
