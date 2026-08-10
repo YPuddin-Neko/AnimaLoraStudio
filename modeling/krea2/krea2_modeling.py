@@ -30,24 +30,68 @@ from torch import Tensor, nn
 #: mem-efficient 在 DTK 上没编译 → 退到 math 后端）。math 后端的峰值是
 #: ``[B, H, S_q, S_k]``，把 S_q 切成块后峰值降到 ``[B, H, chunk, S_k]``。
 #:
-#: 真机标定（BW1000 64GB / Krea2 48 heads / 2048px 桶 → S≈16.9k）。
-#: 下表是**单块**的分数矩阵理论值 ``H × chunk × S × 4B``：
-#:     不分块  51.2 GiB  → 必 OOM（bs 无关，bs=1 也装不下）
-#:     4096    12.4 GiB
-#:     2048     6.2 GiB
-#:     1024     3.1 GiB
-#:      512     1.6 GiB  ← 取这个
+#: 兜底块大小。拿不到显存读数时用它（保守值，见 :func:`_pick_query_chunk`）。
+_MASKED_ATTN_QUERY_CHUNK = 256
+
+#: 单个分数矩阵之外的安全系数：预算按 ``理论大小 × 该系数`` 算。
 #:
-#: **实测比理论值高约 1.84 倍**：chunk=1024 时理论 3.10 GiB，真机报
-#: `Tried to allocate 5.71 GiB`。原因是 SDPA 的 math 后端同时持有原始分数与 softmax
-#: 结果两份中间张量（还要把 bf16 升到 fp32 算 softmax）。所以标定必须按实测倍数留
-#: 余量，不能照理论值取。
+#: 为什么不是 1.0：math 后端不只持有一份 ``[B, H, S_q, S_k]``。它要先算原始分数、再
+#: 算 softmax 结果，且 bf16 输入会升到 fp32 做 softmax，中途至少有两份同量级张量共存。
 #:
-#: 取 512 而非 1024 的理由：这个模型的常驻本身就重 —— LoKr full-matrix 模式下
-#: 803M 可训练参数，加 PPSF 的两份 state 与 DiT 权重，训练前就占掉 33 GiB。留给激活
-#: 与分数矩阵的只有约 31 GiB，而激活本身要 20 GiB 上下。512 对应实测约 2.9 GiB，
-#: 是这个预算下的稳妥值；16.9k/512 ≈ 33 次 kernel 启动，相对单步数百毫秒可忽略。
-_MASKED_ATTN_QUERY_CHUNK = 512
+#: 为什么取 2.0 而不是某个实测值：真机（BW1000 / DTK 26.04 / torch 2.5.1）只留下一个
+#: 观测点 —— chunk=1024、H=48、S_k=16928 时 torch 报 ``Tried to allocate 5.71 GiB``。
+#: 但 5.71 既不等于 B=1 的理论值 3.10 也不等于 B=2 的 6.20，无法唯一定出倍数（这条
+#: 报错只给出**单次分配**大小，落在哪个中间张量上没有确证）。所以这里当保守安全系数
+#: 用，不当实测比例用。选小了只是多几次 kernel 启动，选大了直接 OOM —— 宁可保守。
+_MATH_SDPA_OVERHEAD = 2.0
+
+#: 分数矩阵最多吃掉当前空闲显存的比例。
+#:
+#: 不敢用满是因为 attention 内部除了分数矩阵还有输出张量与临时量，而 allocator 的
+#: 碎片也让「空闲」不等于「可连续分配」。0.5 在真机上留出了足够的安全边际。
+_CHUNK_FREE_VRAM_FRACTION = 0.5
+
+
+def _pick_query_chunk(q: Tensor, s_k: int) -> int:
+    """按**当前空闲显存**选 query 块大小；拿不到读数时回落
+    :data:`_MASKED_ATTN_QUERY_CHUNK`。
+
+    为什么不写死一个常数：可用余量在不同配置下差一个数量级，写死必然二选一地错。
+    真机对照（rank 1，2048px 桶 S≈16.9k，H=48）——
+
+    - LoKr **full matrix**（用户刻意选的训练方式）：803M 可训练参数，加 PPSF 的两份
+      state（各 2.99 GiB）与 DiT 权重 24.12 GiB → 常驻 33 GiB，激活实测再吃 22 GiB，
+      OOM 那一刻只剩 2.8 GiB。这里只能取到下限 128。
+    - 常规低秩 LoKr（rank 32 级）：可训练参数几十 M，常驻不到 26 GiB，余量 20 GiB 以上
+      → chunk 选到 768，kernel 启动次数只有下限那条路的 1/6。
+
+    所以按运行时余量算：``chunk = free × fraction / (B × H × S_k × 4B × overhead)``。
+
+    ``mem_get_info`` 是微秒级、attention 是毫秒级，每次调用问一次不值得优化掉 ——
+    而缓存反而危险：同一进程里余量会随 block swap / 采样 / 其他 rank 的活动变化，
+    用陈旧读数选块正是要避免的事。
+
+    返回值向下取到 128 的倍数并夹在 ``[128, 4096]``：太小则 kernel 启动开销占比失控，
+    太大则超出 math 后端本身能处理的合理范围（也没必要 —— 余量再多也不该一次吃 4 GiB
+    以上，那说明该走 flash 而不是 math）。
+    """
+    fallback = _MASKED_ATTN_QUERY_CHUNK
+    if not q.is_cuda:
+        return fallback
+    try:
+        free, _total = torch.cuda.mem_get_info(q.device)
+    except Exception:  # noqa: BLE001  拿不到读数就用保守兜底，不能让选块本身崩
+        return fallback
+    # 分数矩阵是 [B, H, chunk, S_k]，所以 batch 与 head 都得算进单位成本 —— 漏掉 batch
+    # 会在 bs=2 时把预算高估一倍，正好落在 OOM 那一侧。
+    batch = q.shape[0] if q.ndim >= 4 else 1
+    per_query = batch * q.shape[-3] * s_k * 4 * _MATH_SDPA_OVERHEAD
+    if per_query <= 0:
+        return fallback
+    budget = free * _CHUNK_FREE_VRAM_FRACTION
+    chunk = int(budget // per_query)
+    chunk = (chunk // 128) * 128          # 向下取到 128 的倍数
+    return max(128, min(chunk, 4096))
 
 
 def _chunked_masked_attention(
@@ -55,7 +99,7 @@ def _chunked_masked_attention(
     k: Tensor,
     v: Tensor,
     mask: Tensor,
-    chunk: int = _MASKED_ATTN_QUERY_CHUNK,
+    chunk: int | None = None,
 ) -> Tensor:
     """按 query 维度分块的 SDPA，**数值上与不分块完全等价**。
 
@@ -74,8 +118,13 @@ def _chunked_masked_attention(
     只切 query 不切 key。
 
     ``q`` 的 query 数不超过 ``chunk`` 时直接走原路，不付分块的额外开销。
+
+    ``chunk=None``（默认）时按当前空闲显存自适应选块，见 :func:`_pick_query_chunk`；
+    传显式值只给测试用（要在小张量上强制走分块路径）。
     """
     s_q = q.shape[-2]
+    if chunk is None:
+        chunk = _pick_query_chunk(q, k.shape[-2])
     if s_q <= chunk:
         return F.scaled_dot_product_attention(
             q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False,

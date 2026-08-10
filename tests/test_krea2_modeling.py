@@ -252,6 +252,181 @@ def test_chunked_attention_shortcircuits_when_small() -> None:
     torch.testing.assert_close(out, real(q, k, v, attn_mask=mask), rtol=0, atol=0)
 
 
+def test_pick_query_chunk_falls_back_off_cuda() -> None:
+    """CPU 张量拿不到显存读数，必须回落到保守常数而不是抛异常。
+
+    选块只是个优化决策，任何一步失败都不该让前向崩掉。
+    """
+    from modeling.krea2 import krea2_modeling as m
+
+    q = torch.randn(1, 4, 8, 16)
+    assert not q.is_cuda
+    assert m._pick_query_chunk(q, 8) == m._MASKED_ATTN_QUERY_CHUNK
+
+
+GIB = 1024 ** 3
+
+
+class _FakeCudaQuery:
+    """自称在 cuda 上的 query 替身，配合 monkeypatch 伪造显存读数。"""
+
+    is_cuda = True
+    ndim = 4
+    device = "cuda:0"
+
+    def __init__(self, batch: int, heads: int) -> None:
+        self.shape = (batch, heads, 4096, 128)
+
+
+def _pick_with_free(
+    monkeypatch: pytest.MonkeyPatch,
+    free_bytes: int | None,
+    batch: int,
+    heads: int,
+    s_k: int,
+) -> int:
+    """在伪造的空闲显存读数下跑一次选块；``free_bytes=None`` 表示读数抛异常。"""
+    from modeling.krea2 import krea2_modeling as m
+
+    def fake_mem_get_info(_device):
+        if free_bytes is None:
+            raise RuntimeError("hipErrorNoDevice")
+        return (free_bytes, free_bytes * 2)
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", fake_mem_get_info)
+    return m._pick_query_chunk(_FakeCudaQuery(batch, heads), s_k)
+
+
+def test_pick_query_chunk_falls_back_when_mem_query_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``mem_get_info`` 抛异常（驱动/后端差异）时回落到保守常数，不向上传播。
+
+    选块只是优化决策，任何一步失败都不该让前向崩掉。
+    """
+    from modeling.krea2 import krea2_modeling as m
+
+    got = _pick_with_free(monkeypatch, None, 2, 48, 16928)
+    assert got == m._MASKED_ATTN_QUERY_CHUNK
+
+
+def test_pick_query_chunk_scales_with_free_vram(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """块大小随余量走，且选出的块确实装得进预算。
+
+    这条锁住自适应的**动机**：真机上 full matrix 配置 OOM 时只剩 2.8 GiB，而常规
+    低秩配置有 20 GiB 以上 —— 写死一个常数必然在一侧错（小了白丢吞吐，大了 OOM）。
+    """
+    from modeling.krea2 import krea2_modeling as m
+
+    b, h, s_k = 2, 48, 16928  # 真机 2048px 桶
+    tight = _pick_with_free(monkeypatch, 8 * GIB, b, h, s_k)
+    loose = _pick_with_free(monkeypatch, 32 * GIB, b, h, s_k)
+    assert tight < loose, f"余量大 4 倍却没选更大的块：{tight} vs {loose}"
+
+    for free_gib, chunk in ((8, tight), (32, loose)):
+        need = b * h * chunk * s_k * 4 * m._MATH_SDPA_OVERHEAD
+        budget = free_gib * GIB * m._CHUNK_FREE_VRAM_FRACTION
+        assert need <= budget, (
+            f"free={free_gib}G 选了 chunk={chunk}，需 {need / GIB:.2f}G "
+            f"超出预算 {budget / GIB:.2f}G"
+        )
+
+
+def test_pick_query_chunk_floor_may_exceed_fraction_but_not_free(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """余量紧到连一个最小块都超预算时，128 的下限优先于 fraction —— 但仍远小于余量。
+
+    真机 full matrix 的 rank 1：OOM 那一刻只剩 2.8 GiB，按 0.5 的 fraction 算预算
+    只有 1.40 GiB，而 128 块要 1.55 GiB。fraction 是安全边际不是硬上限，此时让下限
+    赢是对的：1.55 < 2.80，仍然装得下。真装不下时该由 allocator 报 OOM，不该由选块
+    函数返回 0 去做除零。
+    """
+    from modeling.krea2 import krea2_modeling as m
+
+    b, h, s_k = 2, 48, 16928
+    free = int(2.8 * GIB)
+    chunk = _pick_with_free(monkeypatch, free, b, h, s_k)
+    assert chunk == 128, f"紧余量下没落到下限：{chunk}"
+
+    need = b * h * chunk * s_k * 4 * m._MATH_SDPA_OVERHEAD
+    assert need > free * m._CHUNK_FREE_VRAM_FRACTION, "本用例要求下限压过 fraction"
+    assert need < free, f"下限块要 {need / GIB:.2f}G，超过余量 {free / GIB:.2f}G"
+
+
+def test_pick_query_chunk_accounts_for_batch_and_heads(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """batch / head / S_k 任一翻倍，块大小相应减半 —— 漏掉任一维都会高估预算。
+
+    分数矩阵是 ``[B, H, chunk, S_k]``。早先的公式漏了 batch，bs=2 时预算刚好高估
+    一倍，正落在 OOM 那一侧。
+
+    参数取成 2 的幂（per_query = 2 MiB，base = 2048），这样 128 对齐不会引入
+    截断，减半关系可以用严格相等来断言。
+    """
+    base = _pick_with_free(monkeypatch, 8 * GIB, 1, 32, 8192)
+    assert base == 2048, f"基准算错了，后面的减半断言无意义：{base}"
+    assert _pick_with_free(monkeypatch, 8 * GIB, 2, 32, 8192) == base // 2
+    assert _pick_with_free(monkeypatch, 8 * GIB, 1, 64, 8192) == base // 2
+    assert _pick_with_free(monkeypatch, 8 * GIB, 1, 32, 16384) == base // 2
+
+
+def test_pick_query_chunk_is_clamped_and_aligned(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """结果永远是 128 的倍数并夹在 ``[128, 4096]``。
+
+    上限的理由：一次吃几 GiB 以上的分数矩阵没有意义 —— 余量真有那么多说明这一层
+    本该走 flash 而不是 math。
+    """
+    starved = _pick_with_free(monkeypatch, 1024, 2, 48, 16928)   # 1 KiB 余量
+    huge = _pick_with_free(monkeypatch, 4096 * GIB, 1, 1, 64)     # 荒谬的余量
+    assert starved == 128, f"下限没夹住：{starved}"
+    assert huge == 4096, f"上限没夹住：{huge}"
+    for free_gib in (1, 2, 4, 7, 13, 20, 31):
+        chunk = _pick_with_free(monkeypatch, free_gib * GIB, 2, 48, 16928)
+        assert chunk % 128 == 0, f"free={free_gib}G 选了非 128 倍数：{chunk}"
+        assert 128 <= chunk <= 4096
+
+
+def test_chunked_masked_attention_defaults_to_adaptive_pick() -> None:
+    """不传 ``chunk`` 时必须走 :func:`_pick_query_chunk`。
+
+    防回归：helper 与选块函数分别测对了，但默认值若被改回写死常数，其余用例
+    （都显式传 chunk）仍会全绿。
+    """
+    from modeling.krea2 import krea2_modeling as m
+
+    torch.manual_seed(21)
+    q = torch.randn(1, 2, 9, 8)
+    k = torch.randn(1, 2, 6, 8)
+    v = torch.randn(1, 2, 6, 8)
+    mask = torch.ones(1, 1, 1, 6, dtype=torch.bool)
+    mask[..., -2:] = False
+
+    seen: list[tuple[int, int]] = []
+    orig = m._pick_query_chunk
+
+    def spy(qq, s_k):
+        seen.append((int(qq.shape[-3]), int(s_k)))
+        return orig(qq, s_k)
+
+    m._pick_query_chunk = spy
+    try:
+        out = m._chunked_masked_attention(q, k, v, mask)
+    finally:
+        m._pick_query_chunk = orig
+
+    assert seen == [(2, 6)], f"默认路径没问选块函数，或参数不对：{seen}"
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False,
+    )
+    torch.testing.assert_close(out, reference, rtol=1e-5, atol=1e-5)
+
+
 def test_masked_forward_uses_chunked_path() -> None:
     """整模型前向在**有 padding** 时必须走分块路径。
 
