@@ -24,6 +24,67 @@ from einops import rearrange
 from torch import Tensor, nn
 
 
+#: 带 mask 的注意力按 query 维度分块时，每块的 query 数。
+#:
+#: 只在**不得不 materialize 分数矩阵**时才起作用（带 attn_mask → flash 不接、
+#: mem-efficient 在 DTK 上没编译 → 退到 math 后端）。math 后端的峰值是
+#: ``[B, H, S_q, S_k]``，把 S_q 切成块后峰值降到 ``[B, H, chunk, S_k]``。
+#:
+#: 真机标定（BW1000 64GB / Krea2 48 heads / 2048px 桶 → S≈16.9k / bs=2）：
+#:     不分块  102.5 GiB  → 必 OOM
+#:     4096     24.8 GiB
+#:     2048     12.4 GiB
+#:     1024      6.2 GiB  ← 取这个
+#: 1024 在「峰值够低」与「kernel 启动次数不过多」（16.9k/1024 ≈ 17 次）之间。
+#: 更小的块省不了多少却线性增加启动开销与 Python 循环成本。
+_MASKED_ATTN_QUERY_CHUNK = 1024
+
+
+def _chunked_masked_attention(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    mask: Tensor,
+    chunk: int = _MASKED_ATTN_QUERY_CHUNK,
+) -> Tensor:
+    """按 query 维度分块的 SDPA，**数值上与不分块完全等价**。
+
+    为什么可以这么做：softmax 沿 **key** 维归一化，每个 query 行的输出只依赖该行
+    自己的分数向量 —— query 之间没有任何耦合。所以沿 query 切块是**精确**的，不是
+    近似、也不需要像 flash 那样做 online-softmax 的 rescale。
+
+    为什么需要这么做：带 ``attn_mask`` 时 SDPA 只能走 math 后端（flash 不支持任意
+    mask，mem-efficient 在海光 DTK 上编译时没开），而 math 会显式 materialize
+    ``[B, H, S_q, S_k]``。Krea2 在 2048px 桶上 S≈16.9k、48 heads，bs=2 就是
+    102 GiB —— 64GB 卡必 OOM，且这与 batch 无关：bs=1 也要 51 GiB，加上约 30GB
+    常驻权重同样装不下。分块把峰值压到 ``chunk/S_q`` 倍。
+
+    ``mask`` 是 ``[B, 1, 1, S_k]`` 的 key-padding mask（bool，True = 参与）。它在
+    query 维上是广播的，所以每块直接复用同一个 mask，无需切片 —— 这也是为什么这里
+    只切 query 不切 key。
+
+    ``q`` 的 query 数不超过 ``chunk`` 时直接走原路，不付分块的额外开销。
+    """
+    s_q = q.shape[-2]
+    if s_q <= chunk:
+        return F.scaled_dot_product_attention(
+            q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False,
+        )
+    outs = []
+    for start in range(0, s_q, chunk):
+        outs.append(
+            F.scaled_dot_product_attention(
+                q[..., start:start + chunk, :],
+                k,
+                v,
+                attn_mask=mask,
+                dropout_p=0.0,
+                is_causal=False,
+            )
+        )
+    return torch.cat(outs, dim=-2)
+
+
 def _rope(pos: Tensor, dim: int, theta: float) -> Tensor:
     scale = torch.arange(0, dim, 2, dtype=torch.float64, device=pos.device) / dim
     omega = 1.0 / (theta**scale)
@@ -183,14 +244,17 @@ class Attention(nn.Module):
             k = k.repeat_interleave(repeat, dim=1)
             v = v.repeat_interleave(repeat, dim=1)
 
-        out = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=mask,
-            dropout_p=0.0,
-            is_causal=False,
-        )
+        if mask is None:
+            # 无 mask 是快路径：flash 后端接管，分数矩阵根本不 materialize。
+            # 上游的 forward 已尽量把「全 True 的 padding mask」折成 None，让这条
+            # 路径尽可能常被命中。
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False,
+            )
+        else:
+            # 有真实 padding 时只能走 math 后端 → 按 query 分块限制峰值。
+            # 数值与不分块逐值等价（softmax 沿 key 归一化，query 行之间无耦合）。
+            out = _chunked_masked_attention(q, k, v, mask)
         out = rearrange(out, "b h l d -> b l (h d)")
         return self.wo(out * torch.sigmoid(gate))
 

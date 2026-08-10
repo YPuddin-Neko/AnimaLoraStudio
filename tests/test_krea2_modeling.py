@@ -150,6 +150,102 @@ def test_padding_mask_prevents_padded_text_from_affecting_image_output() -> None
     torch.testing.assert_close(original_out, changed_out, rtol=1e-5, atol=1e-5)
 
 
+def test_chunked_masked_attention_matches_unchunked() -> None:
+    """按 query 分块的注意力必须与不分块**逐值相同**。
+
+    分块的理由是显存：带 attn_mask 时 SDPA 只能走 math 后端（flash 不支持任意
+    mask、mem-efficient 在海光 DTK 上没编译），而 math 会 materialize
+    ``[B, H, S_q, S_k]`` —— Krea2 在 2048px 桶上 S≈16.9k、48 heads，bs=2 就是
+    102 GiB，64GB 卡必 OOM（bs=1 也要 51 GiB，同样装不下）。
+
+    分块之所以**精确**而非近似：softmax 沿 key 维归一化，每个 query 行的输出只依赖
+    该行自己的分数向量，query 之间无耦合。所以这里用 rtol=0/atol=0 —— 有任何差异
+    就说明切法错了（切错维度、块边界漏算、mask 对不上），不是浮点误差。
+    """
+    from modeling.krea2.krea2_modeling import _chunked_masked_attention
+
+    torch.manual_seed(3)
+    b, h, s_q, s_k, d = 2, 4, 37, 29, 16
+    q = torch.randn(b, h, s_q, d)
+    k = torch.randn(b, h, s_k, d)
+    v = torch.randn(b, h, s_k, d)
+    # [B, 1, 1, S_k] key-padding mask，含 False（否则测不到 mask 复用是否正确）
+    mask = torch.ones(b, 1, 1, s_k, dtype=torch.bool)
+    mask[0, ..., -7:] = False
+    mask[1, ..., -3:] = False
+
+    reference = torch.nn.functional.scaled_dot_product_attention(
+        q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False,
+    )
+    # 多个块大小都要等价，含 s_q 整除 / 有余数 / 大于 s_q 三种情形
+    for chunk in (5, 8, 16, 37, 64):
+        got = _chunked_masked_attention(q, k, v, mask, chunk=chunk)
+        assert got.shape == reference.shape, f"chunk={chunk} 形状不对"
+        torch.testing.assert_close(got, reference, rtol=0, atol=0)
+
+
+def test_chunked_attention_shortcircuits_when_small() -> None:
+    """query 数不超过 chunk 时直接走原路，不该产生分块开销。
+
+    断言方式是行为等价 + 只调一次 SDPA：分块版对小输入必须与单次调用完全一致。
+    """
+    from modeling.krea2 import krea2_modeling as m
+
+    torch.manual_seed(5)
+    q = torch.randn(1, 2, 10, 8)
+    k = torch.randn(1, 2, 10, 8)
+    v = torch.randn(1, 2, 10, 8)
+    mask = torch.ones(1, 1, 1, 10, dtype=torch.bool)
+    mask[..., -2:] = False
+
+    calls = {"n": 0}
+    real = torch.nn.functional.scaled_dot_product_attention
+
+    def counting(*a, **kw):
+        calls["n"] += 1
+        return real(*a, **kw)
+
+    orig = m.F.scaled_dot_product_attention
+    m.F.scaled_dot_product_attention = counting
+    try:
+        out = m._chunked_masked_attention(q, k, v, mask, chunk=1024)
+    finally:
+        m.F.scaled_dot_product_attention = orig
+
+    assert calls["n"] == 1, f"小输入不该分块，实际调了 {calls['n']} 次 SDPA"
+    torch.testing.assert_close(out, real(q, k, v, attn_mask=mask), rtol=0, atol=0)
+
+
+def test_masked_forward_uses_chunked_path() -> None:
+    """整模型前向在**有 padding** 时必须走分块路径。
+
+    防回归：分块 helper 单独测对了，但调用点若被改回直接调 SDPA，上面两条仍会全绿。
+    这条从模型级入口验证接线。
+    """
+    from modeling.krea2 import krea2_modeling as m
+
+    torch.manual_seed(9)
+    model = SingleStreamDiT(_tiny_config()).eval()
+    x, timesteps, context, mask = _tiny_inputs()
+    assert not bool(mask.all()), "本用例需要含 False 的 mask"
+
+    hits = {"n": 0}
+    orig = m._chunked_masked_attention
+
+    def spy(*a, **kw):
+        hits["n"] += 1
+        return orig(*a, **kw)
+
+    m._chunked_masked_attention = spy
+    try:
+        with torch.no_grad():
+            model(x, timesteps, context, mask)
+    finally:
+        m._chunked_masked_attention = orig
+
+    assert hits["n"] > 0, "有 padding 的前向没有走分块路径 —— 调用点可能被改回裸 SDPA"
+
+
 def test_all_true_mask_is_numerically_identical_to_none() -> None:
     """全 True 的 padding mask 与 ``mask=None`` 必须逐值相同。
 
