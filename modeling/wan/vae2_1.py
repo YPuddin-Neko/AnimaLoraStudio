@@ -10,6 +10,42 @@ from einops import rearrange
 CACHE_T = 2
 
 
+#: VAE 空间自注意力按 query 分块时每块的 query 数。
+#:
+#: 这处 attention 的 head 数固定为 1、head_dim = 通道数（最深层 512），远超 flash 的
+#: head_dim 上限（FA2 最多 256，ROCm/AOTriton 多为 128），所以**只能**走 math 后端，
+#: 它会显式 materialize [b*t, 1, S_q, S_k]。
+#:
+#: 真机标定（1024² 图 → S = 128×128 = 16384，fp32）：
+#:     全量   bs=1 1.00G  bs=2 2.00G ← 撞 hipBLAS 的 int32 上限（2^31 字节）
+#:     4096   bs=1 0.25G  bs=2 0.50G  bs=4 1.00G
+#:     2048   bs=1 0.12G  bs=2 0.25G  bs=4 0.50G  ← 取这个
+#: 2048 让常见 batch 都远离 int32 上限，而 16384/2048 = 8 次 kernel 启动可忽略。
+_VAE_ATTN_QUERY_CHUNK = 2048
+
+
+def _chunked_attention(q, k, v, chunk: int = _VAE_ATTN_QUERY_CHUNK):
+    """按 query 维度分块的无 mask SDPA，数学上与不分块等价。
+
+    softmax 沿 key 维归一化，每个 query 行的输出只依赖该行自己的分数向量 —— query
+    之间无耦合，所以沿 query 切是精确的，不需要 flash 那种 online-softmax rescale。
+    （实现上不是 bit-exact：不同 s_q 会选到不同 kernel tile / 累加顺序，浮点加法不满足
+    结合律，差异在 fp32 eps 量级。）
+
+    query 数不超过 ``chunk`` 时直接走原路 —— 浅层 / 小图走的都是这条。
+    """
+    s_q = q.shape[-2]
+    if s_q <= chunk:
+        return F.scaled_dot_product_attention(q, k, v)
+    return torch.cat(
+        [
+            F.scaled_dot_product_attention(q[..., i:i + chunk, :], k, v)
+            for i in range(0, s_q, chunk)
+        ],
+        dim=-2,
+    )
+
+
 class CausalConv3d(nn.Conv3d):
     """
     Causal 3d convolusion.
@@ -240,27 +276,17 @@ class AttentionBlock(nn.Module):
         x = self.norm(x)
         # compute query, key, value
         #
-        # 每片必须**各自** contiguous，不能只在 chunk 之前做一次。
+        # 每片各自 contiguous（不是只在 chunk 之前做一次）：contiguous 作用在
+        # [b*t, 1, S, 3c] 上时，chunk 沿最后一维切出的三片是同一块内存上的跨步视图
+        # —— 最后一维长度 c，倒数第二维 stride 仍是 3c。SDPA 的快后端都要求最后两维
+        # 连续，跨步视图会被拒。
         #
-        # `.contiguous()` 作用在 [b*t, 1, S, 3c] 上，chunk 沿最后一维切出三片
-        # [b*t, 1, S, c] —— 它们是同一块内存上的**跨步视图**：最后一维长度 c，
-        # 但倒数第二维的 stride 仍是 3c。SDPA 的 flash / mem-efficient 后端都要求
-        # 最后两维连续（stride == 最后一维长度），于是被拒、回落到 math 后端，
-        # 显式 materialize [b*t, 1, S, S] 的分数矩阵。
-        #
-        # 这在 1024² 图上是致命的：VAE 8× 下采样后 S = 128×128 = 16384，单个分数
-        # 矩阵 16384² × 4B = 恰好 1.00 GiB。而 hipBLAS 用 signed int32 算总输出
-        # 字节数：
-        #     bs=1  1,073,741,824 B  塞得进 int32
-        #     bs=2  2,147,483,648 B  正好 2^31，越界 1 字节
-        # 真机（BW1000 / DTK 26.04）表现为 bs=1 正常、bs>=2 抛
-        # `HIPBLAS_STATUS_INVALID_VALUE when calling hipblasSgemmStridedBatched` ——
-        # 不是显存不足（卡上有 64GB），是 BLAS 参数类型溢出。NVIDIA 上没暴露过是
-        # 因为 cuBLAS 用 int64 算偏移。
-        #
-        # 各自 contiguous 之后 flash 接管，分数矩阵**根本不会被构造**，显存与 S
-        # 成正比而非 S²，batch 也不再受 int32 限制。代价是一次额外拷贝
-        # （3 × [b*t, S, c]，MB 级），相对省下的 GiB 级 materialize 可以忽略。
+        # 注意这只是**必要**条件，不充分：这里 head 数固定为 1（reshape 里那个 1），
+        # 于是 head_dim = c，最深层 c = 512 —— 远超 flash 的 head_dim 上限
+        # （FA2 最多 256，ROCm/AOTriton 多为 128）。所以 flash 在这处 attention 上
+        # **无论布局如何都不可能接管**，真正兜底的是下面的分块。
+        # contiguous 仍然留着：它让 mem-efficient 后端在支持它的平台上可用（那个
+        # 后端没有 head_dim 上限），DTK 上没编译 mem-efficient 才必须走分块。
         q, k, v = (
             t_.contiguous()
             for t_ in self.to_qkv(x).reshape(b * t, 1, c * 3, -1)
@@ -269,11 +295,23 @@ class AttentionBlock(nn.Module):
         )
 
         # apply attention
-        x = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-        )
+        #
+        # 按 query 分块，理由与 Krea2 那处同源但触发条件不同（那边是 attn_mask 挡住
+        # flash，这边是 head_dim 超限）。math 后端会显式 materialize
+        # [b*t, 1, S_q, S_k]，而 1024² 图经 VAE 8× 下采样后 S = 128×128 = 16384，
+        # 单个分数矩阵 16384² × 4B = 恰好 1.00 GiB。hipBLAS 用 signed int32 算总输出
+        # 字节数：
+        #     bs=1  1,073,741,824 B  塞得进 int32
+        #     bs=2  2,147,483,648 B  正好 2^31，越界 1 字节
+        # 真机（BW1000 / DTK 26.04）表现为 bs=1 正常、bs>=2 抛
+        # `HIPBLAS_STATUS_INVALID_VALUE when calling hipblasSgemmStridedBatched` ——
+        # 不是显存不足（卡上 64GB），是 BLAS 参数类型溢出。NVIDIA 上没暴露过是因为
+        # cuBLAS 用 int64 算偏移。
+        #
+        # 分块沿 query 维是**精确**的：softmax 沿 key 维归一化，每个 query 行的输出
+        # 只依赖该行自己的分数向量，query 之间无耦合。chunk=2048 下 bs=4 也只需
+        # 0.25 GiB（对比全量 4.00 GiB），而 16384/2048 = 8 次 kernel 启动开销可忽略。
+        x = _chunked_attention(q, k, v)
         x = x.squeeze(1).permute(0, 2, 1).reshape(b * t, c, h, w)
 
         # output
