@@ -239,10 +239,34 @@ class AttentionBlock(nn.Module):
         x = rearrange(x, 'b c t h w -> (b t) c h w')
         x = self.norm(x)
         # compute query, key, value
-        q, k, v = self.to_qkv(x).reshape(b * t, 1, c * 3,
-                                         -1).permute(0, 1, 3,
-                                                     2).contiguous().chunk(
-                                                         3, dim=-1)
+        #
+        # 每片必须**各自** contiguous，不能只在 chunk 之前做一次。
+        #
+        # `.contiguous()` 作用在 [b*t, 1, S, 3c] 上，chunk 沿最后一维切出三片
+        # [b*t, 1, S, c] —— 它们是同一块内存上的**跨步视图**：最后一维长度 c，
+        # 但倒数第二维的 stride 仍是 3c。SDPA 的 flash / mem-efficient 后端都要求
+        # 最后两维连续（stride == 最后一维长度），于是被拒、回落到 math 后端，
+        # 显式 materialize [b*t, 1, S, S] 的分数矩阵。
+        #
+        # 这在 1024² 图上是致命的：VAE 8× 下采样后 S = 128×128 = 16384，单个分数
+        # 矩阵 16384² × 4B = 恰好 1.00 GiB。而 hipBLAS 用 signed int32 算总输出
+        # 字节数：
+        #     bs=1  1,073,741,824 B  塞得进 int32
+        #     bs=2  2,147,483,648 B  正好 2^31，越界 1 字节
+        # 真机（BW1000 / DTK 26.04）表现为 bs=1 正常、bs>=2 抛
+        # `HIPBLAS_STATUS_INVALID_VALUE when calling hipblasSgemmStridedBatched` ——
+        # 不是显存不足（卡上有 64GB），是 BLAS 参数类型溢出。NVIDIA 上没暴露过是
+        # 因为 cuBLAS 用 int64 算偏移。
+        #
+        # 各自 contiguous 之后 flash 接管，分数矩阵**根本不会被构造**，显存与 S
+        # 成正比而非 S²，batch 也不再受 int32 限制。代价是一次额外拷贝
+        # （3 × [b*t, S, c]，MB 级），相对省下的 GiB 级 materialize 可以忽略。
+        q, k, v = (
+            t_.contiguous()
+            for t_ in self.to_qkv(x).reshape(b * t, 1, c * 3, -1)
+            .permute(0, 1, 3, 2)
+            .chunk(3, dim=-1)
+        )
 
         # apply attention
         x = F.scaled_dot_product_attention(
