@@ -125,6 +125,28 @@ class TrainingContext:
     sample_prompt_idx: int = 0
     interrupted: bool = False
 
+    # ─── 采样周期的 rank 不变副本（多卡专用）───
+    #
+    # bootstrap 会在非 rank 0 上把 ``args.sample_steps`` / ``args.sample_every``
+    # 置 0，用来关掉「对外输出」（多 rank 往同一个 step_N.png 并发写必然写坏，
+    # 而采样是纯推理，多跑 N-1 份纯属浪费）。那个抑制本身是对的。
+    #
+    # 但采样调用点外面还套着一对 :func:`utils.distributed.barrier`，而 barrier 是
+    # **集合操作 —— 必须所有 rank 都执行**。如果 barrier 的门控条件读的是被 rank
+    # 改过的 args 字段，非 rank 0 会连 barrier 一起跳过，于是：
+    #
+    # 1. rank 0 多执行了 N 次 barrier，NCCL 按**调用顺序**配对集合操作，从此每个
+    #    rank 的集合操作错位。真机上表现为 rank 1 的 ``_agree_on_finite_loss``
+    #    与 rank 0 的 barrier 配上对，读回垃圾值 → 误报「其他 rank 的 loss 非有限值」。
+    # 2. rank 0 采样时其余 rank 不再被挡，径直冲进下一步前向；被误报的 NaN skip 又
+    #    让上一个 micro-batch 的计算图活着不释放 → 两份 checkpoint 图叠在一起 → OOM。
+    #
+    # 所以周期值要在**任何 rank 相关改写之前**存一份到 ctx，barrier 的门控只读这份。
+    # 「采不采样」由 ``is_main()`` 决定（barrier 里侧），「进不进这个 if」由这份
+    # rank 不变副本决定 —— 两件事分开，条件才真的各 rank 一致。
+    sample_steps_all_ranks: int = 0
+    sample_every_all_ranks: int = 0
+
     # ─── loop.py epoch backup（ADR 0006 Addendum 1 方案 Δ）───
     # 每 epoch 末尾覆盖式写 auto_epoch_state.pt 后填充这两个字段。
     # handle_interrupt 读它们 emit pause_state event；None 表示首 epoch 还没结束

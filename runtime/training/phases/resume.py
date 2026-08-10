@@ -122,9 +122,16 @@ def run(ctx: TrainingContext) -> None:
     # 的第一个 attention —— 两者的显存峰值叠在同一时间窗口，rank 1 OOM。
     # （各 rank 还会并发写同一批 step_0_baseline_*.png，必然写坏。）
     #
-    # barrier 在 if 里侧、is_main() 外侧：集合操作必须所有 rank 都执行，而这个 if
-    # 的条件（global_step / sample_steps / sample_every）各 rank 一致。
-    sampling_enabled = args.sample_steps > 0 or args.sample_every > 0
+    # barrier 在 if 里侧、is_main() 外侧：集合操作必须所有 rank 都执行。
+    #
+    # 门控读 ctx.sample_*_all_ranks 而**不是** args.sample_* —— 后者在非 rank 0 上
+    # 被 bootstrap 置 0 了（关掉重复出图），拿它当门控会让 rank 1 连 barrier 一起
+    # 跳过。真机上的后果：rank 1 不等 rank 0 采样完就冲进训练前向，而且 NCCL 集合
+    # 操作从此错位（rank 1 的 loss all_reduce 与 rank 0 的 barrier 配对，读回垃圾值
+    # → 误报「其他 rank 的 loss 非有限值」）。详见 TrainingContext 那两个字段的注释。
+    sampling_enabled = (
+        ctx.sample_steps_all_ranks > 0 or ctx.sample_every_all_ranks > 0
+    )
     if ctx.global_step == 0 and sampling_enabled:
         dist_env.barrier()
         if dist_env.is_main():

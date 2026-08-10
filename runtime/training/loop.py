@@ -650,6 +650,19 @@ def run(ctx: TrainingContext) -> None:
                     # 保证了一致），通信不会错位。
                     (loss.nan_to_num(0.0, posinf=0.0, neginf=0.0) * 0.0).backward()
                     ctx.optimizer.zero_grad()
+                # 显式放掉这一轮的计算图再 continue。
+                #
+                # Python 的 for 不给循环体开作用域，`loss` / `pred` 会一直绑着上一轮的
+                # 张量，直到下一轮**赋值完成**才解绑 —— 而下一轮的 forward 是在赋值
+                # *之前*跑的。于是跳过的那一轮的整张 gradient-checkpoint 图与新一轮的
+                # 图在同一时刻都活着，激活翻倍。
+                #
+                # 走到这里的两种情形都可能不跑 backward（累积中间步压根没 arm reducer），
+                # 图不会被 backward 顺手释放，只能手动解绑。真机上 Krea2 单份图约 15 GiB，
+                # 翻倍就是 OOM 与不 OOM 的差别。
+                loss = None
+                pred = None
+                denoise_loss_log = None
                 continue
 
             # 反向传播。尾组（len % grad_accum）不满时按实际 micro-batch 数归一，
@@ -844,11 +857,16 @@ def run(ctx: TrainingContext) -> None:
                 # 那段时间它的激活一直挂着不释放，等于把两个峰值叠在同一个时间窗口。
                 # 12.9B 模型 + 64GB 卡上这就是 OOM 与不 OOM 的差别。
                 #
-                # barrier 在 if 里侧、is_main() 外侧 —— 它是集合操作必须所有 rank 都
-                # 执行，而这个 if 的条件（global_step / sample_steps）各 rank 一致。
+                # barrier 在 if 里侧、is_main() 外侧 —— 它是集合操作必须所有 rank 都执行。
                 # 采样前也挡一次：让 rank 0 在其余 rank 的激活都已释放之后才开始
                 # 吃显存，而不是撞在它们的峰值上。
-                if args.sample_steps > 0 and ctx.global_step % args.sample_steps == 0:
+                #
+                # 门控读 ctx.sample_steps_all_ranks 而**不是** args.sample_steps —— 后者
+                # 在非 rank 0 上被 bootstrap 置 0（关掉重复出图），拿它当门控会让其余
+                # rank 连 barrier 一起跳过，NCCL 集合操作从此永久错位。这里曾经写的就是
+                # args.sample_steps，注释还断言「各 rank 一致」—— 真机上 rank 1 因此 OOM。
+                _sample_steps = ctx.sample_steps_all_ranks
+                if _sample_steps > 0 and ctx.global_step % _sample_steps == 0:
                     dist_env.barrier()
                     if dist_env.is_main():
                         prompt = ctx.get_next_sample_prompt()
@@ -944,7 +962,9 @@ def run(ctx: TrainingContext) -> None:
 
             # 采样（轮换提示词）；多卡只 rank 0 出图 + 前后 barrier，理由同 step 版采样
             # （采样是显存最高峰，不挡会与其余 rank 的训练峰值在时间上重叠）。
-            if args.sample_every > 0 and ctx.current_epoch % args.sample_every == 0:
+            # 门控同样读 rank 不变副本，不读被 bootstrap 置 0 过的 args.sample_every。
+            _sample_every = ctx.sample_every_all_ranks
+            if _sample_every > 0 and ctx.current_epoch % _sample_every == 0:
                 dist_env.barrier()
                 if dist_env.is_main():
                     prompt = ctx.get_next_sample_prompt()

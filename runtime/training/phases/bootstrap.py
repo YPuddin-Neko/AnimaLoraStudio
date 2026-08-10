@@ -425,14 +425,20 @@ def run(ctx: TrainingContext) -> None:
     # ctx 字段来门控。三件事各有各的坑：
     #   - 进度条：N 个 Rich Live 抢同一个终端 → 互相覆盖出乱码。
     #   - 采样出图：所有 rank 会往**同一个** sample_dir/step_N.png 写，并发写同一
-    #     文件必然写坏；而且采样是纯推理，多跑 N-1 份纯属浪费显存和时间。置 0 同时
-    #     关掉 resume_phase 的 step-0 基线采样（它读 sample_steps/sample_every 判断
-    #     是否采样）—— 那是本次改不到的文件，只能这样拦。
+    #     文件必然写坏；而且采样是纯推理，多跑 N-1 份纯属浪费显存和时间。
+    #
+    # ⚠️ 置 0 之前**必须**先把周期值存进 ctx.sample_*_all_ranks。采样调用点外面套着
+    # 一对 barrier（集合操作，必须所有 rank 都执行），它们的门控只能读那份 rank
+    # 不变副本；读被改过的 args 会让非 rank 0 连 barrier 一起跳过 —— 真机上的后果是
+    # NCCL 集合操作永久错位 + rank 1 OOM，详见 TrainingContext 上那两个字段的注释。
     #   - monitor_state.json：Studio 前端按 task 读一个文件，多 rank 同写会让
     #     step/loss 反复跳变。monitor_server=None 让 loop/resume 里所有
     #     `if ctx.monitor_server:` 分支自然短路。
     # args 被改的字段会进 auto_epoch_state.config.json（pause snapshot），但那份
     # snapshot 只由 rank 0 写，记录的是 rank 0 的真实值，resume 不受影响。
+    # 先存 rank 不变副本（所有 rank 都执行这两行，值必然一致），再做 rank 相关抑制。
+    ctx.sample_steps_all_ranks = int(getattr(args, "sample_steps", 0) or 0)
+    ctx.sample_every_all_ranks = int(getattr(args, "sample_every", 0) or 0)
     if not dist_env.is_main():
         args.no_progress = True
         args.sample_steps = 0
