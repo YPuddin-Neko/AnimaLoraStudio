@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import socket
 import sys
 from pathlib import Path
@@ -134,6 +135,17 @@ def _torchrun_prefix(nproc: int, task_id: Any) -> list[str]:
     """
     if nproc <= 1:
         return []
+    # OMP_NUM_THREADS：不设的话 torchrun 会 setdefault 成 1 并打一段五行的醒目
+    # WARNING（"Setting OMP_NUM_THREADS environment variable for each process to
+    # be 1 in default, to avoid your system being overloaded..."）。那段警告出现在
+    # 每次训练启动的 task log 顶部，用户看着像出了问题，实际只是提示该自己调值。
+    #
+    # 显式设成 1 既消掉警告、也是本项目的正确值：torch 的 CPU 算子在训练热路径上
+    # 几乎不参与（前向/反向都在 GPU），而 DataLoader 的并行度由 num_workers 单独
+    # 控制。留着 OpenMP 多线程只会让 N 个训练进程各自开一堆线程互相抢 CPU。
+    # 用 setdefault 语义（只在用户没设过时才设）—— 想调的人可以自己 export。
+    if "OMP_NUM_THREADS" not in os.environ:
+        os.environ["OMP_NUM_THREADS"] = "1"
     args = [
         "-m", "torch.distributed.run",
         # nnodes 默认就是 1，显式写出来是为了让「本项目只支持单机多卡」这件事

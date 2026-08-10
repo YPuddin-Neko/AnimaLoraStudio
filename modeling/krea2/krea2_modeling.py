@@ -471,15 +471,38 @@ class SingleStreamDiT(nn.Module):
             if attention_mask.shape != (batch, text_len):
                 raise ValueError("Krea2 attention_mask 应为 (B,text_len)")
             attention_mask = attention_mask.to(device=x.device, dtype=torch.bool)
-            text_mask = attention_mask[:, None, None, :]
-            image_mask = torch.ones(
-                batch,
-                image.shape[1],
-                device=x.device,
-                dtype=torch.bool,
-            )
-            combined_mask = torch.cat((attention_mask, image_mask), dim=1)
-            combined_mask = combined_mask[:, None, None, :]
+            # 全 True 的 key-padding mask 与 None 语义完全相同（SDPA 的 bool mask
+            # 约定：True = 参与注意力），但**代价差一个数量级**：带 attn_mask 时
+            # flash 后端压根不接（它不支持任意 mask）、mem-efficient 在部分平台也不
+            # 可用，SDPA 于是退到 math 后端，把 [B, 1, 1, S] 广播成完整的
+            # [B, H, S, S] 分数矩阵显式 materialize。
+            #
+            # 真机实测（BW1000 64GB / Krea2 / bs=1，DTK 无 mem-efficient 后端）：
+            # 这一条退化让单次 attention 试图分配 42.99 GiB 直接 OOM；置 None 走
+            # flash 后同一个前向只需常数级额外显存。
+            #
+            # 什么时候会全 True：`pad_text_conditions` 按 batch 内**最长** caption
+            # 右填充，所以 bs=1 时恒全 True（只有一条 caption，max_length 就是它自己
+            # 的长度）；bs>1 时各 caption 长度恰好一致同样全 True。Krea2 是 12.9B
+            # 模型、bs=1 是常态，所以这条捷径命中率很高。
+            #
+            # 只需判文本段：图像 token 无 padding（image_mask 恒 ones），所以
+            # combined 是否全 True 完全由 attention_mask 决定。一次 GPU reduce +
+            # D2H 同步，相对省下的 materialize 可以忽略。
+            if bool(attention_mask.all()):
+                # 短路：text_mask / combined_mask 都保持 None，连 image_mask 的
+                # 分配与 torch.cat 都不做 —— 那两步在这条（最常见的）路径上纯浪费。
+                pass
+            else:
+                text_mask = attention_mask[:, None, None, :]
+                image_mask = torch.ones(
+                    batch,
+                    image.shape[1],
+                    device=x.device,
+                    dtype=torch.bool,
+                )
+                combined_mask = torch.cat((attention_mask, image_mask), dim=1)
+                combined_mask = combined_mask[:, None, None, :]
 
         text = self.txtfusion(context, mask=text_mask)
         text = self.txtmlp(text)

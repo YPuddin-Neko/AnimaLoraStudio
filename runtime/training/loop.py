@@ -819,21 +819,34 @@ def run(ctx: TrainingContext) -> None:
                 # 并发写同一文件必然写坏；采样是纯推理，多跑 N-1 份纯浪费。
                 # （bootstrap 已把非 rank 0 的 sample_steps 置 0，这里的 is_main()
                 # 是显式化意图 + 让本文件自成一体可测，两者都留。）
-                # 不需要 barrier：采样不改权重（optimizer_eval_mode 把 averaged
-                # weights 换进去、事后原样换回），其余 rank 跑到下一次梯度 all_reduce
-                # 时自然会等 rank 0 回来。
-                if dist_env.is_main() and args.sample_steps > 0 and ctx.global_step % args.sample_steps == 0:
-                    prompt = ctx.get_next_sample_prompt()
-                    prompt_short = prompt[:50] + "..." if len(prompt) > 50 else prompt
-                    ctx.emit(f"采样中 (step {ctx.global_step}): {prompt_short}")
-                    run_sample(
-                        ctx,
-                        prompt=prompt,
-                        sample_path=ctx.sample_dir / f"step_{ctx.global_step}.png",
-                        wandb_key="samples/step",
-                        wandb_caption=f"step {ctx.global_step}: {prompt}",
-                        wandb_step=ctx.global_step,
-                    )
+                #
+                # **必须 barrier**（早期版本判断成「不需要」，真机上 OOM 了）：
+                # 采样期 rank 0 要额外驻留 VAE + 采样中间激活，是整个训练里的显存
+                # 最高峰。不挡的话其余 rank 会径直冲进下一步训练的前向，于是
+                # 「rank 0 的采样峰值」与「rank 1 的训练峰值」在时间上重叠 —— 虽然
+                # 两者在不同卡上，但 rank 1 的下一步 all_reduce 会等 rank 0 采样完，
+                # 那段时间它的激活一直挂着不释放，等于把两个峰值叠在同一个时间窗口。
+                # 12.9B 模型 + 64GB 卡上这就是 OOM 与不 OOM 的差别。
+                #
+                # barrier 在 if 里侧、is_main() 外侧 —— 它是集合操作必须所有 rank 都
+                # 执行，而这个 if 的条件（global_step / sample_steps）各 rank 一致。
+                # 采样前也挡一次：让 rank 0 在其余 rank 的激活都已释放之后才开始
+                # 吃显存，而不是撞在它们的峰值上。
+                if args.sample_steps > 0 and ctx.global_step % args.sample_steps == 0:
+                    dist_env.barrier()
+                    if dist_env.is_main():
+                        prompt = ctx.get_next_sample_prompt()
+                        prompt_short = prompt[:50] + "..." if len(prompt) > 50 else prompt
+                        ctx.emit(f"采样中 (step {ctx.global_step}): {prompt_short}")
+                        run_sample(
+                            ctx,
+                            prompt=prompt,
+                            sample_path=ctx.sample_dir / f"step_{ctx.global_step}.png",
+                            wandb_key="samples/step",
+                            wandb_caption=f"step {ctx.global_step}: {prompt}",
+                            wandb_step=ctx.global_step,
+                        )
+                    dist_env.barrier()
 
                 # 定期保存 LoRA 权重（按 step）。
                 # 多卡只有 rank 0 落盘（各 rank 的 LoRA 权重由 DDP 保证一致，存 N 份
@@ -913,19 +926,23 @@ def run(ctx: TrainingContext) -> None:
                     ctx.wandb_monitor.upload_model(save_path)
                 dist_env.barrier()
 
-            # 采样（轮换提示词）；多卡只 rank 0 出图，理由同 step 版采样
-            if dist_env.is_main() and args.sample_every > 0 and ctx.current_epoch % args.sample_every == 0:
-                prompt = ctx.get_next_sample_prompt()
-                prompt_short = prompt[:50] + "..." if len(prompt) > 50 else prompt
-                ctx.emit(f"采样中 (epoch {ctx.current_epoch}): {prompt_short}")
-                run_sample(
-                    ctx,
-                    prompt=prompt,
-                    sample_path=ctx.sample_dir / f"epoch_{ctx.current_epoch}.png",
-                    wandb_key="samples/epoch",
-                    wandb_caption=f"epoch {ctx.current_epoch}: {prompt}",
-                    wandb_step=ctx.global_step,
-                )
+            # 采样（轮换提示词）；多卡只 rank 0 出图 + 前后 barrier，理由同 step 版采样
+            # （采样是显存最高峰，不挡会与其余 rank 的训练峰值在时间上重叠）。
+            if args.sample_every > 0 and ctx.current_epoch % args.sample_every == 0:
+                dist_env.barrier()
+                if dist_env.is_main():
+                    prompt = ctx.get_next_sample_prompt()
+                    prompt_short = prompt[:50] + "..." if len(prompt) > 50 else prompt
+                    ctx.emit(f"采样中 (epoch {ctx.current_epoch}): {prompt_short}")
+                    run_sample(
+                        ctx,
+                        prompt=prompt,
+                        sample_path=ctx.sample_dir / f"epoch_{ctx.current_epoch}.png",
+                        wandb_key="samples/epoch",
+                        wandb_caption=f"epoch {ctx.current_epoch}: {prompt}",
+                        wandb_step=ctx.global_step,
+                    )
+                dist_env.barrier()
 
             # 定期保存训练状态（epoch 版）
             # ADR 0006 Addendum 1：epoch 字段顺手修 off-by-one（dev current_epoch 在 L297

@@ -150,6 +150,50 @@ def test_padding_mask_prevents_padded_text_from_affecting_image_output() -> None
     torch.testing.assert_close(original_out, changed_out, rtol=1e-5, atol=1e-5)
 
 
+def test_all_true_mask_is_numerically_identical_to_none() -> None:
+    """全 True 的 padding mask 与 ``mask=None`` 必须逐值相同。
+
+    这是 forward 里「全 True 就置 None」那条捷径依赖的不变式。捷径的动机是显存：
+    带 attn_mask 时 SDPA 的 flash 后端不接（不支持任意 mask），只能退到 math 后端
+    显式 materialize 完整的 [B, H, S, S] 分数矩阵 —— 真机上（BW1000 64GB /
+    Krea2 / bs=1）单次 attention 就试图分配 42.99 GiB 直接 OOM。
+
+    而 bs=1 时 mask 恒为全 True：`pad_text_conditions` 按 batch 内最长 caption
+    右填充，只有一条 caption 时 max_length 就是它自己的长度。所以这条捷径在
+    最常见的配置上必然命中，它的正确性必须被钉住。
+
+    用 rtol=0/atol=0 的严格相等：两条路径走的是**同一个** kernel（都是无 mask 的
+    SDPA），不存在浮点重排，任何差异都意味着捷径的语义判断错了。
+    """
+    torch.manual_seed(11)
+    model = SingleStreamDiT(_tiny_config()).eval()
+    x, timesteps, context, _ = _tiny_inputs()
+    all_true = torch.ones(context.shape[0], context.shape[1], dtype=torch.bool)
+    with torch.no_grad():
+        with_mask = model(x, timesteps, context, all_true)
+        without_mask = model(x, timesteps, context, None)
+    torch.testing.assert_close(with_mask, without_mask, rtol=0, atol=0)
+
+
+def test_partial_mask_still_differs_from_none() -> None:
+    """含 False 的 mask **不能**被当成 None —— 否则 padding 会污染输出。
+
+    与上一条互为对照：捷径只在全 True 时生效。这条防的是「为了省显存把判断放宽成
+    无条件置 None」那种改法（它会让 test_padding_mask_prevents_padded_text... 失败，
+    但那条测试的失败信息指向的是模型行为，不容易联想到是捷径写错了）。
+    """
+    torch.manual_seed(11)
+    model = SingleStreamDiT(_tiny_config()).eval()
+    x, timesteps, context, mask = _tiny_inputs()
+    assert not bool(mask.all()), "本用例需要含 False 的 mask"
+    with torch.no_grad():
+        masked = model(x, timesteps, context, mask)
+        unmasked = model(x, timesteps, context, None)
+    assert not torch.allclose(masked, unmasked, rtol=1e-4, atol=1e-4), (
+        "含 padding 的 mask 被忽略了 —— padded 位置正在参与注意力"
+    )
+
+
 def test_gradient_checkpointing_path_backpropagates() -> None:
     model = SingleStreamDiT(_tiny_config()).train()
     model.enable_gradient_checkpointing()
