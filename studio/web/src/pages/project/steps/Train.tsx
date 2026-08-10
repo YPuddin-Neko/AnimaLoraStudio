@@ -63,6 +63,11 @@ export default function TrainPage() {
   const [autoSyncPaths, setAutoSyncPaths] = useState<boolean>(true)
   const [droppedFields, setDroppedFields] = useState<string[]>([])
   const [defaultedFields, setDefaultedFields] = useState<string[]>([])
+  /** 检测到的加速器卡数；null = 探测不到（无卡 / 驱动缺失 / torch 不可用）。
+   * 多卡设置项的上限与置灰都看它。用 /api/system/stats 的 gpu 数组长度：它已经
+   * 逐卡返回，且**服务端**口径 —— 与训练子进程看到的可见范围同源（都受
+   * CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES 约束）。 */
+  const [gpuCount, setGpuCount] = useState<number | null>(null)
 
   /** 已落盘的 config JSON 快照，dirty 判断的 baseline。 */
   const savedJsonRef = useRef<string | null>(null)
@@ -147,6 +152,10 @@ export default function TrainPage() {
     api.schema().then(setSchema).catch((e) => toast(t('train.loadSchemaFailed', { error: e }), 'error'))
     api.listPresets().then(setPresets).catch(() => setPresets([]))
     api.getSecrets().then((s) => setAutoSyncPaths(s.models?.auto_sync_paths ?? true)).catch(() => {})
+    // 一次性拉卡数（不轮询：这一页只用它决定多卡设置项要不要置灰，机器上插了
+    // 几张卡不会在用户填表期间变）。失败保持 null → 不置灰，宁可让用户能填也
+    // 不要因为一次探测抖动把功能锁死。
+    api.systemStats().then((s) => setGpuCount(s.gpu?.length ?? null)).catch(() => {})
   }, [toast, t])
 
   useEffect(() => {
@@ -209,9 +218,43 @@ export default function TrainPage() {
           </>
         )
       }
+      // 多卡设置项的动态后缀。按 docs/design/ui-info-design.md：机制说明（每卡
+      // batch 语义、上限、互斥理由）全在 schema description → ⓘ tooltip 里；这里
+      // 只放**跟随当前值变化的状态**（检测到几张卡 / 算出来的全局 batch），那属于
+      // 控件反馈而不是说明。
+      const ddp = Number(formValues?.ddp_num_processes) || 1
+      if (gpuCount !== null && gpuCount <= 1 && ddp > 1) {
+        // config 要 N 卡但机器只有 1 张（换机器 / 导入别人的预设）。此时字段
+        // **不置灰**（见下面 ddpDisabledFields），否则用户在 UI 上改不回 1、
+        // 只能去手改 yaml —— 同 navit_native_resolution 那条自救不了的教训。
+        h.ddp_num_processes = t('train.ddpExceedsDetected', { n: ddp, detected: gpuCount })
+      } else if (ddp > 1) {
+        h.ddp_num_processes = t('train.ddpGlobalBatch', {
+          detected: gpuCount ?? ddp,
+          global: (Number(formValues?.batch_size) || 1) * (Number(formValues?.grad_accum) || 1) * ddp,
+        })
+      }
       return h
     },
-    [configResp?.project_specific_fields, configResp?.project_specific_defaults, t, settingsDrawer],
+    [configResp?.project_specific_fields, configResp?.project_specific_defaults, t, settingsDrawer, gpuCount],
+  )
+
+  /** 单卡机器上把多卡设置项置灰 —— 只有 1 张卡时这个选项无意义。
+   *
+   * 例外：当前值已经 >1 时**不置灰**，否则用户改不回来（置灰的字段没有输入
+   * 入口）。那种情况由 autoHints 挂一条「检测到 N 张卡」的警示，让用户自己调回。
+   * gpuCount===null（探测失败）也不置灰：证明不了是单卡就别锁功能。 */
+  const ddpDisabledFields = useMemo(
+    () =>
+      gpuCount !== null && gpuCount <= 1 && (Number(config?.ddp_num_processes) || 1) <= 1
+        ? ['ddp_num_processes']
+        : [],
+    [gpuCount, config?.ddp_num_processes],
+  )
+
+  const ddpDisabledHints = useMemo(
+    () => ({ ddp_num_processes: t('train.ddpSingleGpu', { detected: gpuCount ?? 0 }) }),
+    [t, gpuCount],
   )
 
   /** 落盘 cfg。串行化保证：如果上一次 save 还在飞，等它跑完再决定是否要再
@@ -796,6 +839,8 @@ export default function TrainPage() {
                   schema={schema}
                   values={config}
                   onChange={onFormChange}
+                  disabledFields={ddpDisabledFields}
+                  disabledHints={ddpDisabledHints}
                   autoHints={makeAutoHints(config, setConfigSync)}
                   advancedMode={advancedMode}
                 />

@@ -30,6 +30,9 @@ from training.snapshot import (
 )
 from training.state import save_training_state
 from training.timestep_sampling import apply_resolution_shift, latent_token_counts
+# 模块对象 import（不是 `from utils.distributed import ...`）：测试要 monkeypatch
+# `utils.distributed.*`，绑成本模块全局名会打不中。同 training/dataset.py 的约定。
+from utils import distributed as dist_env
 from utils.optimizer_utils import get_optimizer_monitor_metrics, optimizer_eval_mode
 
 
@@ -162,6 +165,45 @@ def _display_total_steps(global_step, dl_len, grad_accum, total_epochs, epoch, m
     return est
 
 
+def _forward_via_ddp(ctx: TrainingContext, step_fn, *args, **kwargs):
+    """跑一次训练前向：多卡经 DDP 包装器，单进程直接调原函数。
+
+    单进程下 ``step_fn(ctx.model, *args, **kwargs)`` 与改动前的写法逐字节等价
+    （原来就是 ``family.forward_train(ctx.model, ...)`` 这种形式），没有任何多出来的
+    间接层或张量拷贝。
+
+    多卡下**必须**走这一层：DDP 的梯度同步是 ``DDP.forward`` 里
+    ``reducer.prepare_for_backward()`` 装上的。直接调 ``step_fn(ctx.model, ...)``
+    不会报任何错，但 reducer 的 autograd hook 全部提前 return —— 一次 all_reduce
+    都不会发生，各 rank 静默各训各的、最后存 rank 0 那份。这是本次集成里唯一
+    「不报错但结果全错」的坑，所以三条前向路径（标准 / navit / leap）统一收到
+    这个函数上，避免以后加第四条路径时漏掉。
+
+    ``step_fn`` 的约定：第一个位置参数收模型，其余原样透传 —— 现有三条路径
+    （``family.forward_train`` / ``navit_packed_forward_and_loss`` /
+    ``*_training_step``）本来就是这个签名。
+    """
+    if ctx.ddp_model is None:
+        return step_fn(ctx.model, *args, **kwargs)
+    return ctx.ddp_model(step_fn, *args, **kwargs)
+
+
+def _agree_on_finite_loss(loss) -> bool:
+    """本 micro-batch 的 loss 是否有限 —— 多卡下取**所有 rank 的一致结论**。
+
+    单进程等价于 ``bool(torch.isfinite(loss))``，行为不变。
+
+    为什么必须变成集合决策：NaN loss 的处理是 ``continue`` 跳过本 micro-batch。多卡下
+    只要有一个 rank 跳、别的 rank 没跳，没跳的那些就会进 backward 等一次永远不会
+    到齐的 all_reduce —— 训练卡死且不报错，是 DDP 最难查的死锁形态。
+    """
+    local_finite = bool(torch.isfinite(loss))
+    if not dist_env.is_distributed():
+        return local_finite
+    # 均值 < 1 说明至少一个 rank 是非有限值 → 全体一起跳。
+    return float(dist_env.all_reduce_mean(1.0 if local_finite else 0.0)) >= 1.0
+
+
 def _sample_timesteps(timestep_sampler, bs: int, device, latents) -> torch.Tensor:
     """按 sampler 能力声明按需注入 batch context，避免 family 分支进入共享循环。"""
     if getattr(timestep_sampler, "requires_token_counts", False):
@@ -230,6 +272,29 @@ def run(ctx: TrainingContext) -> None:
             # 在累积周期开始时记录时间
             if batch_idx % args.grad_accum == 0:
                 step_start_time = time.perf_counter()
+
+            # ── 梯度累积期间关掉 DDP 的梯度同步 ──────────────────────────
+            # DDP 默认**每次 backward 都 all_reduce**。梯度累积下这是纯浪费：
+            # grad_accum=4 时通信 4 次，而只有最后一次的结果会被 optimizer 用到，
+            # 前 3 次同步出来的梯度紧接着又被下一次累加覆盖。实测语义等价、通信量
+            # 降到 1/grad_accum。
+            #
+            # 为什么直接设 `require_backward_grad_sync` 而不用 `ddp_model.no_sync()`：
+            # no_sync() 是上下文管理器，而本循环的 forward 与 backward 相隔 300 多行
+            # （中间有 navit / leap / 标准三条分支），包起来要整体缩进一大段代码，
+            # 改动面和出错风险都远大于设一个标志位 —— 而 no_sync() 的实现本身就是
+            # 设这个标志位。语义完全一致。
+            #
+            # **必须在 forward 之前设**：DDP.forward 读这个标志决定要不要调
+            # prepare_for_backward 装 autograd hook。forward 之后再设是无效的。
+            #
+            # is_group_end 只依赖 batch_idx / dl_len / grad_accum，三者在 forward 前
+            # 都已确定，所以能提前算。多卡下各 rank 的 dl_len 相等（sampler 分片时
+            # 截断对齐过），batch_idx 同步推进，所以这个判断在各 rank 上必然一致 ——
+            # 不一致会让部分 rank 同步、部分不同步，直接死锁。
+            _, _is_group_end_pre = _accumulation_step(batch_idx, dl_len, args.grad_accum)
+            if ctx.ddp_model is not None:
+                ctx.ddp_model.require_backward_grad_sync = _is_group_end_pre
 
             captions = batch["captions"]
 
@@ -368,8 +433,9 @@ def run(ctx: TrainingContext) -> None:
                     if _lw is not None:
                         _piw = _lw if _piw is None else _piw * _lw
                     _no, _pi, _pd = noise_params_from_args(args)
-                    loss, pred, _navit_info = navit_packed_forward_and_loss(
-                        ctx.model, navit_latents, t, cross_packed, text_seqlens,
+                    loss, pred, _navit_info = _forward_via_ddp(
+                        ctx, navit_packed_forward_and_loss,
+                        navit_latents, t, cross_packed, text_seqlens,
                         ctx.loss_fn,
                         noise_offset=_no,
                         pyramid_iters=_pi,
@@ -407,8 +473,13 @@ def run(ctx: TrainingContext) -> None:
                             k=int(getattr(args, "leap_activation_k", 3) or 3),
                             dtype=torch.float32,
                         )
-                        loss_per_sample = sparse_training_step(
-                            ctx.model, latents, noise, cross, pad_mask, t_steps,
+                        # 注：leap 系每步跑多次前向，与 DDP 的「一次 forward 对一次
+                        # backward」冲突，启动期已 fail-fast
+                        # （bootstrap._check_ddp_prerequisites），多卡下走不到这里。
+                        # 仍然经 _forward_via_ddp 收口，保持三条路径同形。
+                        loss_per_sample = _forward_via_ddp(
+                            ctx, sparse_training_step,
+                            latents, noise, cross, pad_mask, t_steps,
                             traj_sim_weighting=_leap_tsw, traj_sim_min=_leap_tsm,
                             use_checkpoint=args.grad_checkpoint,
                         )
@@ -423,8 +494,9 @@ def run(ctx: TrainingContext) -> None:
                             _step_fn = lagrange_training_step
                         else:  # original（默认，行为零变化）
                             _step_fn = leap_training_step
-                        loss_per_sample = _step_fn(
-                            ctx.model, latents, noise, cross, pad_mask, t_k, t_j,
+                        loss_per_sample = _forward_via_ddp(
+                            ctx, _step_fn,
+                            latents, noise, cross, pad_mask, t_k, t_j,
                             nested_grad_coe=_leap_ngc,
                             traj_sim_weighting=_leap_tsw, traj_sim_min=_leap_tsm,
                             use_checkpoint=args.grad_checkpoint,
@@ -442,8 +514,8 @@ def run(ctx: TrainingContext) -> None:
                     # ── 标准 rectified flow 路径（零行为变化）──
                     noisy = (1 - t_exp) * latents + t_exp * noise
                     target = noise - latents
-                    pred = ctx.family.forward_train(
-                        ctx.model, noisy, t, cross,
+                    pred = _forward_via_ddp(
+                        ctx, ctx.family.forward_train, noisy, t, cross,
                         use_checkpoint=args.grad_checkpoint,
                     )
                     # masked loss（B2）：dataset 已把 mask 下采样到 latent 分辨率，
@@ -474,6 +546,22 @@ def run(ctx: TrainingContext) -> None:
                     # 是因为 distribution identity 跟 gradient 权重是两条独立轴
                     # （reg_weight=1.0 时 loss_weight=1.0 但 reg 仍是不同分布）。
                     # 见 docs/todo/infonoise-reg-policy-reeval.md 未来重评估条件。
+                    #
+                    # 多卡：统计**有意保持 per-rank 独立**，不跨 rank 同步。三条理由：
+                    #   1. record 在数据相关的分支里调（`if _main_mask.any()`）——
+                    #      某个 rank 的 batch 全是 reg 集时它压根不调。集合通信放进来
+                    #      会在那一步少一个参与者 → 直接死锁。这是硬性排除，不是取舍。
+                    #   2. 不同步也是无偏的：各 rank 的 FIFO 喂的是同一分布的 IID 分片
+                    #      （dataset._ddp_shard 按 batch 轮流分，各 rank 桶分布近似一致），
+                    #      每个 rank 估的是同一条 mmse(t) 曲线；全局采样分布是 N 条近似
+                    #      相同 CDF 的混合，期望上与单卡一致，差别只是估计噪声。
+                    #   3. warmup 时长不变：gate 用 global_step（各 rank 同步推进），
+                    #      而每个 rank 每 step 往 FIFO 里塞的样本数与单卡相同 ——
+                    #      也就是 N_warm 的语义跨 world_size 不漂。
+                    # 代价：wandb 上的 infonoise/cdf_ready 等只反映 rank 0 的视角
+                    # （日志本来就只有 rank 0 上报）。真要同步的话唯一安全的挂点是
+                    # maybe_refresh —— 它的触发条件只看 global_step，各 rank 必定同时
+                    # 进入，在那里 all_reduce 每 bin 的 EMA 是可行的。
                     if "is_reg" in batch:
                         _main_mask = ~batch["is_reg"].to(t.device)
                         if _main_mask.any():
@@ -516,25 +604,60 @@ def run(ctx: TrainingContext) -> None:
                 if reg is not None:
                     loss = loss + reg
 
-            # NaN 检测：forward 出 NaN 时跳过本 micro-batch
-            if not torch.isfinite(loss):
-                logger.warning(f"step {ctx.global_step} micro-batch {batch_idx}: loss={loss.item():.4g}，跳过")
+            # NaN 检测：forward 出 NaN 时跳过本 micro-batch。
+            # 多卡下跳不跳必须全体一致，否则没跳的 rank 会等死在 all_reduce 上
+            # （见 _agree_on_finite_loss）。
+            if not _agree_on_finite_loss(loss):
+                if bool(torch.isfinite(loss)):
+                    # 本 rank 的 loss 正常，是别的 rank 出了 NaN —— 一起跳。
+                    logger.warning(
+                        "step %d micro-batch %d: 其他 rank 的 loss 非有限值，本 rank 同步跳过",
+                        ctx.global_step, batch_idx,
+                    )
+                else:
+                    logger.warning(f"step {ctx.global_step} micro-batch {batch_idx}: loss={loss.item():.4g}，跳过")
                 ctx.optimizer.zero_grad()
+                if ctx.ddp_model is not None and _is_group_end_pre:
+                    # DDP 的 reducer 在 forward 末尾已被 arm（prepare_for_backward），
+                    # 不跑 backward 就 continue 会让它一直等 finalize，下一步的 forward
+                    # 直接抛「Expected to have finished reduction in the prior iteration」——
+                    # 于是「跳过一个坏 micro-batch」在多卡下升级成硬崩。
+                    # 跑一次系数为 0 的 backward 把 reduction 走完（梯度紧接着被
+                    # zero_grad 丢掉，只为让 reducer 回到干净状态）。全体 rank 同时
+                    # 走这条路，通信仍然对齐；代价是一次白跑的反向 —— NaN 是罕见事件，
+                    # 换来「跳过」语义在多卡下依然成立，值得。
+                    #
+                    # 只在 _is_group_end_pre 为真时才需要：累积中间步已经关掉了同步
+                    # （require_backward_grad_sync=False），reducer 压根没被 arm，
+                    # 没有待 finalize 的 reduction。此时跑这个 backward 是纯浪费，
+                    # 而且各 rank 都会跳过同一批 micro-batch（_agree_on_finite_loss
+                    # 保证了一致），通信不会错位。
+                    (loss.nan_to_num(0.0, posinf=0.0, neginf=0.0) * 0.0).backward()
+                    ctx.optimizer.zero_grad()
                 continue
 
             # 反向传播。尾组（len % grad_accum）不满时按实际 micro-batch 数归一，
             # 且 epoch 末批不满也 step —— 修尾批丢弃 + 跨 epoch 梯度泄漏（见 _accumulation_step）。
             group_size, is_group_end = _accumulation_step(batch_idx, dl_len, args.grad_accum)
             loss = loss / group_size
+            # 多卡：backward **必须**用本 rank 的原始 loss。DDP 自己在反向里对梯度做
+            # all_reduce 取平均，这里再把 loss 跨 rank 平均一次等于平均两遍，梯度会被
+            # 缩到 1/world_size。跨 rank 平均只用于下面的日志（见 loss_val）。
             if ctx.scaler is not None:
                 ctx.scaler.scale(loss).backward()
             else:
                 loss.backward()
 
             if is_group_end:
+                # GradScaler 与 DDP 的顺序天然正确，无需改动：DDP 在 backward 里就
+                # 把（放大过的）梯度 all_reduce 完了，scaler 在这里 unscale 的是已经
+                # 同步好的梯度。放大系数各 rank 一致（同一个 scaler 初值 + 同样的
+                # update 序列），所以「先同步后 unscale」与「先 unscale 后同步」等价。
                 if ctx.scaler is not None:
                     ctx.scaler.unscale_(ctx.optimizer)
-                # NaN 梯度检测：跳过本次 update，清零继续
+                # NaN 梯度检测：跳过本次 update，清零继续。
+                # 多卡下这个判断天然一致 —— 梯度已经过 all_reduce，任一 rank 出 NaN
+                # 都会污染均值，于是所有 rank 看到同一份含 NaN 的梯度、同时跳过。
                 has_nan_grad = any(
                     p.grad is not None and not torch.isfinite(p.grad).all()
                     for p in ctx.trainable_params
@@ -546,6 +669,10 @@ def run(ctx: TrainingContext) -> None:
                         ctx.scaler.update()
                     continue
 
+                # 多卡下梯度已同步 → 各 rank 算出同一个范数、同一个裁剪系数，参数不会
+                # 因裁剪而分歧。前提是 trainable_params 里每一项的梯度都进了
+                # all_reduce；唯一的例外（SRA projection MLP）已在启动期与
+                # grad_clip 互斥（bootstrap._check_ddp_prerequisites）。
                 if ctx.grad_clip > 0:
                     torch.nn.utils.clip_grad_norm_(ctx.trainable_params, max_norm=ctx.grad_clip)
                 if ctx.scaler is not None:
@@ -561,12 +688,23 @@ def run(ctx: TrainingContext) -> None:
                 # 自适应采样器：刷新采样分布；baseline 是 no-op
                 ctx.timestep_sampler.maybe_refresh(ctx.global_step)
 
-                # 记录 loss 历史
+                # 记录 loss 历史。
+                #
+                # 多卡：**只有日志/监控用跨 rank 平均值**。各 rank 只见自己那份
+                # micro-batch，直接打出来曲线抖得多、且与单卡不可比（同样的全局
+                # batch size 下单卡打的就是全局均值）。平均后语义正好等于
+                # 「全局 batch 的 loss」。
+                # 反向已经在上面用本 rank 的原始 loss 跑完了 —— 顺序很重要：先
+                # backward（本地值），再为日志求平均。反过来（拿平均值 backward）
+                # 会让 DDP 的梯度平均叠加一次 loss 平均，梯度被缩到 1/world_size。
                 loss_val = float(loss.item() * group_size)
                 denoise_loss_val = (
                     float(denoise_loss_log.item())
                     if denoise_loss_log is not None else loss_val
                 )
+                if dist_env.is_distributed():
+                    loss_val = float(dist_env.all_reduce_mean(loss_val))
+                    denoise_loss_val = float(dist_env.all_reduce_mean(denoise_loss_val))
                 sra_align_loss_val = (
                     float(sra_align_loss_log.item())
                     if sra_align_loss_log is not None else None
@@ -676,8 +814,15 @@ def run(ctx: TrainingContext) -> None:
                         flush=True,
                     )
 
-                # 按 step 采样（轮换提示词）
-                if args.sample_steps > 0 and ctx.global_step % args.sample_steps == 0:
+                # 按 step 采样（轮换提示词）。
+                # 多卡只有 rank 0 出图：所有 rank 会写同一个 sample_dir/step_N.png，
+                # 并发写同一文件必然写坏；采样是纯推理，多跑 N-1 份纯浪费。
+                # （bootstrap 已把非 rank 0 的 sample_steps 置 0，这里的 is_main()
+                # 是显式化意图 + 让本文件自成一体可测，两者都留。）
+                # 不需要 barrier：采样不改权重（optimizer_eval_mode 把 averaged
+                # weights 换进去、事后原样换回），其余 rank 跑到下一次梯度 all_reduce
+                # 时自然会等 rank 0 回来。
+                if dist_env.is_main() and args.sample_steps > 0 and ctx.global_step % args.sample_steps == 0:
                     prompt = ctx.get_next_sample_prompt()
                     prompt_short = prompt[:50] + "..." if len(prompt) > 50 else prompt
                     ctx.emit(f"采样中 (step {ctx.global_step}): {prompt_short}")
@@ -690,43 +835,57 @@ def run(ctx: TrainingContext) -> None:
                         wandb_step=ctx.global_step,
                     )
 
-                # 定期保存 LoRA 权重（按 step）
+                # 定期保存 LoRA 权重（按 step）。
+                # 多卡只有 rank 0 落盘（各 rank 的 LoRA 权重由 DDP 保证一致，存 N 份
+                # 相同文件到同一路径只会互相写坏）。存完 barrier：PPSF 系优化器的
+                # optimizer_eval_mode 会把参数原地换成 averaged weights 再换回，
+                # 让其余 rank 在这段窗口外等着，避免任何 rank 在半换状态下参与通信。
+                # barrier 放在 if 里侧、is_main() 外侧 —— 它是集合操作，必须所有 rank
+                # 都执行；而这个 if 的条件（global_step / save_every_steps）各 rank 一致。
                 save_every_steps = getattr(args, "save_every_steps", 0)
                 if save_every_steps > 0 and ctx.global_step % save_every_steps == 0:
                     lora_path = ctx.output_dir / f"{args.output_name}_step{ctx.global_step}.safetensors"
-                    # PPSF：保存 averaged weights 的 LoRA
-                    with optimizer_eval_mode(ctx.optimizer):
-                        ctx.injector.save(lora_path)
-                    ctx.emit(f"Saved LoRA: {lora_path}")
-                    ctx.wandb_monitor.upload_model(lora_path)
+                    if dist_env.is_main():
+                        # PPSF：保存 averaged weights 的 LoRA
+                        with optimizer_eval_mode(ctx.optimizer):
+                            ctx.injector.save(lora_path)
+                        ctx.emit(f"Saved LoRA: {lora_path}")
+                        ctx.wandb_monitor.upload_model(lora_path)
+                    dist_env.barrier()
 
                 # 定期保存训练状态（断点续训）
                 save_state_every_steps = getattr(args, "save_state_every_steps", 0)
                 if save_state_every_steps > 0 and ctx.global_step % save_state_every_steps == 0:
                     state_path = ctx.state_dir() / f"training_state_step{ctx.global_step}.pt"
-                    # 获取监控面板数据用于恢复 loss 曲线
-                    monitor_data = None
-                    if ctx.monitor_server:
-                        try:
-                            from train_monitor import get_state
-                            monitor_data = get_state()
-                        except Exception:
-                            pass
-                    # PPSF：state + LoRA 都走 averaged weights
-                    with optimizer_eval_mode(ctx.optimizer):
-                        save_training_state(
-                            state_path, ctx.injector, ctx.optimizer, epoch, ctx.global_step,
-                            ctx.loss_history, monitor_state=monitor_data, scheduler=ctx.scheduler,
-                            timestep_sampler=ctx.timestep_sampler,
-                            sra_aligner=ctx.sra_aligner,
-                            scaler=ctx.scaler,
-                            model_family=ctx.family.spec.family_id,
-                        )
-                        # 同时保存 LoRA 权重
-                        lora_path = ctx.output_dir / f"{args.output_name}_step{ctx.global_step}.safetensors"
-                        ctx.injector.save(lora_path)
-                    ctx.emit(f"Saved training state (step {ctx.global_step}): {state_path.name}")
-                    ctx.wandb_monitor.upload_state_manual(state_path)
+                    # 只有 rank 0 落盘 + barrier，理由同上面的 LoRA 周期保存。
+                    # state 里的 optimizer / sampler / RNG 状态取 rank 0 那一份：
+                    # resume 时所有 rank 都从这同一份起步（各 rank 的种子偏移由
+                    # bootstrap 重新施加），语义清晰。
+                    if dist_env.is_main():
+                        # 获取监控面板数据用于恢复 loss 曲线
+                        monitor_data = None
+                        if ctx.monitor_server:
+                            try:
+                                from train_monitor import get_state
+                                monitor_data = get_state()
+                            except Exception:
+                                pass
+                        # PPSF：state + LoRA 都走 averaged weights
+                        with optimizer_eval_mode(ctx.optimizer):
+                            save_training_state(
+                                state_path, ctx.injector, ctx.optimizer, epoch, ctx.global_step,
+                                ctx.loss_history, monitor_state=monitor_data, scheduler=ctx.scheduler,
+                                timestep_sampler=ctx.timestep_sampler,
+                                sra_aligner=ctx.sra_aligner,
+                                scaler=ctx.scaler,
+                                model_family=ctx.family.spec.family_id,
+                            )
+                            # 同时保存 LoRA 权重
+                            lora_path = ctx.output_dir / f"{args.output_name}_step{ctx.global_step}.safetensors"
+                            ctx.injector.save(lora_path)
+                        ctx.emit(f"Saved training state (step {ctx.global_step}): {state_path.name}")
+                        ctx.wandb_monitor.upload_state_manual(state_path)
+                    dist_env.barrier()
 
                 # 检查 max_steps
                 if args.max_steps and ctx.global_step >= args.max_steps:
@@ -743,17 +902,19 @@ def run(ctx: TrainingContext) -> None:
                 step=ctx.global_step,
             )
         if not args.max_steps or ctx.global_step < args.max_steps:
-            # 保存 checkpoint
+            # 保存 checkpoint（只 rank 0 落盘 + barrier，理由同 step 版）
             if args.save_every_epochs > 0 and ctx.current_epoch % args.save_every_epochs == 0:
                 save_path = ctx.output_dir / f"{args.output_name}_epoch{ctx.current_epoch}.safetensors"
-                # PPSF：保存 averaged weights 的 LoRA
-                with optimizer_eval_mode(ctx.optimizer):
-                    ctx.injector.save(save_path)
-                ctx.emit(f"Saved LoRA: {save_path}")
-                ctx.wandb_monitor.upload_model(save_path)
+                if dist_env.is_main():
+                    # PPSF：保存 averaged weights 的 LoRA
+                    with optimizer_eval_mode(ctx.optimizer):
+                        ctx.injector.save(save_path)
+                    ctx.emit(f"Saved LoRA: {save_path}")
+                    ctx.wandb_monitor.upload_model(save_path)
+                dist_env.barrier()
 
-            # 采样（轮换提示词）
-            if args.sample_every > 0 and ctx.current_epoch % args.sample_every == 0:
+            # 采样（轮换提示词）；多卡只 rank 0 出图，理由同 step 版采样
+            if dist_env.is_main() and args.sample_every > 0 and ctx.current_epoch % args.sample_every == 0:
                 prompt = ctx.get_next_sample_prompt()
                 prompt_short = prompt[:50] + "..." if len(prompt) > 50 else prompt
                 ctx.emit(f"采样中 (epoch {ctx.current_epoch}): {prompt_short}")
@@ -773,27 +934,29 @@ def run(ctx: TrainingContext) -> None:
             save_state_every_epochs = int(getattr(args, "save_state_every_epochs", 0) or 0)
             if save_state_every_epochs > 0 and ctx.current_epoch % save_state_every_epochs == 0:
                 state_path = ctx.state_dir() / f"training_state_epoch{ctx.current_epoch}.pt"
-                monitor_data = None
-                if ctx.monitor_server:
-                    try:
-                        from train_monitor import get_state
-                        monitor_data = get_state()
-                    except Exception:
-                        pass
-                with optimizer_eval_mode(ctx.optimizer):
-                    save_training_state(
-                        state_path, ctx.injector, ctx.optimizer, ctx.current_epoch, ctx.global_step,
-                        ctx.loss_history, monitor_state=monitor_data, scheduler=ctx.scheduler,
-                        timestep_sampler=ctx.timestep_sampler,
-                        sra_aligner=ctx.sra_aligner,
-                        scaler=ctx.scaler,
-                        model_family=ctx.family.spec.family_id,
-                    )
-                    lora_path = ctx.output_dir / f"{args.output_name}_epoch{ctx.current_epoch}.safetensors"
-                    if not lora_path.exists():
-                        ctx.injector.save(lora_path)
-                ctx.emit(f"Saved training state (epoch {ctx.current_epoch}): {state_path.name}")
-                ctx.wandb_monitor.upload_state_manual(state_path)
+                if dist_env.is_main():
+                    monitor_data = None
+                    if ctx.monitor_server:
+                        try:
+                            from train_monitor import get_state
+                            monitor_data = get_state()
+                        except Exception:
+                            pass
+                    with optimizer_eval_mode(ctx.optimizer):
+                        save_training_state(
+                            state_path, ctx.injector, ctx.optimizer, ctx.current_epoch, ctx.global_step,
+                            ctx.loss_history, monitor_state=monitor_data, scheduler=ctx.scheduler,
+                            timestep_sampler=ctx.timestep_sampler,
+                            sra_aligner=ctx.sra_aligner,
+                            scaler=ctx.scaler,
+                            model_family=ctx.family.spec.family_id,
+                        )
+                        lora_path = ctx.output_dir / f"{args.output_name}_epoch{ctx.current_epoch}.safetensors"
+                        if not lora_path.exists():
+                            ctx.injector.save(lora_path)
+                    ctx.emit(f"Saved training state (epoch {ctx.current_epoch}): {state_path.name}")
+                    ctx.wandb_monitor.upload_state_manual(state_path)
+                dist_env.barrier()
 
             # ADR 0006 Addendum 1 方案 Δ：每 epoch 末尾**强制**写 auto_epoch_state.pt（覆盖式）。
             # 跟用户主动开的 save_state_every_epochs / save_state_every_steps（多份历史归档）独立，无 args gate ——

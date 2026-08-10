@@ -21,6 +21,11 @@ from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
+# 有意 import **模块对象**而不是 `from utils.distributed import is_main`：后者把函数
+# 绑成本模块的全局名，测试 monkeypatch `utils.distributed.is_main` 就打不中了。
+# 与 training/dataset.py 的 DDP 分片段同一约定。
+from utils import distributed as dist_env
+
 if TYPE_CHECKING:
     from training.losses.protocol import LossProtocol
 
@@ -64,6 +69,21 @@ class TrainingContext:
     # 对循环 opaque —— 多模型 PR-2b D15，替代原 qwen_model/qwen_tok/t5_tok 三字段）
     text_stack: Any = None
     injector: Any = None
+    # DDP 包装器（多卡时由 models_phase._wrap_ddp 填充；单进程恒为 None）。
+    #
+    # 为什么**不是**把 ctx.model 换成 DDP 对象（这是最容易想错的一步）：
+    #   1. `DistributedDataParallel` 不转发属性访问。ctx.model 的下游要读
+    #      `.blocks` / `.model_channels` / `.patch_spatial`（SRA、block swap）、
+    #      要调 `.train()` / `.eval()`（resume_phase、sample_runner）、还要整个
+    #      塞给 family.sample_image() 出图 —— 换成 DDP 对象后全部 AttributeError。
+    #   2. checkpoint 的 `module.` 前缀问题从根上不存在：LoRA 产物由
+    #      `injector.state_dict()` 出（LyCORIS network 是 DiT 的**兄弟**对象，不是
+    #      子模块），ctx.model 保持裸模型意味着没有任何一处 state_dict 会被
+    #      DDP 的命名空间污染。
+    # 所以：ctx.model 永远是裸模型，DDP 包装器单独放这里，**只有训练前向**走它
+    # （loop._forward_via_ddp）—— 因为梯度同步是 DDP.forward 装上去的，不进它
+    # 就一次 all_reduce 都不会发生（静默各 rank 独立训练，最坏的失败形态）。
+    ddp_model: Any = None  # torch.nn.parallel.DistributedDataParallel (optional)
 
     # ─── dataset_phase 填充 ───
     bucket_mgr: Any = None
@@ -147,8 +167,17 @@ class TrainingContext:
     def emit(self, msg: str) -> None:
         """打印一条 user-facing 消息，按当前进度显示模式分流。
 
-        移植自原 main() 内 emit 闭包；行为完全一致。
+        移植自原 main() 内 emit 闭包；单进程行为完全一致。
+
+        多卡下只有 rank 0 真的打印。门控放在这里而不是逐个调用点，是因为
+        emit 的调用方遍布 loop / resume / finalize / sample_runner，其中
+        resume_phase 那几处（"从断点恢复训练" / "采样中 (step 0, 基线)"）不在
+        本次改动范围内 —— 收在这一处才能真正做到日志不 ×N。
+
+        单进程 ``is_main()`` 恒真，所以这个分支等于不存在。
         """
+        if not dist_env.is_main():
+            return
         if self.use_plain:
             print()
         if self.live:
@@ -203,11 +232,18 @@ class TrainingContext:
         except Exception:
             pass
         # emit 在 wandb finish 后 — 让 supervisor 读到事件时一切 IO 已完成。
-        emit_event("pause_state", {
-            "state_path": str(self.last_auto_epoch_state_path) if self.last_auto_epoch_state_path else None,
-            "config_path": str(self.last_auto_epoch_config_path) if self.last_auto_epoch_config_path else None,
-            "step": self.global_step,
-        })
+        #
+        # 多卡：`__EVENT__:` 只能由 rank 0 写。supervisor 只读一个 stdout，N 个 rank
+        # 同写 pause_state 会让它按 N 次暂停处理（第二次起 state_path 指向同一份
+        # 文件、step 却可能不同）—— 表现为任务状态在 paused/canceled 之间反复跳。
+        # 非 rank 0 仍然照常 sys.exit(0)：torchrun 见到任一子进程退出会收掉整组，
+        # 所以「只有 rank 0 上报、所有 rank 都退出」是正确组合。
+        if dist_env.is_main():
+            emit_event("pause_state", {
+                "state_path": str(self.last_auto_epoch_state_path) if self.last_auto_epoch_state_path else None,
+                "config_path": str(self.last_auto_epoch_config_path) if self.last_auto_epoch_config_path else None,
+                "step": self.global_step,
+            })
         if self.last_auto_epoch_state_path:
             self.emit(f"已暂停！恢复点: {self.last_auto_epoch_state_path}")
         else:

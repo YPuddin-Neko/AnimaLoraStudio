@@ -8,6 +8,10 @@ NaViT / Patch-n-Pack 块对角打包（Phase 2 数据层）：
 
 抽自原 runtime/anima_train.py L1144-1675 + L1939-1962（ADR 0003 PR-A）。
 
+DDP（ADR 0016 多卡）：两个 batch sampler 都在**batch 粒度**分片（不是样本粒度，
+那会打散分桶 → 同 step 各 rank 形状不一致 → 梯度同步死锁）。规则单点收敛在
+``_ddp_shard``。单进程（无 torchrun）路径逐字节保持原行为。
+
 公开：
 - BucketManager / ImageDataset / RepeatDataset / MergedDataset
 - BucketBatchSampler / CachedLatentDataset
@@ -26,6 +30,16 @@ from pathlib import Path
 
 import torch
 from torch.utils.data import Dataset
+
+# DDP 分片要用的 rank / world_size。判定收敛在 utils.distributed（单一权威源），
+# 这里不自己读 os.environ["RANK"]。
+# 有意 import **模块对象**而不是 `from utils.distributed import world_size`：后者把
+# 函数绑成本模块的全局名，(a) 测试 monkeypatch utils.distributed.world_size 打不中，
+# (b) 语义上也不对 —— utils.distributed 每次调用现读环境变量，sampler 不该在
+# import 时就把拓扑冻结成常量。
+# utils/__init__.py 故意保持空（历史上 eager re-export 会链式拉起 torchvision），
+# 所以这条 import 对 studio server 侧同样零代价，仓库根在 sys.path 上即可。
+from utils import distributed as dist_env
 
 # 相对导入：本模块被 studio server 以 `runtime.training.dataset` 复用（bucket
 # 分布预览），那边 sys.path 只有仓库根，`training.*` 绝对导入会 ModuleNotFoundError。
@@ -819,8 +833,94 @@ class MergedDataset(Dataset):
         return item
 
 
+# ======================================================== DDP 的 batch 级分片
+# 两个 batch sampler（ARB 分桶 / NaViT 打包）共用同一套分片规则，见 _ddp_shard。
+
+#: 已打过的分片日志键，防止每 epoch 重复刷同一行（sampler 每 epoch 重建 batch 列表）。
+_DDP_SHARD_LOGGED: set[str] = set()
+
+
+def _ddp_shard(batches, label):
+    """把**完整** batch 列表切成本 rank 该跑的那一份。单进程下原对象返回。
+
+    为什么不用 ``torch.utils.data.DistributedSampler``
+    ------------------------------------------------
+    它按**样本索引**平均切分再分给各 rank，完全无视桶结构 —— 切完一个 batch 里会
+    混进不同分辨率的样本，``collate_fn`` / ``collate_fn_cached`` 的 ``torch.stack``
+    直接 RuntimeError（形状不一致）。就算 stack 侥幸过了，各 rank 同一 step 的张量
+    形状也不同，DDP 依赖「所有 rank 的计算图同构」这一前提，形状分歧会让梯度桶
+    对不上 → all_reduce 卡死。所以分片必须发生在**batch 粒度**：先照单进程逻辑生成
+    完整 batch 列表（桶内分组、shuffle 全都不变），再整个 batch 分给某个 rank。
+
+    为什么 stride 切片（``[rank::ws]``）而不是连续块（``[rank*n:(rank+1)*n]``）
+    ----------------------------------------------------------------------
+    batch 列表是按桶顺序排的（一个桶的 batch 连续排在一起）。连续块切法会让
+    rank 0 拿到全部小分辨率桶、最后一个 rank 拿到全部大分辨率桶：显存占用和单步
+    耗时都严重不均，而 DDP 每步都要等最慢的 rank，整体吞吐被拖到最慢那张卡的水平，
+    大桶那张卡还更容易 OOM。stride 切片让相邻 batch 轮流分给各 rank，各 rank 的
+    桶分布近似一致。
+
+    为什么截断而不是补齐
+    ------------------
+    各 rank 的 batch 数必须**严格相等**：少一个 batch 的 rank 会先退出 for 循环，
+    其余 rank 永远等在下一次 all_reduce 上 —— 这是 DDP 最经典的死锁，且表现为
+    「训练卡住无报错」，极难排查。对齐只有补齐和截断两条路：补齐（重复采样凑数）
+    会让部分样本在同一 epoch 里训练两次，静默改变训练语义（等价于给这些样本悄悄
+    加权），所以这里选截断到 ``total // world_size``。丢掉的最多 ``world_size - 1``
+    个 batch，相对整个 epoch 可忽略；又因为 ``shuffle`` 让每个 epoch 的 batch 顺序
+    不同，被丢的不是固定那几个样本，多 epoch 下期望覆盖仍然均匀。
+    """
+    ws = dist_env.world_size()
+    if ws <= 1:
+        # 单进程逐字节保持原行为：连列表对象都不换（不 copy、不重排）。
+        return batches
+
+    total = len(batches)
+    per_rank = total // ws
+    _log_shard_once(label, total, per_rank, ws)
+    if per_rank == 0:
+        return []
+    # 先截到 ws 的整数倍再 stride：这样每个 rank 恰好拿 per_rank 个，
+    # 不必再逐 rank 二次裁剪（stride 切片在整数倍下天然等长）。
+    return batches[:per_rank * ws][dist_env.rank()::ws]
+
+
+def _log_shard_once(label, total, per_rank, ws):
+    """分片结果只在每个 (sampler, world_size) 组合上打一次，避免每 epoch 刷屏。
+
+    只有 rank 0 打：各 rank 算出的是同一份数字（分片是纯本地的确定性计算），
+    N 个进程各打一遍只是把日志刷成 N 份。
+    """
+    if not dist_env.is_main():
+        return
+    key = f"{label}:{ws}:{per_rank == 0}"
+    if key in _DDP_SHARD_LOGGED:
+        return
+    _DDP_SHARD_LOGGED.add(key)
+    if per_rank == 0:
+        # 数据太少，切不出每 rank 一个 batch。截断语义下这会导致**空 epoch**
+        # （所有 rank 都拿 0 个 batch）—— 与其静默跑一个什么都没训的 epoch，
+        # 这里必须显式 warn。补齐并不能真正解决（样本重复次数会超过 1 倍）。
+        logger.warning(
+            "[DDP] %s 只有 %d 个 batch，少于 world_size=%d：本 epoch 各 rank 都拿不到 batch。"
+            "请减小 --nproc_per_node、减小 batch_size 或增加数据量。",
+            label, total, ws,
+        )
+    else:
+        logger.info(
+            "[DDP] %s 按 batch 分片：全局 %d 个 → 每 rank %d 个（丢弃尾部 %d 个以对齐各 rank，"
+            "见 _ddp_shard 注释）",
+            label, total, per_rank, total - per_rank * ws,
+        )
+
+
 class BucketBatchSampler:
-    """Batch sampler that groups samples by bucket so latents in each batch have the same size."""
+    """Batch sampler that groups samples by bucket so latents in each batch have the same size.
+
+    DDP 下按 batch 分片（``batches[rank::world_size]`` + 截断对齐），分桶结构不受
+    影响 —— 规则与理由见 :func:`_ddp_shard`。单进程（``world_size()==1``）时
+    ``__iter__`` / ``__len__`` 的输出与加 DDP 支持之前逐字节一致。
+    """
     def __init__(self, dataset, batch_size, drop_last=True, shuffle=True, seed=42):
         self.dataset = dataset
         self.batch_size = int(batch_size)
@@ -839,9 +939,20 @@ class BucketBatchSampler:
         return None
 
     def set_epoch(self, epoch):
+        """每 epoch 换 shuffle 顺序（``seed + epoch`` 确定性）。DDP 下语义不变。
+
+        这条「只用 seed + epoch，不混入 rank」的性质正是 DDP 分片能成立的关键：
+        所有 rank 用同一个种子独立重建出**同一份**完整 batch 列表，各自 stride
+        切自己那份，因此不需要任何进程间通信（不需要 broadcast batch 划分、也不
+        需要在 epoch 边界 barrier）。反过来说：**绝不能**把 rank 掺进种子 —— 那样
+        各 rank 的完整列表就不同了，切片结果会重叠 + 漏样本，且不会报错。
+
+        调用方（loop.py）在每个 epoch 开头调它，各 rank 传相同的 epoch。
+        """
         self.epoch = int(epoch)
 
-    def __len__(self):
+    def _len_full(self):
+        """**全局**（未分片）batch 数 —— 单进程下就是 ``__len__`` 的原实现。"""
         # ARB 下实际 batch 数 = Σ_bucket f(n_b, bs)；用全局 n 会偏（每桶各自有零头）。
         # 没有桶信息时退回到全局公式（线性 DataLoader 行为）。
         if self._cached_dataset is None:
@@ -864,7 +975,35 @@ class BucketBatchSampler:
                 total += (n + self.batch_size - 1) // self.batch_size
         return total
 
+    def __len__(self):
+        """本 rank 实际会迭代出的 batch 数（DDP 下 = 分片后的数量）。
+
+        **必须**返回分片后的数量，不能返回全局数：loop.py 用 ``dl_len =
+        len(dataloader)`` 判定梯度累积的尾组（``batch_idx >= dl_len - remainder``
+        以及 ``batch_idx + 1 == dl_len``）。返回全局数的话每个 rank 都以为后面还有
+        batch，尾组的 ``optimizer.step`` 不会触发，那部分梯度会挂在参数上泄漏到下
+        一个 epoch；``steps_per_epoch`` / scheduler 总步数也会全部偏大 world_size 倍。
+
+        batch 数与 shuffle 顺序无关（每桶各自算零头），所以这里能纯解析算出来，
+        不必真跑一遍 ``__iter__``。分片是整数除法，同样解析可算。
+        """
+        total = self._len_full()
+        ws = dist_env.world_size()
+        if ws <= 1:
+            return total
+        return total // ws
+
     def __iter__(self):
+        # 单进程走原来的惰性生成路径（不物化列表）—— 逐字节保持原行为，也不多占内存。
+        if not dist_env.is_distributed():
+            yield from self._iter_full()
+            return
+        # DDP：必须先物化完整 batch 列表才能分片（切片要知道总数）。各 rank 靠
+        # seed + epoch 独立算出同一份列表，见 set_epoch / _ddp_shard 注释。
+        yield from _ddp_shard(list(self._iter_full()), "BucketBatchSampler")
+
+    def _iter_full(self):
+        """产出**全局**（未分片）batch 序列 —— 单进程下就是 ``__iter__`` 的原实现。"""
         rng = random.Random(self.seed + self.epoch)
         if self._cached_dataset is None:
             indices = list(range(len(self.dataset)))
@@ -1548,6 +1687,23 @@ class NavitPackBatchSampler:
     每个产出的列表是一个打包训练序列：其各图 token 数之和 ≤ ``token_budget``，
     整包作为一个零 padding 的块对角 forward。把"每步图片数"与单图形状解耦——
     不同 token 数和长宽比的图可以共享一个包，小数据集也能填满大 effective batch。
+
+    DDP
+    ---
+    按包分片（``packs[rank::world_size]`` + 截断对齐），规则同 :func:`_ddp_shard`。
+    单进程输出与加 DDP 支持之前逐字节一致。
+
+    分片只对齐**包数**（不对齐包不会死锁的部分）—— 各 rank 同一 step 拿到的包，其
+    token 数与图片数本来就不同（打包器产出异构包，这是 NaViT 的设计而非缺陷）。由此
+    产生的两个已知性质，本次只做记录、不在 sampler 里"修"：
+      1. per-rank loss 是「本包内 per-image loss 的均值」，包大小不同 ⇒ 各 rank 的
+         每图权重不同。``all_reduce_mean`` 平均的是这些均值，不等于全局按图加权的
+         均值。要严格对齐需要在训练循环里按 token/图片数加权归一（loop.py 的事）。
+      2. 各 rank 每步的序列长度不同。DDP 的梯度 all_reduce 只看参数形状、与序列长度
+         无关，所以不会因此死锁；但如果 forward 里有**按 token 数选分支**的逻辑
+         （attention 后端切换、block swap 阈值等），各 rank 可能走进不同分支 →
+         参与反传的参数集合不同 → reducer 期望的梯度桶对不上。真出现时应在那些
+         分支的判定处收敛（用全局量而非本 rank 量），不该由 sampler 兜。
     """
 
     def __init__(self, dataset, token_budget, max_images_per_pack=0,
@@ -1599,10 +1755,25 @@ class NavitPackBatchSampler:
             )
 
     def set_epoch(self, epoch):
+        """换 epoch → 重新打包（``seed + epoch``）并清缓存。DDP 下语义不变。
+
+        与 :meth:`BucketBatchSampler.set_epoch` 同理：种子里只有 seed + epoch、不含
+        rank，所以各 rank 独立打出**同一份**完整包列表，分片纯本地、零通信。打包器
+        本身（next-fit / 窗口 FFD）是纯函数，给定 ``order`` 结果确定，这点成立。
+        """
         self.epoch = int(epoch)
         self._cached_packs = None
 
     def _build_packs(self):
+        """打包并按 rank 分片。返回的是**本 rank** 的包列表（单进程即全部）。
+
+        分片放在这里（而不是 ``__iter__``）是为了让 ``__iter__`` 与 ``__len__``
+        共用同一份 ``_cached_packs``：包数依赖打包顺序（next-fit / 窗口 FFD 都是
+        顺序敏感的），两处各算一次很容易算出不同的数。
+
+        DDP 注意：这里只保证**包数**各 rank 相等（否则死锁），不保证各包的 token
+        数 / 图片数相等 —— 打包器本来就产出异构包。见类 docstring 的 DDP 一节。
+        """
         order = list(range(len(self.token_counts)))
         if self.shuffle:
             random.Random(self.seed + self.epoch).shuffle(order)
@@ -1619,7 +1790,12 @@ class NavitPackBatchSampler:
             last_sum = sum(self.token_counts[i] for i in packs[-1])
             if last_sum < self.token_budget:
                 packs = packs[:-1]
-        return packs
+        # 顺序必须是「打包 → drop_last 去尾 → DDP 分片」：drop_last 判的是"全局列表的
+        # 最后一个包没装满"。反过来先分片再 drop_last 会**直接死锁** —— 各 rank 的尾
+        # 包不是同一个，有的不满被丢、有的满着保留，包数就不相等了。
+        # （tests/test_dataset_sampler_ddp.py::test_navit_drop_last_applies_before_shard
+        # 用 counts=[60,60,60,5] 钉住这个顺序：反过来是 2 个 vs 1 个。）
+        return _ddp_shard(packs, "NavitPackBatchSampler")
 
     def __iter__(self):
         packs = self._build_packs()

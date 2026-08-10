@@ -10,6 +10,8 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
+import torch
+
 from training.context import TrainingContext
 from training.families import resolve_family
 from training.families.anima import ANIMA_SPEC as _ANIMA_SPEC
@@ -18,6 +20,9 @@ from training.model_loading import (
     find_diffusion_pipe_root,
     resolve_path_best_effort,
 )
+# 模块对象 import（不是 `from utils.distributed import ...`）：测试要 monkeypatch
+# `utils.distributed.*`。同 training/dataset.py 的约定。
+from utils import distributed as dist_env
 
 
 logger = logging.getLogger(__name__)
@@ -209,6 +214,115 @@ def _inject_adapter(ctx: TrainingContext) -> None:
         )
 
 
+class _DDPAdapterSync(torch.nn.Module):
+    """DDP 真正包住的东西：**只有 adapter 的可训练参数**，外加一个转调前向。
+
+    为什么不是 ``DDP(ctx.model)``（两个独立的硬理由，都是踩过才知道的）
+    ------------------------------------------------------------------
+    1. **DiT 里没有可训练参数。** LyCORIS 的 ``apply_to()`` 是 monkeypatch
+       原模块的 ``forward``，适配器模块自己挂在 ``LycorisNetwork`` 上，并把原模块
+       用 ``org_module=[m]``（**列表**，刻意绕开子模块注册）持有。于是
+       ``dit.parameters()`` 里全是 frozen 基座，一个 ``requires_grad=True`` 都没有 ——
+       ``DDP(dit)`` 会直接抛「not needed when a module doesn't have any parameter
+       that requires a gradient」，就算不抛也永远同步不到 LoRA 梯度。
+    2. **训练前向压根不走 ``dit.__call__``。** Anima 开梯度检查点时手工展开
+       ``prepare_embedded_sequence`` / ``t_embedder`` / ``blocks`` / ``final_layer``
+       （族私货，见 families/anima/forward.py），navit 走
+       ``forward_packed_navit``。而 DDP 的梯度同步是 ``DDP.forward`` 里
+       ``prepare_for_backward`` 装上去的：不进 DDP.forward，reducer 的
+       ``expect_autograd_hooks_`` 就一直是 false，所有 autograd hook 直接 return ——
+       **一次 all_reduce 都不会发生，且不报任何错**。各 rank 悄悄各训各的、最后存
+       rank 0 那份，是本次集成最危险的失败形态。
+
+    所以这里反过来做：把「要同步的参数」和「怎么跑前向」解耦。
+
+    - 参数：``nn.ParameterList(trainable)`` 注册的是**同一批 Parameter 对象**（不复制），
+      所以 DDP 的桶、autograd hook、optimizer 三方引用的是同一批张量。传什么进来
+      就同步什么 —— 同步集合显式可审计，而不是「模块树里恰好有什么」。这也让
+      SRA projection MLP 能被有意排除（它的 loss 在 DDP 前向之外算，硬塞进来会被
+      find_unused_parameters 提前 mark ready，反而出错）。
+    - DiT：用 ``self._dit = [dit]`` 列表持有（跟 LyCORIS 的 org_module 同一手法），
+      **不进模块树**。两个好处：不会和 ParameterList 里的参数重复注册；DDP 构造时的
+      ``_sync_module_states`` 只广播几十 MB 的 adapter 参数，而不是把 26GB frozen
+      基座在卡间广播一遍（那是几十秒到几分钟的启动停顿，而且毫无必要 —— 每个 rank
+      都从同一个 checkpoint 文件读，本来就一样）。
+    - 前向：``forward(step_fn, *args)`` 把真正的前向函数当入参收进来再转调，于是
+      标准 / navit / 展开检查点三条路径**全都**能进 DDP.forward，无需改 families/。
+      callable 经 DDP 的 ``_to_kwargs`` 时落在「非 tensor/list/dict → 原样复制」的
+      分支上，不会被搬运或篡改。
+    """
+
+    def __init__(self, dit, trainable_params):
+        super().__init__()
+        self.trainables = torch.nn.ParameterList(list(trainable_params))
+        self._dit = [dit]
+
+    def forward(self, step_fn, *args, **kwargs):
+        return step_fn(self._dit[0], *args, **kwargs)
+
+
+def _wrap_ddp(ctx: TrainingContext) -> None:
+    """多卡时把 adapter 参数包进 DDP；单进程 no-op（``ctx.ddp_model`` 保持 None）。
+
+    时机：模型与 adapter 都就位之后、optimizer 构造之前（optimizer_phase 在
+    main() 里排在 models_phase 之后）。**参数对象身份不变**是这里的关键前提 ——
+    ``nn.ParameterList`` 注册引用而不复制，DDP 构造也只是原地广播数值，所以
+    optimizer 之后从 ``injector.get_param_groups()`` 拿到的仍是同一批张量，
+    梯度同步与参数更新落在同一处内存上。
+
+    构造参数逐条说明
+    ----------------
+    ``device_ids=[local_rank]`` / ``output_device=local_rank``：单设备模块的标准写法。
+    ``distributed.init()`` 已经 set_device 过，这里再显式声明一次让 DDP 自己的
+    输入搬运和 reduction 流都落在正确的卡上。
+
+    ``find_unused_parameters=True``：保守起见开着。LoRA 训练下基座 frozen、只有
+    adapter 有梯度，理论上每步都全用；但 LyCORIS 的 ``module_dropout`` > 0 会
+    **按 rank 各自随机**跳过若干适配器模块 —— 那些模块本步没有梯度，而各 rank 跳的
+    还不是同一批。关着（False）时 DDP 会等一个永远不来的梯度，抛
+    「Expected to have finished reduction in the prior iteration」。代价是每步多一次
+    autograd 图遍历（PyTorch 文档称开销可观）。确认 module_dropout=0 且没有条件分支
+    之后可以改成 False 提速。
+
+    ``broadcast_buffers=False``：DiT 用 LayerNorm/RMSNorm，没有 BatchNorm 那种需要
+    跨 rank 校正的 running stats，每步广播 buffer 纯属浪费带宽。更要紧的是
+    T-LoRA 会按**本 rank 的 sigma_t** 每步写一份 rank mask buffer，广播 rank 0 的
+    版本过去会直接算错别人的前向。（当前 shim 里只有 ParameterList、本来就没有
+    buffer，显式写上是防以后往 shim 里加东西时踩坑。）
+
+    ``static_graph``：保持默认 False。本循环的计算图逐步会变（T-LoRA 按 timestep
+    改结构、module_dropout 改参与集合），static_graph 会把第一步的图当成永久事实。
+
+    ``gradient_as_bucket_view``：不开。它能省一份梯度副本，但只有 adapter 参数进桶
+    （几十 MB 级），省下的量不值得引入「``zero_grad(set_to_none=True)`` 之后 bucket
+    view 失效」这类与优化器实现相关的坑（PPSF / Prodigy 都自己动 grad）。
+    """
+    if not dist_env.is_distributed():
+        return
+
+    trainable = ctx.injector.get_params()
+    if not trainable:
+        raise RuntimeError(
+            "多卡训练需要至少一个可训练参数，但 adapter 没有产出任何 "
+            "requires_grad=True 的参数。请检查 lora_type / lora_rank 配置。"
+        )
+
+    from torch.nn.parallel import DistributedDataParallel
+
+    local_rank = dist_env.local_rank()
+    ctx.ddp_model = DistributedDataParallel(
+        _DDPAdapterSync(ctx.model, trainable),
+        device_ids=[local_rank],
+        output_device=local_rank,
+        find_unused_parameters=True,
+        broadcast_buffers=False,
+    )
+    logger.info(
+        "DDP 已就绪：同步 %d 个 adapter 参数张量（%.1fM），基座权重 frozen 不参与通信",
+        len(trainable), sum(p.numel() for p in trainable) / 1e6,
+    )
+
+
 def _defer_dit_for_text_cache(ctx: TrainingContext) -> bool:
     return (
         ctx.family.spec.text.strategy == "cached_varlen"
@@ -296,6 +410,7 @@ def run(ctx: TrainingContext) -> None:
     _load_vae(ctx)
     _load_text(ctx)
     _inject_adapter(ctx)
+    _wrap_ddp(ctx)
     _log_train_start_vram(ctx)
 
 
@@ -315,6 +430,10 @@ def finish(ctx: TrainingContext) -> None:
     )
     _load_dit(ctx)
     _inject_adapter(ctx)
+    # cached_varlen 族的 DiT 推迟到这里才加载，DDP 也必须跟着推迟 —— 包的时候
+    # adapter 参数必须已经存在（见 _wrap_ddp）。两条路径各调一次、互斥（run()
+    # 走 defer 分支时提前 return），不会重复包。
+    _wrap_ddp(ctx)
     _log_train_start_vram(ctx)
 
 

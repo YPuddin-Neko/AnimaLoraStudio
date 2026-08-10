@@ -136,18 +136,29 @@ def main():
     from training import phases
     from training.context import TrainingContext
     from training import loop
+    from utils import distributed
 
     args = parse_args()
     ctx = TrainingContext(args=args)
-    phases.bootstrap.run(ctx)
-    phases.models.run(ctx)
-    phases.dataset.run(ctx)
-    phases.text_cache.run(ctx)
-    phases.models.finish(ctx)
-    phases.optimizer.run(ctx)
-    phases.resume.run(ctx)
-    loop.run(ctx)
-    phases.finalize.run(ctx)
+    # 进程组的生命周期横跨全部 phase（bootstrap 里 init、各 phase 都可能通信），
+    # 所以销毁只能收在这一层 —— finalize_phase 只在成功路径执行，训练中途抛异常
+    # 就不会走到，那正是留下僵死 NCCL 通信器的情形：同一张卡上的旧通信器没释放，
+    # 下一个训练任务起来时可能卡死在 init_process_group 上。
+    #
+    # destroy() 幂等且吞掉自身异常，所以放在 finally 里不会盖掉真正的训练异常
+    # （单进程下它整个是 no-op，这段对不开多卡的用户零影响）。
+    try:
+        phases.bootstrap.run(ctx)
+        phases.models.run(ctx)
+        phases.dataset.run(ctx)
+        phases.text_cache.run(ctx)
+        phases.models.finish(ctx)
+        phases.optimizer.run(ctx)
+        phases.resume.run(ctx)
+        loop.run(ctx)
+        phases.finalize.run(ctx)
+    finally:
+        distributed.destroy()
 
 
 if __name__ == "__main__":

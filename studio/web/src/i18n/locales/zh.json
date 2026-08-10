@@ -382,7 +382,8 @@
       "loss_type": "InfoNoise / Leap 启用时禁用 loss 类型切换（schema 互斥，仅 mse 兼容）",
       "masked_loss": "Leap（per-sample loss 无空间维度）/ NaViT 打包路径不支持 mask（schema 互斥）",
       "timestep_schedule_shift": "InfoNoise 启用时禁用 schedule shift（schema 互斥，仅 1.0 兼容）",
-      "infonoise_enabled": "需先把 noise_enhancement / loss_weighting / loss_type / schedule_shift 全部置默认才能启用（schema 互斥）"
+      "infonoise_enabled": "需先把 noise_enhancement / loss_weighting / loss_type / schedule_shift 全部置默认才能启用（schema 互斥）",
+      "blocks_to_swap": "Block swap 与多卡训练互斥：每张卡各锁一份换出层内存（N 卡 = N 倍），且换入换出与 DDP 梯度同步抢 PCIe 带宽"
     },
     "descriptions": {
       "model_family": "模型族。决定训练走哪套模型实现；其余字段按族能力自动显隐。切换将重算模型路径并重置族相关默认值",
@@ -418,7 +419,7 @@
       "lora_module_dropout": "整个 LoRA 模块的随机跳过概率（stochastic depth）：每步以此概率完全不应用此模块；越大正则化越强；0 = 关闭",
       "epochs": "训练轮数",
       "max_steps": "最大步数（0=不限）",
-      "batch_size": "批次大小",
+      "batch_size": "批次大小（每卡）。多卡时全局 batch = batch_size × grad_accum × ddp_num_processes",
       "grad_checkpoint": "梯度检查点（省显存，约增加 1/3 计算量）",
       "grad_accum": "梯度累积步数（有效 batch = batch_size × grad_accum）",
       "learning_rate": "学习率。Automagic 推荐 1e-6（切换时自动改）；Lion 推荐 AdamW lr / 3；Prodigy / PPSF 必须 1.0",
@@ -513,7 +514,8 @@
       "sample_seed": "采样种子（0=随机）",
       "sample_negative_prompt": "负面提示词",
       "sample_prompt": "单 prompt 模式：训练中所有采样图共用此 prompt（设置 sample_prompts 时被忽略）",
-      "sample_prompts": "多 prompt 轮换（优先于 sample_prompt）"
+      "sample_prompts": "多 prompt 轮换（优先于 sample_prompt）",
+      "ddp_num_processes": "多卡并行的训练进程数（1 = 单卡，默认）。单机每进程独占一张卡，所以此值就是「用几张卡」，上限为实际可见卡数（受 CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES 限制）。batch_size 是「每卡」批次（PyTorch DDP 惯例，与 kohya 系一致）：全局 batch = batch_size × grad_accum × 本值。也就是说开 2 卡后全局 batch 直接翻倍，学习率通常要跟着调（线性缩放经验法则：卡数翻倍则 lr 翻倍），否则等效于换了一组超参。开启后 Block swap 不可用。"
     },
     "altDescriptions": {
       "timestep_sampling": "【时间步采样】分布；InfoNoise 启用时作为热身期 baseline，正式阶段由自适应 CDF 接管",
@@ -2438,7 +2440,10 @@
     "configChip": "配置",
     "scopedConfigLabel": "{{title}} / {{label}} 配置",
     "notConfiguredLabel": "未配置 — 选预设作为起点",
-    "readPresetParams": "读取此预设参数"
+    "readPresetParams": "读取此预设参数",
+    "ddpSingleGpu": "仅检测到 {{detected}} 张卡，多卡不可用",
+    "ddpExceedsDetected": "配置为 {{n}} 卡，但只检测到 {{detected}} 张 —— 训练会启动失败，请调回 {{detected}}",
+    "ddpGlobalBatch": "检测到 {{detected}} 张卡 · 全局 batch {{global}}"
   },
   "reg": {
     "loadFailed": "加载 reg 状态失败: {{error}}",

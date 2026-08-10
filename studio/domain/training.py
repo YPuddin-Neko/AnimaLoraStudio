@@ -176,6 +176,15 @@ class TrainingConfig(BaseModel):
             "system",
             show_when=cap_gate("block_swap"),
             advanced=True,
+            # 与多卡互斥。每个 rank 都会各自锁一份换出层的内存（换出全部 28 层
+            # ≈ 11GB/进程 bf16），N 卡就是 N 倍锁定内存，消费级机器直接把系统
+            # 内存吃穿；换入换出还与 DDP 的梯度 all-reduce 抢 PCIe 带宽。
+            # 声明成 disable 规则（而不是手写 validator）让 UI 灰显 + takeover、
+            # 后端 fail-fast、tolerant 读盘修复三处从同一份声明派生（R2 v2）。
+            disable_when="ddp_num_processes!=1",
+            disable_value=0,
+            disable_hint="Block swap 与多卡训练互斥：每张卡各锁一份换出层内存（N 卡 = N 倍），"
+                         "且换入换出与 DDP 梯度同步抢 PCIe 带宽",
         ),
     )
 
@@ -379,6 +388,22 @@ class TrainingConfig(BaseModel):
         4, ge=1,
         description="梯度累积步数（有效 batch = batch_size × grad_accum）",
         json_schema_extra=_meta("training"),
+    )
+    # 多卡（DDP）。默认 1 = 单进程单卡，与改动前逐字节等价：supervisor 的
+    # cmd_builder 只在 >1 时才套 torchrun，utils/distributed 在 world_size==1 时
+    # 所有 is_main() 门控恒真。放 training 组而不是 system 组是因为它**改训练
+    # 数值语义**（下面的全局 batch 换算），不是纯资源旋钮 —— 与 blocks_to_swap
+    # （换出多少层对产出 LoRA 逐位无影响）的分组判据正好相反。
+    ddp_num_processes: int = Field(
+        1, ge=1,
+        description="多卡并行的训练进程数（1 = 单卡，默认）。单机每进程独占一张卡，"
+                    "所以此值就是「用几张卡」，上限为实际可见卡数（受 "
+                    "CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES 限制）。"
+                    "batch_size 是「每卡」批次（PyTorch DDP 惯例，与 kohya 系一致）："
+                    "全局 batch = batch_size × grad_accum × 本值。"
+                    "也就是说开 2 卡后全局 batch 直接翻倍，学习率通常要跟着调"
+                    "（线性缩放经验法则：卡数翻倍则 lr 翻倍），否则等效于换了一组超参",
+        json_schema_extra=_meta("training", advanced=True),
     )
     learning_rate: float = Field(
         1e-4, gt=0.0,

@@ -382,7 +382,8 @@
       "loss_type": "Disabled while InfoNoise or Leap is enabled (schema mutex, only `mse` compatible)",
       "masked_loss": "Not supported with Leap (per-sample loss has no spatial dims) or NaViT packing (schema mutex)",
       "timestep_schedule_shift": "Disabled while InfoNoise is enabled (schema mutex, only `1.0` compatible)",
-      "infonoise_enabled": "Reset noise_enhancement / loss_weighting / loss_type / schedule_shift to defaults to enable (schema mutex)"
+      "infonoise_enabled": "Reset noise_enhancement / loss_weighting / loss_type / schedule_shift to defaults to enable (schema mutex)",
+      "blocks_to_swap": "Block swap is mutually exclusive with multi-GPU training: every GPU pins its own copy of the swapped-out layers (N GPUs = N×), and the swap traffic competes with DDP gradient sync for PCIe bandwidth"
     },
     "descriptions": {
       "model_family": "Model family. Decides which model implementation training uses; other fields show/hide by family capability. Switching recalculates model paths and resets family-specific defaults",
@@ -418,7 +419,7 @@
       "lora_module_dropout": "Probability of skipping the entire LoRA module (stochastic depth): the module contributes nothing on that step; larger = stronger regularization; 0 = disabled",
       "epochs": "Training epochs",
       "max_steps": "Maximum steps (0 = unlimited)",
-      "batch_size": "Batch size",
+      "batch_size": "Batch size (per GPU). With multi-GPU, global batch = batch_size × grad_accum × ddp_num_processes",
       "grad_checkpoint": "Gradient checkpointing (saves VRAM, roughly +1/3 compute)",
       "grad_accum": "Gradient accumulation steps (effective batch = batch_size × grad_accum)",
       "learning_rate": "Learning rate. Automagic recommends 1e-6 (auto-applied on switch); Lion recommends AdamW lr / 3; Prodigy / PPSF require 1.0",
@@ -513,7 +514,8 @@
       "sample_seed": "Sample seed (0 = random)",
       "sample_negative_prompt": "Negative prompt",
       "sample_prompt": "Single prompt mode: all sample images during training share this prompt (ignored when sample_prompts is set)",
-      "sample_prompts": "Multiple prompt rotation (takes priority over sample_prompt)"
+      "sample_prompts": "Multiple prompt rotation (takes priority over sample_prompt)",
+      "ddp_num_processes": "Number of training processes for multi-GPU (1 = single GPU, default). One process owns one GPU on a single machine, so this is literally \"how many GPUs to use\"; the ceiling is the number of visible devices (restricted by CUDA_VISIBLE_DEVICES / HIP_VISIBLE_DEVICES). batch_size is PER GPU (PyTorch DDP convention, same as the kohya family): global batch = batch_size × grad_accum × this value. So going to 2 GPUs doubles the global batch, and the learning rate usually has to follow (linear scaling rule: double the GPUs, double the lr) — otherwise you have silently changed your hyperparameters. Block swap is unavailable once this is enabled."
     },
     "altDescriptions": {
       "timestep_sampling": "[Timestep sampling] Distribution; when InfoNoise is enabled this is the warmup baseline, then adaptive CDF takes over",
@@ -2438,7 +2440,10 @@
     "configChip": "config",
     "scopedConfigLabel": "{{title}} / {{label}} config",
     "notConfiguredLabel": "Not configured — pick a preset to start",
-    "readPresetParams": "Read params from this preset"
+    "readPresetParams": "Read params from this preset",
+    "ddpSingleGpu": "Only {{detected}} GPU detected — multi-GPU unavailable",
+    "ddpExceedsDetected": "Configured for {{n}} GPUs but only {{detected}} detected — training will fail to start; set it back to {{detected}}",
+    "ddpGlobalBatch": "{{detected}} GPUs detected · global batch {{global}}"
   },
   "reg": {
     "loadFailed": "Failed to load reg status: {{error}}",
