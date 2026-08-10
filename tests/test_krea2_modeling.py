@@ -158,9 +158,19 @@ def test_chunked_masked_attention_matches_unchunked() -> None:
     ``[B, H, S_q, S_k]`` —— Krea2 在 2048px 桶上 S≈16.9k、48 heads，bs=2 就是
     102 GiB，64GB 卡必 OOM（bs=1 也要 51 GiB，同样装不下）。
 
-    分块之所以**精确**而非近似：softmax 沿 key 维归一化，每个 query 行的输出只依赖
-    该行自己的分数向量，query 之间无耦合。所以这里用 rtol=0/atol=0 —— 有任何差异
-    就说明切法错了（切错维度、块边界漏算、mask 对不上），不是浮点误差。
+    分块在**数学上**精确：softmax 沿 key 维归一化，每个 query 行的输出只依赖该行
+    自己的分数向量，query 之间无耦合，不像 flash 那样需要 online-softmax rescale。
+
+    但**实现上不是 bit-exact**。真机（BW1000 / DTK / torch 2.5.1）实测最大绝对差
+    4.17e-07 ≈ 3.5 个 fp32 eps —— SDPA 对不同 ``s_q`` 会选不同的 kernel tile /
+    累加顺序，而浮点加法不满足结合律。所以容差取 fp32 量级而非 0。
+
+    容差仍然足够严：真正的切法错误误差是 O(0.1~1)，比这里的阈值大四五个数量级
+        沿 key 切  → softmax 分母错   → O(1)
+        块边界漏算 → 整行为 0/未初始化 → O(1)
+        mask 对不上 → padding 参与注意力 → O(0.1~1)
+    ``atol`` 兜住接近 0 的元素（那里 rtol 无意义 —— 实测 rel diff 2.9e-04 就出现在
+    这种元素上），``rtol`` 兜住大值。
     """
     from modeling.krea2.krea2_modeling import _chunked_masked_attention
 
@@ -181,7 +191,31 @@ def test_chunked_masked_attention_matches_unchunked() -> None:
     for chunk in (5, 8, 16, 37, 64):
         got = _chunked_masked_attention(q, k, v, mask, chunk=chunk)
         assert got.shape == reference.shape, f"chunk={chunk} 形状不对"
-        torch.testing.assert_close(got, reference, rtol=0, atol=0)
+        torch.testing.assert_close(got, reference, rtol=1e-5, atol=1e-5)
+
+
+def test_chunked_attention_rows_are_independent_of_chunk_placement() -> None:
+    """同一 query 行落在块首 / 块中 / 块尾都得到同一结果（fp32 量级内）。
+
+    这条比「与不分块比较」更能抓切法错误。若实现误把块内位置当成了绝对位置
+    （典型：mask 也跟着切、或 RoPE 偏移按块内 index 算），那么同一行在不同块布局下
+    的输出就会不同 —— 而与不分块的整体比较可能因为误差被平均而看不出来。
+
+    做法：用互质的块大小（3 / 7 / 11）让每一行在三次运行里落到不同的块内位置。
+    """
+    from modeling.krea2.krea2_modeling import _chunked_masked_attention
+
+    torch.manual_seed(13)
+    b, h, s_q, s_k, d = 1, 2, 23, 17, 8
+    q = torch.randn(b, h, s_q, d)
+    k = torch.randn(b, h, s_k, d)
+    v = torch.randn(b, h, s_k, d)
+    mask = torch.ones(b, 1, 1, s_k, dtype=torch.bool)
+    mask[..., -5:] = False
+
+    outs = [_chunked_masked_attention(q, k, v, mask, chunk=c) for c in (3, 7, 11)]
+    for i in range(1, len(outs)):
+        torch.testing.assert_close(outs[0], outs[i], rtol=1e-5, atol=1e-5)
 
 
 def test_chunked_attention_shortcircuits_when_small() -> None:
@@ -213,6 +247,8 @@ def test_chunked_attention_shortcircuits_when_small() -> None:
         m.F.scaled_dot_product_attention = orig
 
     assert calls["n"] == 1, f"小输入不该分块，实际调了 {calls['n']} 次 SDPA"
+    # 这里可以要求 bit-exact：短路路径就是原封不动的单次调用，同一 kernel、
+    # 同一累加顺序，不存在分块那条路的浮点重排。
     torch.testing.assert_close(out, real(q, k, v, attn_mask=mask), rtol=0, atol=0)
 
 
