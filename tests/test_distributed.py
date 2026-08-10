@@ -8,6 +8,7 @@
 """
 from __future__ import annotations
 
+import os
 import sys
 import types
 
@@ -17,7 +18,12 @@ sys.path.insert(0, ".")
 
 from utils import distributed as d  # noqa: E402
 
-_ENV_KEYS = ("RANK", "LOCAL_RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT")
+#: 每个用例前要清掉的环境变量。含 GLOG_minloglevel —— `init()` 会 setdefault 它，
+#: 不清的话前一个用例的残留会让「用户显式设过就不覆盖」那条用例假通过。
+_ENV_KEYS = (
+    "RANK", "LOCAL_RANK", "WORLD_SIZE", "MASTER_ADDR", "MASTER_PORT",
+    "GLOG_minloglevel",
+)
 
 
 @pytest.fixture(autouse=True)
@@ -190,6 +196,40 @@ def test_backend_survives_torch_import_failure(monkeypatch):
 # ---------------------------------------------------------------------------
 # init()：绑卡顺序与越界检查
 # ---------------------------------------------------------------------------
+
+
+def test_init_quiets_nccl_info_logs(monkeypatch):
+    """建进程组前压掉 ProcessGroupNCCL 的 INFO glog。
+
+    真机实测（DTK 26.04 / torch 2.5.1 / 2 卡）：不压的话建组刷十几行、销毁再刷
+    十几行，训练 task log 里该看 loss 的地方全被淹掉，而这些行对用户零信息量。
+    """
+    torch = _fake_torch(monkeypatch, cuda_available=True)
+    dist = types.ModuleType("torch.distributed")
+    dist.is_initialized = lambda: False
+    dist.init_process_group = lambda **kw: None
+    monkeypatch.setitem(sys.modules, "torch.distributed", dist)
+    torch.distributed = dist
+    monkeypatch.delenv("GLOG_minloglevel", raising=False)
+
+    _torchrun(monkeypatch, rank=0, world=2)
+    d.init()
+    assert os.environ["GLOG_minloglevel"] == "1"
+
+
+def test_init_respects_explicit_glog_level(monkeypatch):
+    """用户显式设过就不覆盖 —— 排查通信问题时要能强开 verbose。"""
+    torch = _fake_torch(monkeypatch, cuda_available=True)
+    dist = types.ModuleType("torch.distributed")
+    dist.is_initialized = lambda: False
+    dist.init_process_group = lambda **kw: None
+    monkeypatch.setitem(sys.modules, "torch.distributed", dist)
+    torch.distributed = dist
+    monkeypatch.setenv("GLOG_minloglevel", "0")
+
+    _torchrun(monkeypatch, rank=0, world=2)
+    d.init()
+    assert os.environ["GLOG_minloglevel"] == "0"
 
 
 def test_init_binds_device_before_creating_process_group(monkeypatch):

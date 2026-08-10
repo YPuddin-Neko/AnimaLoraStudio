@@ -109,6 +109,26 @@ def backend_name() -> str:
     return "gloo"
 
 
+def _quiet_nccl_logs() -> None:
+    """把 ProcessGroupNCCL 的 INFO 级 glog 输出压掉（用户没显式设过才动）。
+
+    海光 DTK 的 torch 编译时开了 c10d 的 glog verbose 输出，建进程组时每个 rank 会
+    刷十几行 ``I0810 ... ProcessGroupNCCL.cpp:934] ... initialization options: ...``，
+    销毁时再刷十几行。两卡 = 五十多行，训练 task log 里本来该看 loss 的地方全被这些
+    淹掉，而它们对用户零信息量（真机实测，见 tools/check_ddp_comm.py 的输出）。
+
+    ``GLOG_minloglevel=1`` 只挡 INFO，WARNING / ERROR 照常出 —— 真出通信问题
+    （超时、communicator abort）时该看到的还在。
+
+    ``setdefault`` 语义：排查通信问题时用 ``GLOG_minloglevel=0
+    NCCL_DEBUG=INFO`` 强开，本函数不会覆盖。
+
+    必须在 ``init_process_group`` **之前**调：glog 在首次使用时读一次环境变量并
+    缓存，之后再改无效。
+    """
+    os.environ.setdefault("GLOG_minloglevel", "1")
+
+
 def init() -> bool:
     """初始化进程组并把本进程绑到 ``local_rank`` 对应的卡。返回是否真的初始化了。
 
@@ -123,6 +143,8 @@ def init() -> bool:
         return False
     if _INITIALIZED:
         return True
+
+    _quiet_nccl_logs()
 
     import torch
     import torch.distributed as dist
