@@ -425,15 +425,45 @@ def test_device_stats_nvml_decodes_bytes_name(monkeypatch):
     assert stats is not None and stats[0].name == "RTX 3090"
 
 
-def test_device_stats_torch_path_leaves_util_temp_none(monkeypatch):
-    """DCU 口径：显存有、利用率与温度为 None（要解析 hy-smi 文本，当前不报）。"""
+def test_device_stats_torch_path_reports_vram_without_smi(monkeypatch):
+    """DCU 口径：smi 不可用时显存照常返回（绝对值来自 torch），两项指标留 None。
+
+    ⚠️ ``smi_command`` 必须显式 stub。这条原来只 stub 了 torch，于是在**真机上失败、
+    在没有 hy-smi 的机器上通过** —— 正好反了：真机 DCU 上 ``_dcu_smi_metrics`` 会真
+    去跑 hy-smi 并成功返回 ``util_pct=0, temp_c=51``，而断言写的是两项为 None。那是
+    我后来加 ``_parse_hy_smi_metrics`` 之前的行为，加了解析后没回来改这条测试。
+
+    教训：凡是会 shell out 的依赖，测试里必须显式 stub。靠"目标环境大概没装这个工具"
+    让断言成立，等于把结果绑在环境上 —— 而这类测试最需要在真机上跑。
+    """
     _install(monkeypatch, _fake_torch(hip="6.3.0", device_names=("Hygon BW1000",)))
+    monkeypatch.setattr(accelerator, "smi_command", lambda: None)
     stats = accelerator.device_stats()
     assert stats is not None and len(stats) == 1
     d = stats[0]
     assert d.name == "Hygon BW1000"
     assert d.util_pct is None and d.temp_c is None
     assert (d.vram_used_gb, d.vram_total_gb) == (6.0, 8.0)  # (total-free)/1G, total/1G
+
+
+def test_device_stats_smi_partial_coverage_leaves_missing_cards_none(monkeypatch):
+    """smi 只报了部分卡时，缺的那些卡两项为 None，不能串到别的卡上。
+
+    真机 hy-smi 偶发只列出部分卡（驱动重载 / 卡被占用时）。``_torch_device_stats``
+    用 ``metrics.get(i, (None, None))`` 按 index 取而不是按顺序 zip，就是为了这种
+    情形 —— 顺序 zip 会把 1 号卡的读数安到 0 号卡上。
+    """
+    _install(
+        monkeypatch,
+        _fake_torch(hip="6.3.0", device_names=("Hygon BW1000", "Hygon BW1000")),
+    )
+    monkeypatch.setattr(accelerator, "smi_command", lambda: "/opt/hyhal/bin/hy-smi")
+    monkeypatch.setattr(accelerator, "_parse_hy_smi_metrics", lambda _text: {1: (12, 55)})
+    monkeypatch.setattr(accelerator, "_run", lambda args, timeout=10: "irrelevant")
+    stats = accelerator.device_stats()
+    assert stats is not None and len(stats) == 2
+    assert (stats[0].util_pct, stats[0].temp_c) == (None, None), "0 号卡不该有读数"
+    assert (stats[1].util_pct, stats[1].temp_c) == (12, 55), "1 号卡的读数错位了"
 
 
 def test_device_stats_none_without_gpu(monkeypatch):
@@ -726,3 +756,88 @@ def test_smi_command_uses_backend_candidates(monkeypatch):
     monkeypatch.setattr(accelerator.shutil, "which",
                         lambda c: "/opt/rocm/bin/rocm-smi" if c == "rocm-smi" else None)
     assert accelerator.smi_command() is None, "NVIDIA 后端不该挑 rocm-smi"
+
+# ---------------------------------------------------------------------------
+# 测试自身的卫生：不许把结果绑在运行环境上
+# ---------------------------------------------------------------------------
+
+
+def test_no_dcu_test_reaches_the_real_smi_binary() -> None:
+    """凡是走 DCU 路径又调 ``device_stats`` 的测试，都必须 stub 掉 shell 依赖。
+
+    守的是一类真实踩过的坑，而不是某一行：
+    ``test_device_stats_torch_path_leaves_util_temp_none`` 原来只 stub 了 torch，
+    ``_dcu_smi_metrics`` 于是真去跑 hy-smi。后果是这条测试**在真机 DCU 上失败、在
+    没装 hy-smi 的开发机上通过** —— 完全反了。而 DCU 相关的改动最需要在真机上验，
+    这种测试等于在最该起作用的地方失效。
+
+    判定方式：函数体里出现 ``hip=`` （走 DCU 分支）且调用了 ``device_stats``，就必须
+    同时 stub 掉 ``smi_command`` / ``_dcu_smi_metrics`` 之一。stub 哪一层都行 ——
+    ``smi_command`` 更深、顺带覆盖解析，``_dcu_smi_metrics`` 更省事。
+
+    为什么用 AST 而不是 conftest 里禁 subprocess：``_run`` 的失败会被 best-effort 的
+    except 吞掉，禁用它只会让测试静默地测到兜底分支，看起来仍然是绿的。
+    """
+    import ast
+    import pathlib
+
+    source = pathlib.Path(__file__).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    #: 允许 stub 的目标：任一即可。
+    SMI_STUBS = {"smi_command", "_dcu_smi_metrics", "_parse_hy_smi_metrics", "_run"}
+
+    def _calls_and_strings(fn: ast.FunctionDef) -> tuple[set[str], set[str]]:
+        """``(被调用的函数名, monkeypatch.setattr 的目标名)``。
+
+        **不看 ast.dump 的整体文本**：那会把 docstring 里的散文也算成命中 —— 本函数
+        的 docstring 就提到 ``smi_command``，早先的版本因此对自己的反例视而不见。
+        只认真正的调用节点与 setattr 的字符串实参。
+        """
+        called: set[str] = set()
+        patched: set[str] = set()
+        for sub in ast.walk(fn):
+            if not isinstance(sub, ast.Call):
+                continue
+            func = sub.func
+            if isinstance(func, ast.Attribute):
+                called.add(func.attr)
+                if func.attr == "setattr":
+                    for arg in sub.args:
+                        if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                            patched.add(arg.value)
+            elif isinstance(func, ast.Name):
+                called.add(func.id)
+        return called, patched
+
+    def _uses_dcu(fn: ast.FunctionDef) -> bool:
+        """函数里是否用 ``hip=`` 造过 DCU 替身（只看关键字实参，不看散文）。"""
+        for sub in ast.walk(fn):
+            if isinstance(sub, ast.Call) and any(
+                kw.arg == "hip" and not (
+                    isinstance(kw.value, ast.Constant) and kw.value.value is None
+                )
+                for kw in sub.keywords
+            ):
+                return True
+        return False
+
+    offenders = []
+    for node in tree.body:
+        if not isinstance(node, ast.FunctionDef) or not node.name.startswith("test_"):
+            continue
+        called, patched = _calls_and_strings(node)
+        if "device_stats" not in called:
+            continue
+        if not _uses_dcu(node):            # 非 DCU 路径（NVML / 无卡）不受这条约束
+            continue
+        if patched & SMI_STUBS:
+            continue
+        offenders.append(node.name)
+
+    assert not offenders, (
+        "下列 DCU 测试调了 device_stats 却没 stub smi 依赖，会在真机上真跑 hy-smi ——\n"
+        + "\n".join(f"  {name}" for name in offenders)
+        + "\n加一行 monkeypatch.setattr(accelerator, 'smi_command', lambda: None) "
+        "（或按需返回假读数）。"
+    )
