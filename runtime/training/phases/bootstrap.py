@@ -163,7 +163,27 @@ def _check_ddp_prerequisites(args) -> None:
             "请关闭 leap_enabled 跑多卡，或用单卡跑 leap。"
         )
 
-    # 3) SRA v2 + 梯度裁剪：SRA 的 projection MLP 在 optimizer 里，但它的 loss 在
+    # 3) PPSF fused backward：用 register_post_accumulate_grad_hook 在**反向过程中**
+    #    就地更新参数、随即释放该参数的梯度。DDP 的 reducer 恰恰要在反向途中拿那块
+    #    梯度存储做 all_reduce —— 两者抢同一块内存且没有次序保证，reducer 可能读到
+    #    已被就地改写或已释放的值。
+    #
+    #    后果是**静默的**：不抛异常、不 OOM，只是各 rank 的梯度不再一致，权重逐步
+    #    分歧，训出来的东西不对。所以必须在启动期拦住，不能靠「默认值是 False」。
+    #
+    #    这里之前没有任何拦截 —— 它默认 False 纯粹因为配置默认值，不是因为有代码
+    #    判断。而它是个 advanced UI 开关，描述写着「显存吃紧时开，可显著降显存」，
+    #    多卡 + full matrix 正是最容易去点它的处境。
+    if bool(getattr(args, "ppsf_fused_back_pass", False)):
+        problems.append(
+            "ppsf_fused_back_pass=true 与多卡同时开启。它在反向过程中就地更新参数并"
+            "释放梯度，而 DDP 的 reducer 此时还要用那块梯度存储做 all_reduce，两者"
+            "抢同一块内存且无次序保证。后果是静默的：不报错，但各 rank 梯度不一致、"
+            "权重逐步分歧。请把 ppsf_fused_back_pass 置 false 跑多卡，"
+            "或用单卡 + fused backward。"
+        )
+
+    # 4) SRA v2 + 梯度裁剪：SRA 的 projection MLP 在 optimizer 里，但它的 loss 在
     #    DDP 前向之外算（loop.py 拿 hook 抓的激活），梯度进不了 DDP 的 reduction ——
     #    也不能硬塞进去（find_unused_parameters 会先把它判成未用、提前 mark ready，
     #    真梯度随后才到，等于「同一变量 mark 两次」）。

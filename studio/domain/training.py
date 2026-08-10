@@ -584,8 +584,30 @@ class TrainingConfig(BaseModel):
     )
     ppsf_fused_back_pass: bool = Field(
         False,
-        description="PPSF 与 fused backward 集成（显存吃紧时开，可显著降显存）",
-        json_schema_extra=_meta("training", show_when="optimizer_type==prodigy_plus_schedulefree", advanced=True),
+        description="PPSF 与 fused backward 集成（显存吃紧时开，可显著降显存）。"
+                    "单卡专用：它在反向过程中就地更新参数并释放梯度，与 DDP 的梯度"
+                    "同步冲突",
+        json_schema_extra=_meta(
+            "training",
+            show_when="optimizer_type==prodigy_plus_schedulefree",
+            advanced=True,
+            # 与多卡互斥，理由同 blocks_to_swap 用 disable 规则而非手写 validator：
+            # 让 UI 灰显 + takeover、后端 fail-fast、tolerant 读盘修复三处从同一份
+            # 声明派生（R2 v2）。
+            #
+            # 冲突的机制：fused backward 用 register_post_accumulate_grad_hook，在
+            # **反向过程中**就地更新参数、随即释放该参数的梯度；而 DDP 的 reducer 恰恰
+            # 要在反向途中拿那块梯度存储做 all_reduce。两者抢同一块内存且没有次序保证。
+            #
+            # 为什么必须声明成硬规则：后果是**静默的** —— 不抛异常、不 OOM，只是各 rank
+            # 梯度不再一致、权重逐步分歧，训出来的东西不对。而这个开关的描述写着「显存
+            # 吃紧时开」，多卡 + full matrix（803M 可训练参数）正是最容易去点它的处境。
+            disable_when="ddp_num_processes!=1",
+            disable_value=False,
+            disable_hint="PPSF fused backward 与多卡训练互斥：它在反向过程中就地更新参数并"
+                         "释放梯度，而 DDP 此时还要用那块梯度做 all-reduce。"
+                         "后果是静默的 —— 不报错，但各 rank 梯度不一致、权重逐步分歧",
+        ),
     )
     ppsf_use_stableadamw: bool = Field(
         True,

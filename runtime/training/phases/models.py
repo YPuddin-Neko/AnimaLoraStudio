@@ -322,9 +322,34 @@ def _wrap_ddp(ctx: TrainingContext) -> None:
     ``static_graph``：保持默认 False。本循环的计算图逐步会变（T-LoRA 按 timestep
     改结构、module_dropout 改参与集合），static_graph 会把第一步的图当成永久事实。
 
-    ``gradient_as_bucket_view``：不开。它能省一份梯度副本，但只有 adapter 参数进桶
-    （几十 MB 级），省下的量不值得引入「``zero_grad(set_to_none=True)`` 之后 bucket
-    view 失效」这类与优化器实现相关的坑（PPSF / Prodigy 都自己动 grad）。
+    ``gradient_as_bucket_view``：仍然不开，但**原来写的理由是错的**，别照着它推理。
+
+    原文说「只有 adapter 参数进桶（几十 MB 级），省下的量不值得」。前半句对，后半句
+    只在低秩下成立：
+
+        常规低秩 LoKr（rank 32 级，~20-50M 参数）  ->  76-191 MiB   原理由成立
+        LyCORIS full matrix（803M 参数，fp32）      ->  2.99 GiB    差约 40 倍
+
+    full matrix 是用户会刻意选的配置（``lora_dim`` 给个极大值触发），而它 OOM 时只差
+    1.43 GiB —— 3 GiB 在这个处境下不是「不值得」，是决定性的。
+
+    那为什么还是不开：**没验证过它和 ``set_to_none=True`` 的组合**。开了之后
+    ``p.grad`` 是桶的视图，而本循环每步都调 ``ctx.optimizer.zero_grad()``（五处，
+    全都没传 ``set_to_none``，torch>=2.0 默认就是 True），也就是每步都把 ``p.grad``
+    置 None。reducer 是否在下一次反向前把视图重新指回去，取决于 C++ reducer 的实现
+    细节，本机没装 torch、官方文档也取不到，无法核实。这个方向上猜错的后果是各 rank
+    梯度静默不一致（不报错，只是训出来的东西不对），所以不靠推理开它。
+
+    真要开，两件事必须一起做，缺一不可：
+      1. 在真机上跑一步，确认 ``set_to_none=True`` + bucket view 在当前 torch 版本下
+         各 rank 梯度仍然一致；
+      2. 先补上 ``ppsf_fused_back_pass`` 的多卡拦截（见 bootstrap._check_ddp_compat）。
+         它用 post-accumulate hook 在反向过程中就地更新参数并释放梯度，而 DDP 此时还
+         要拿那块存储做 all_reduce —— 和 bucket view 是直接冲突。
+
+    另外本循环对 ``.grad`` 只有「读」（第 691 行的有限性检查）和「原地改」
+    (``clip_grad_norm_`` 的 ``mul_``)，没有任何一处给 ``p.grad`` 赋新张量 —— 那是
+    bucket view 的必要条件，这一条是满足的，但不充分。
     """
     if not dist_env.is_distributed():
         return

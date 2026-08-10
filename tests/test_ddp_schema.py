@@ -93,3 +93,52 @@ def test_tolerant_fix_drops_block_swap_not_ddp() -> None:
     assert fixed["blocks_to_swap"] == 0
     assert fixed["ddp_num_processes"] == 2
     assert "blocks_to_swap" in names
+
+
+# ------------------------------------------- PPSF fused backward × 多卡互斥
+
+
+def test_ppsf_fused_back_pass_rule_is_declared() -> None:
+    """PPSF fused backward 必须声明成多卡 disable 规则，钉 False。
+
+    为什么是 schema 规则而不是只靠 runtime 检查：声明在这里，UI 灰显、后端
+    fail-fast、tolerant 读盘修复三处从同一份声明派生（与 blocks_to_swap 同款）。
+    """
+    rules = {name: (expr, pin) for name, expr, pin, _ in iter_pin_rules(TrainingConfig)}
+    assert "ppsf_fused_back_pass" in rules, (
+        "ppsf_fused_back_pass 没有 disable_when 声明 —— 多卡下开它会静默地让各 rank "
+        "梯度不一致"
+    )
+    assert rules["ppsf_fused_back_pass"][0] == "ddp_num_processes!=1"
+    assert rules["ppsf_fused_back_pass"][1] is False
+
+
+def test_single_gpu_keeps_ppsf_fused_back_pass_usable() -> None:
+    """单卡下它照常可用 —— 这是个真有用的省显存开关，不能一并禁掉。"""
+    assert TrainingConfig(ppsf_fused_back_pass=True).ppsf_fused_back_pass is True
+
+
+def test_multi_gpu_pins_ppsf_fused_back_pass_when_absent() -> None:
+    """只开多卡、没提这个字段 → 落钉值 False，不报错。"""
+    assert TrainingConfig(ddp_num_processes=2).ppsf_fused_back_pass is False
+
+
+def test_multi_gpu_with_explicit_ppsf_fused_back_pass_is_rejected() -> None:
+    """显式同时开两者 → 校验失败（fail-fast，而不是静默钉值）。
+
+    静默改用户显式写的值同样危险 —— 用户会以为省显存生效了。
+    """
+    with pytest.raises(ValidationError, match="ppsf_fused_back_pass"):
+        TrainingConfig(ddp_num_processes=2, ppsf_fused_back_pass=True)
+
+
+def test_tolerant_fix_drops_ppsf_fused_back_pass_not_ddp() -> None:
+    """存量 config 读盘修复：钉 ppsf_fused_back_pass=False、保住多卡设置。
+
+    方向很重要 —— 用户开多卡是为了摊算力，不能反过来把多卡关掉。
+    """
+    fixed, _ = apply_disable_rule_fixes(
+        {"ddp_num_processes": 2, "ppsf_fused_back_pass": True}, TrainingConfig
+    )
+    assert fixed["ppsf_fused_back_pass"] is False
+    assert fixed["ddp_num_processes"] == 2
