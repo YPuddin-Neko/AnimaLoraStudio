@@ -223,6 +223,67 @@ def test_startup_checkpoints_between_every_phase():
     assert kinds.count("check") >= 4
 
 
+def test_baseline_sampling_is_rank0_gated_with_barriers():
+    """resume phase 的 step-0 基线采样必须 rank0 门控 + 前后 barrier。
+
+    这处**曾经漏了**（loop.py 的 step / epoch 采样都加了，唯独 resume.py 没有）。
+    真机后果：rank 0 还在基线采样、rank 1 已经冲进训练前向的第一个 attention，两者
+    显存峰值叠在同一时间窗口 → rank 1 OOM。次要后果是各 rank 并发写同一批
+    step_0_baseline_*.png，必然写坏。
+
+    按 AST 结构断言而非文本 —— 要确认 barrier 在 `if` 里侧、`is_main()` 外侧
+    （集合操作必须所有 rank 都执行）。
+    """
+    import ast
+    import pathlib
+
+    src = pathlib.Path("runtime/training/phases/resume.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+
+    def _has_call(node, name: str) -> bool:
+        """节点子树里有没有调用 ``name``。
+
+        同时认 ``ast.Name``（裸函数名，如 ``run_sample(...)``）与 ``ast.Attribute``
+        （带模块前缀，如 ``dist_env.barrier()``）—— 只认后者会漏掉 run_sample，
+        本测试最初就是这么写错的，导致它在真实的漏 barrier 代码上也「通过」。
+        """
+        for n in ast.walk(node):
+            if not isinstance(n, ast.Call):
+                continue
+            f = n.func
+            if isinstance(f, ast.Attribute) and f.attr == name:
+                return True
+            if isinstance(f, ast.Name) and f.id == name:
+                return True
+        return False
+
+    # 找包住 run_sample 的那个 if（基线采样块）
+    target = None
+    for node in ast.walk(tree):
+        if isinstance(node, ast.If) and _has_call(node, "run_sample"):
+            target = node
+            break
+    assert target is not None, "resume.py 里找不到基线采样的 if 块"
+
+    body_src = [ast.unparse(s) for s in target.body]
+    assert any("barrier()" in s for s in body_src), (
+        "基线采样块里没有 barrier —— rank 0 采样时其余 rank 会径直进训练前向，"
+        "显存峰值重叠导致 OOM"
+    )
+    # barrier 至少两次（前后各一）
+    assert sum(s.count("barrier()") for s in body_src) >= 2, (
+        "barrier 少于两次 —— 采样前后都要挡：前者让 rank 0 在其余 rank 释放激活后"
+        "才开始吃显存，后者让其余 rank 等它结束"
+    )
+    # run_sample 必须在 is_main() 门控内
+    guarded = False
+    for stmt in target.body:
+        if isinstance(stmt, ast.If) and _has_call(stmt.test, "is_main"):
+            if _has_call(stmt, "run_sample"):
+                guarded = True
+    assert guarded, "run_sample 不在 is_main() 门控内 —— 各 rank 会并发写同一批文件"
+
+
 def test_loop_clears_marker_on_rank0_only():
     """只有 rank 0 删标记。
 

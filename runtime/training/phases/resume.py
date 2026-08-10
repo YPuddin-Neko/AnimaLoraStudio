@@ -15,6 +15,7 @@ from training.bootstrap import init_progress
 from training.context import TrainingContext
 from training.observability import render_curve_panel
 from training.sample_runner import run_sample
+from utils import distributed as dist_env
 from training.snapshot import emit_event
 from training.state import load_training_state
 
@@ -115,20 +116,31 @@ def run(ctx: TrainingContext) -> None:
 
     # Step 0 初始采样（基线效果，测试所有提示词）
     # 只在新训练时执行（global_step == 0），resume 时跳过
+    #
+    # 多卡：只 rank 0 出图 + 前后 barrier，与 loop.py 的 step / epoch 采样同口径。
+    # 这里**曾经漏了**，后果是真机上 rank 0 还在基线采样、rank 1 已经冲进训练前向
+    # 的第一个 attention —— 两者的显存峰值叠在同一时间窗口，rank 1 OOM。
+    # （各 rank 还会并发写同一批 step_0_baseline_*.png，必然写坏。）
+    #
+    # barrier 在 if 里侧、is_main() 外侧：集合操作必须所有 rank 都执行，而这个 if
+    # 的条件（global_step / sample_steps / sample_every）各 rank 一致。
     sampling_enabled = args.sample_steps > 0 or args.sample_every > 0
     if ctx.global_step == 0 and sampling_enabled:
-        ctx.emit("采样中 (step 0, 基线)...")
-        for i, prompt in enumerate(ctx.sample_prompts[:3]):  # 最多测试 3 个
-            sample_path = ctx.sample_dir / f"step_0_baseline_{i}.png"
-            run_sample(
-                ctx,
-                prompt=prompt,
-                sample_path=sample_path,
-                wandb_key="samples/baseline",
-                wandb_caption=f"step 0 baseline {i}: {prompt}",
-                wandb_step=0,
-                seed_offset=i,
-            )
+        dist_env.barrier()
+        if dist_env.is_main():
+            ctx.emit("采样中 (step 0, 基线)...")
+            for i, prompt in enumerate(ctx.sample_prompts[:3]):  # 最多测试 3 个
+                sample_path = ctx.sample_dir / f"step_0_baseline_{i}.png"
+                run_sample(
+                    ctx,
+                    prompt=prompt,
+                    sample_path=sample_path,
+                    wandb_key="samples/baseline",
+                    wandb_caption=f"step 0 baseline {i}: {prompt}",
+                    wandb_step=0,
+                    seed_offset=i,
+                )
+        dist_env.barrier()
     elif ctx.global_step > 0 and sampling_enabled:
         ctx.emit(f"跳过启动基线采样（从 step {ctx.global_step} 恢复，非 step 0）")
 

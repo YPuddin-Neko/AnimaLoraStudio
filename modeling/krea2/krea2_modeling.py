@@ -30,14 +30,24 @@ from torch import Tensor, nn
 #: mem-efficient 在 DTK 上没编译 → 退到 math 后端）。math 后端的峰值是
 #: ``[B, H, S_q, S_k]``，把 S_q 切成块后峰值降到 ``[B, H, chunk, S_k]``。
 #:
-#: 真机标定（BW1000 64GB / Krea2 48 heads / 2048px 桶 → S≈16.9k / bs=2）：
-#:     不分块  102.5 GiB  → 必 OOM
-#:     4096     24.8 GiB
-#:     2048     12.4 GiB
-#:     1024      6.2 GiB  ← 取这个
-#: 1024 在「峰值够低」与「kernel 启动次数不过多」（16.9k/1024 ≈ 17 次）之间。
-#: 更小的块省不了多少却线性增加启动开销与 Python 循环成本。
-_MASKED_ATTN_QUERY_CHUNK = 1024
+#: 真机标定（BW1000 64GB / Krea2 48 heads / 2048px 桶 → S≈16.9k）。
+#: 下表是**单块**的分数矩阵理论值 ``H × chunk × S × 4B``：
+#:     不分块  51.2 GiB  → 必 OOM（bs 无关，bs=1 也装不下）
+#:     4096    12.4 GiB
+#:     2048     6.2 GiB
+#:     1024     3.1 GiB
+#:      512     1.6 GiB  ← 取这个
+#:
+#: **实测比理论值高约 1.84 倍**：chunk=1024 时理论 3.10 GiB，真机报
+#: `Tried to allocate 5.71 GiB`。原因是 SDPA 的 math 后端同时持有原始分数与 softmax
+#: 结果两份中间张量（还要把 bf16 升到 fp32 算 softmax）。所以标定必须按实测倍数留
+#: 余量，不能照理论值取。
+#:
+#: 取 512 而非 1024 的理由：这个模型的常驻本身就重 —— LoKr full-matrix 模式下
+#: 803M 可训练参数，加 PPSF 的两份 state 与 DiT 权重，训练前就占掉 33 GiB。留给激活
+#: 与分数矩阵的只有约 31 GiB，而激活本身要 20 GiB 上下。512 对应实测约 2.9 GiB，
+#: 是这个预算下的稳妥值；16.9k/512 ≈ 33 次 kernel 启动，相对单步数百毫秒可忽略。
+_MASKED_ATTN_QUERY_CHUNK = 512
 
 
 def _chunked_masked_attention(
