@@ -101,26 +101,39 @@ export default function SystemStats() {
     ? utilValues.reduce((s, u) => s + u, 0) / utilValues.length
     : null
 
-  /** 逐卡一行：`#0 BW  12.3/64G (19%) · 45% · 50°C`。缺失项省略而非填 0。 */
-  const perCardLines = gpus.map((g) => {
+  // 两个 pill 的 tooltip 各自只列**自己那项**指标的逐卡明细。
+  // 早期版本两边共用一份「显存 + 利用率 + 温度」的合并行，于是悬停 GPU 利用率时
+  // 满屏是显存数字，要找的利用率被夹在中间 —— tooltip 的意义就是「这个 pill 的
+  // 数是怎么来的」，混进无关指标反而更难读。
+  //
+  // 温度跟着利用率而不是显存：它俩都是「卡当前忙不忙」的即时状态，且温度只有
+  // 一个数、并进利用率行不会太长；显存那行本身已有 used/total/百分比三个数。
+
+  /** 逐卡显存：`#0 BW  12.3/64G (19%)`。 */
+  const perCardVram = gpus.map((g) => {
     const pct = g.vram_total_gb > 0
       ? ` (${((g.vram_used_gb / g.vram_total_gb) * 100).toFixed(0)}%)`
       : ''
-    const util = g.util_pct != null ? ` · ${g.util_pct}%` : ''
+    return `#${g.index} ${g.name}  ${g.vram_used_gb.toFixed(1)}/${Math.round(g.vram_total_gb)}G${pct}`
+  }).join('\n')
+
+  /** 逐卡利用率 + 温度：`#0 BW  90% · 70°C`。缺失项省略而非填 0 —— 0% 是合法读数。 */
+  const perCardUtil = gpus.map((g) => {
+    const util = g.util_pct != null ? `${g.util_pct}%` : '利用率不可用'
     const temp = g.temp_c != null ? ` · ${g.temp_c}°C` : ''
-    return `#${g.index} ${g.name}  ${g.vram_used_gb.toFixed(1)}/${Math.round(g.vram_total_gb)}G${pct}${util}${temp}`
+    return `#${g.index} ${g.name}  ${util}${temp}`
   }).join('\n')
 
   // 单卡时不重复显示汇总行（与逐卡行内容完全一样，纯噪音）
   const vramTooltip = hasGpu
     ? (multi
-        ? `显存合计 ${vramUsed.toFixed(1)} / ${Math.round(vramTotal)} GB (${vramPct.toFixed(0)}%) · ${gpus.length} 卡\n${perCardLines}`
-        : `显存 ${perCardLines}`)
+        ? `显存合计 ${vramUsed.toFixed(1)} / ${Math.round(vramTotal)} GB (${vramPct.toFixed(0)}%) · ${gpus.length} 卡\n${perCardVram}`
+        : `显存 ${perCardVram}`)
     : ''
   const utilTooltip = hasGpu
     ? (multi && utilAvg != null
-        ? `GPU 利用率均值 ${utilAvg.toFixed(0)}% · ${gpus.length} 卡\n${perCardLines}`
-        : `GPU 利用率 · ${perCardLines}`)
+        ? `GPU 利用率均值 ${utilAvg.toFixed(0)}% · ${gpus.length} 卡\n${perCardUtil}`
+        : `GPU 利用率 · ${perCardUtil}`)
     : ''
 
   return (

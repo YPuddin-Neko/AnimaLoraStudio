@@ -106,14 +106,53 @@ describe('SystemStats', () => {
     expect(screen.queryByText('GPU')).toBeNull()
   })
 
-  it('lists every card in the tooltip', async () => {
+  it('lists per-card VRAM in the VRAM tooltip', async () => {
     vi.spyOn(api, 'systemStats').mockResolvedValue(twoCards())
     render(<SystemStats />)
     const vram = await screen.findByText('36.0/128G')
     const tip = vram.closest('[title]')?.getAttribute('title') ?? ''
     expect(tip).toContain('显存合计 36.0 / 128 GB (28%) · 2 卡')
-    expect(tip).toContain('#0 BW  32.0/64G (50%) · 90% · 70°C')
-    expect(tip).toContain('#1 BW  4.0/64G (6%) · 10% · 50°C')
+    expect(tip).toContain('#0 BW  32.0/64G (50%)')
+    expect(tip).toContain('#1 BW  4.0/64G (6%)')
+  })
+
+  it('keeps utilization out of the VRAM tooltip', async () => {
+    // 两个 tooltip 各只列自己那项指标。早期版本共用一份合并行，于是悬停利用率
+    // 时满屏是显存数字、要找的利用率被夹在中间。
+    vi.spyOn(api, 'systemStats').mockResolvedValue(twoCards())
+    render(<SystemStats />)
+    const vram = await screen.findByText('36.0/128G')
+    const tip = vram.closest('[title]')?.getAttribute('title') ?? ''
+    expect(tip).not.toContain('90%')
+    expect(tip).not.toContain('70°C')
+  })
+
+  it('lists per-card utilization and temperature in the GPU tooltip', async () => {
+    vi.spyOn(api, 'systemStats').mockResolvedValue(twoCards())
+    render(<SystemStats />)
+    const util = await screen.findByText('50%')
+    const tip = util.closest('[title]')?.getAttribute('title') ?? ''
+    expect(tip).toContain('GPU 利用率均值 50% · 2 卡')
+    expect(tip).toContain('#0 BW  90% · 70°C')
+    expect(tip).toContain('#1 BW  10% · 50°C')
+    // 显存不该混进来
+    expect(tip).not.toContain('32.0/64G')
+  })
+
+  it('marks unavailable utilization explicitly in the GPU tooltip', async () => {
+    // 部分卡拿不到利用率时，那一行要写明「不可用」而不是留空或填 0 ——
+    // 空行看着像渲染 bug，0% 是合法读数会误导。
+    vi.spyOn(api, 'systemStats').mockResolvedValue(makeStats({
+      gpu: [
+        { index: 0, name: 'BW', util_pct: 80, vram_used_gb: 10.0, vram_total_gb: 64.0, temp_c: 60 },
+        { index: 1, name: 'BW', util_pct: null, vram_used_gb: 10.0, vram_total_gb: 64.0, temp_c: 55 },
+      ],
+    }))
+    render(<SystemStats />)
+    const util = await screen.findByText('80%')
+    const tip = util.closest('[title]')?.getAttribute('title') ?? ''
+    expect(tip).toContain('#0 BW  80% · 60°C')
+    expect(tip).toContain('#1 BW  利用率不可用 · 55°C')
   })
 
   it('keeps single-card labels unchanged', async () => {
