@@ -22,6 +22,9 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from torch import Tensor, nn
+# 分块注意力给每块套嵌套 checkpoint 用（见 _chunked_masked_attention）。模块级导入 ——
+# 它在每块的循环里调用，不该每次进函数再 import。
+from torch.utils.checkpoint import checkpoint as _checkpoint
 
 
 #: 带 mask 的注意力按 query 维度分块时，每块的 query 数。
@@ -135,18 +138,36 @@ def _chunked_masked_attention(
         return F.scaled_dot_product_attention(
             q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False,
         )
+    # 每块再套一层 checkpoint —— 这是分块在**反向**里也能省显存的唯一办法。
+    #
+    # 为什么必须这样：外层 `checkpoint(use_reentrant=False)` 的首次前向在 no_grad 下
+    # 跑，每块的分数矩阵是临时量，峰值 = 一块，分块有效。但反向里 recompute_fn 会
+    # **带 grad** 重跑同一段代码，于是每次 SDPA 调用都为自己的反向保留 attention
+    # weights —— S_q/chunk 份同时活着，加起来正好等于不分块的整块。真机实测：
+    # chunk=256 时 61 块 × 1.43 GiB = 87.1 GiB，与不分块的 87.0 GiB 一样，
+    # 反向重算到第 19 块就 OOM 了。也就是说不加这层嵌套，分块只压得住前向。
+    #
+    # 套上之后每块的分数矩阵在该块前向后即释放，等这一块自己反向时再重算一次 ——
+    # 峰值回到「一块」，代价是那一块的 attention 多算一遍。
+    #
+    # 只在 grad 打开时套：no_grad 下（推理 / 外层 checkpoint 的首次前向）本来就不保留
+    # 中间量，套 checkpoint 纯属白付开销，而且 torch 在 no_grad 下对 checkpoint 会发
+    # UserWarning（"None of the inputs have requires_grad=True"）。
+    def _attend(q_slice: Tensor) -> Tensor:
+        return F.scaled_dot_product_attention(
+            q_slice, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False,
+        )
+
+    use_nested = torch.is_grad_enabled() and (
+        q.requires_grad or k.requires_grad or v.requires_grad
+    )
     outs = []
     for start in range(0, s_q, chunk):
-        outs.append(
-            F.scaled_dot_product_attention(
-                q[..., start:start + chunk, :],
-                k,
-                v,
-                attn_mask=mask,
-                dropout_p=0.0,
-                is_causal=False,
-            )
-        )
+        q_slice = q[..., start:start + chunk, :]
+        if use_nested:
+            outs.append(_checkpoint(_attend, q_slice, use_reentrant=False))
+        else:
+            outs.append(_attend(q_slice))
     return torch.cat(outs, dim=-2)
 
 

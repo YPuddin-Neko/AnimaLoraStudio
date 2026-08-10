@@ -571,3 +571,102 @@ def test_modeling_layer_only_imports_torch_einops_and_stdlib() -> None:
         elif isinstance(node, ast.ImportFrom) and node.module:
             roots.add(node.module.split(".", 1)[0])
     assert roots <= {"__future__", "dataclasses", "einops", "math", "torch"}
+
+
+def test_chunked_attention_nests_checkpoint_per_chunk_when_grad_enabled() -> None:
+    """带 grad 时每块必须各自套一层 checkpoint，否则分块在**反向**里等于没做。
+
+    这条守的是一个真机上炸过、而且靠"看代码觉得对"完全看不出来的东西。
+
+    外层 ``checkpoint(use_reentrant=False)`` 的首次前向在 ``no_grad`` 下跑 —— 每块的
+    分数矩阵是临时量，峰值 = 一块，分块有效。但反向里 ``recompute_fn`` 会**带 grad**
+    重跑同一段代码，此时每次 SDPA 调用都要为自己的反向保留 attention weights，
+    ``S_q/chunk`` 份同时活着，加起来正好等于不分块的整块：
+
+        真机 chunk=256、B=2、H=48、S_k=15600：
+          单块 1.43 GiB × 61 块 = 87.1 GiB
+          不分块 B*H*S*S*4      = 87.0 GiB   ← 一样
+
+    也就是说没有这层嵌套，"按 query 分块"只压得住前向。真机反向重算到第 19 块
+    (~26.9 GiB 激活) 就 OOM 了。
+
+    测法：数 SDPA 的调用次数。带 grad 时每块会被 checkpoint 重算一次（前向一次 +
+    该块反向时一次），所以反向跑完后的总次数应当是块数的两倍；不套嵌套则只有一倍。
+    这比测显存稳（小张量上显存差异被 allocator 的块粒度吃掉，测不出来）。
+    """
+    from modeling.krea2 import krea2_modeling as m
+
+    torch.manual_seed(31)
+    b, h, s_q, s_k, d = 1, 2, 12, 8, 16
+    chunk = 4
+    n_chunks = -(-s_q // chunk)          # 3
+
+    q = torch.randn(b, h, s_q, d, requires_grad=True)
+    k = torch.randn(b, h, s_k, d, requires_grad=True)
+    v = torch.randn(b, h, s_k, d, requires_grad=True)
+    mask = torch.ones(b, 1, 1, s_k, dtype=torch.bool)
+    mask[..., -2:] = False
+
+    calls = {"n": 0}
+    real = torch.nn.functional.scaled_dot_product_attention
+
+    def counting(*a, **kw):
+        calls["n"] += 1
+        return real(*a, **kw)
+
+    orig = m.F.scaled_dot_product_attention
+    m.F.scaled_dot_product_attention = counting
+    try:
+        out = m._chunked_masked_attention(q, k, v, mask, chunk=chunk)
+        after_forward = calls["n"]
+        out.sum().backward()
+        after_backward = calls["n"]
+    finally:
+        m.F.scaled_dot_product_attention = orig
+
+    assert after_forward == n_chunks, (
+        f"前向该调 {n_chunks} 次 SDPA，实际 {after_forward} 次"
+    )
+    assert after_backward == 2 * n_chunks, (
+        f"反向后总调用次数该是 {2 * n_chunks}（每块重算一次），实际 {after_backward}。"
+        f"等于 {n_chunks} 说明每块没套 checkpoint —— 分块只压得住前向，反向峰值仍是"
+        f"整块，真机上会 OOM。"
+    )
+    assert q.grad is not None and torch.isfinite(q.grad).all(), "梯度没算出来或含非有限值"
+
+
+def test_chunked_attention_gradients_match_unchunked() -> None:
+    """嵌套 checkpoint 不能改变梯度。
+
+    上面那条只数了调用次数 —— 次数对但梯度错（比如重算时 mask 没跟上、或块边界的
+    切片在反向里对不上）仍会绿。这条直接比梯度。
+
+    容差取 fp32 量级而非 0：重算走的是另一次 kernel 调用，累加顺序可能不同，而浮点
+    加法不满足结合律（同一原因见 test_chunked_masked_attention_matches_unchunked）。
+    """
+    from modeling.krea2 import krea2_modeling as m
+
+    def grads(chunk: int | None) -> tuple[torch.Tensor, ...]:
+        torch.manual_seed(37)
+        q = torch.randn(1, 2, 12, 16, dtype=torch.float64, requires_grad=True)
+        k = torch.randn(1, 2, 8, 16, dtype=torch.float64, requires_grad=True)
+        v = torch.randn(1, 2, 8, 16, dtype=torch.float64, requires_grad=True)
+        mask = torch.ones(1, 1, 1, 8, dtype=torch.bool)
+        mask[..., -2:] = False
+        if chunk is None:
+            out = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=mask, dropout_p=0.0, is_causal=False,
+            )
+        else:
+            out = m._chunked_masked_attention(q, k, v, mask, chunk=chunk)
+        (out * torch.arange(1.0, out.numel() + 1, dtype=torch.float64).view(out.shape)).sum().backward()
+        return q.grad.clone(), k.grad.clone(), v.grad.clone()
+
+    reference = grads(None)
+    for chunk in (4, 5, 8):
+        got = grads(chunk)
+        for name, a, b in zip(("q", "k", "v"), got, reference):
+            torch.testing.assert_close(
+                a, b, rtol=1e-9, atol=1e-9,
+                msg=lambda s, n=name, c=chunk: f"chunk={c} 的 {n}.grad 与不分块不一致\n{s}",
+            )
