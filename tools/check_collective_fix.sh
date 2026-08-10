@@ -19,8 +19,25 @@ python -m pytest tests/test_collective_gating.py -v 2>&1 | tail -15
 
 echo
 echo "=== 2/3 相关既有测试 ==="
-python -m pytest tests/ -q \
-  -k "ddp or distributed or pause or collective or krea2" 2>&1 | tail -15
+# 显式列文件而不是用 -k：pytest 的 -k 是在**收集之后**才过滤的，用 tests/ 当路径会
+# 先导入全部测试模块，任何一个模块缺可选依赖（如 reg 那几个要 sklearn）都会在收集
+# 阶段就 Interrupted —— 于是本该跑的这些一条都没跑，而且 set -e 还会顺手掐掉第 3 段。
+RELATED=(
+  tests/test_collective_gating.py
+  tests/test_distributed.py
+  tests/test_accelerator.py
+  tests/test_pause_marker.py
+  tests/test_ddp_find_unused.py
+  tests/test_ddp_schema.py
+  tests/test_loop_ddp_grad_accum.py
+  tests/test_dataset_sampler_ddp.py
+  tests/test_cmd_builder_ddp.py
+  tests/test_krea2_modeling.py
+  tests/test_krea2_mask_shortcut_static.py
+)
+# 不让这一段的失败掐掉第 3 段（真机双卡验证才是重点），但记下来最后一起报。
+stage2_rc=0
+python -m pytest "${RELATED[@]}" -q 2>&1 | tail -18 || stage2_rc=$?
 
 echo
 echo "=== 3/3 双卡集合操作对齐实测 ==="
@@ -115,7 +132,13 @@ if timeout 180 python -m torch.distributed.run \
     --nnodes 1 --nproc_per_node 2 --master_port 29517 \
     /tmp/_align_probe.py; then
   echo
-  echo "全部通过：集合操作在两个 rank 上对齐。"
+  echo "第 3 段通过：集合操作在两个 rank 上对齐。"
+  if [ "$stage2_rc" -ne 0 ]; then
+    echo
+    echo "但第 2 段（既有测试）退出码 $stage2_rc —— 往上翻看是哪条失败。"
+    exit "$stage2_rc"
+  fi
+  echo "全部通过。"
 else
   rc=$?
   echo
