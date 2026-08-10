@@ -240,6 +240,69 @@ def all_reduce_mean(value: Any) -> Any:
         return value
 
 
+#: 暂停请求标记文件名。放在 task 档案目录下（``studio_data/tasks/<id>/``），由
+#: supervisor 创建、训练循环轮询、rank 0 在退出前删除。
+PAUSE_MARKER_NAME = "pause.request"
+
+
+def pause_marker_path() -> Optional[Any]:
+    """本次训练的暂停标记路径；拿不到 task 目录时 None。
+
+    路径由 ``LORA_TASK_DIR`` 环境变量给出 —— supervisor spawn 训练进程时注入。
+    裸 CLI 训练没有这个变量，返回 None，轮询直接短路（CLI 用 Ctrl+C，信号那条路
+    在单进程下工作正常）。
+    """
+    raw = os.environ.get("LORA_TASK_DIR")
+    if not raw:
+        return None
+    from pathlib import Path
+
+    return Path(raw) / PAUSE_MARKER_NAME
+
+
+def pause_requested() -> bool:
+    """是否有待处理的暂停请求。
+
+    **为什么多卡下用文件而不是信号**：torchrun 起的进程树是
+    ``supervisor → elastic agent → N × worker``，supervisor 只持有 agent 的 pid。
+    发 SIGINT 给 agent 时，它的 ``_terminate_process_handler`` 接住后**转发 SIGTERM**
+    给 worker 并自己抛 SignalException —— worker 收到的是 SIGTERM 而不是 SIGINT，
+    ``ctx.handle_interrupt`` 压根没注册那个信号，于是 pause snapshot 不会被写出来，
+    任务无法续训（真机实测，日志里能看到 agent 的
+    "Sending process ... closing signal SIGTERM"）。
+
+    即使绕过 agent、直接给每个 worker 发 SIGINT，信号路径在多卡下仍然不安全：各
+    rank 收到信号的时刻不同，一个 rank 已经 ``sys.exit`` 而另一个还等在 all_reduce
+    上就会挂住整组。文件标记让所有 rank 在**同一个循环位置**看到请求，天然同步。
+
+    单卡的信号路径保持不动（已验证、且 CLI Ctrl+C 依赖它）；本函数是多卡下的补充
+    通道，两者可以并存 —— 谁先命中都走同一个 ``handle_interrupt``。
+
+    每步一次 ``os.path.exists`` 的开销相对训练步（数百毫秒级）可忽略。
+    """
+    marker = pause_marker_path()
+    if marker is None:
+        return False
+    try:
+        return marker.exists()
+    except OSError:
+        return False
+
+
+def clear_pause_marker() -> None:
+    """删掉暂停标记（只该 rank 0 调）。失败不抛。
+
+    不删的话下次 resume 会立刻又看到标记、立刻又暂停 —— 表现为「一点继续就又停了」。
+    """
+    marker = pause_marker_path()
+    if marker is None:
+        return
+    try:
+        marker.unlink(missing_ok=True)
+    except OSError as exc:
+        logger.warning("删除暂停标记失败（下次 resume 可能立刻再暂停）: %s", exc)
+
+
 def topology_summary() -> str:
     """一行拓扑描述，给启动日志用。单进程返回 "单卡"。"""
     if not is_distributed():

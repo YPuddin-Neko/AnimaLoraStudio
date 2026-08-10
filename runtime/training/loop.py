@@ -296,6 +296,22 @@ def run(ctx: TrainingContext) -> None:
             if ctx.ddp_model is not None:
                 ctx.ddp_model.require_backward_grad_sync = _is_group_end_pre
 
+            # 暂停请求的**文件通道**：多卡下信号送不到训练进程（torchrun 的
+            # elastic agent 会把 SIGINT 转成 SIGTERM 给 worker，而 handle_interrupt
+            # 只注册了 SIGINT/SIGBREAK），详见 distributed.pause_requested()。
+            #
+            # 位置刻意选在**组末步之后**判断：mid-accumulation 退出会留下悬挂的
+            # partial backward 梯度（ADR 0006 Addendum 1 放弃 mid-epoch save 的
+            # 同一组理由）。等到组末再响应，最多多跑 grad_accum-1 个 micro-batch。
+            #
+            # 所有 rank 在同一个 batch_idx 上看到标记 → 一起走 handle_interrupt →
+            # 一起 sys.exit。信号做不到这种同步：各 rank 收到的时刻不同，一个已退出
+            # 而另一个还等在 all_reduce 上会挂住整组。
+            if _is_group_end_pre and not ctx.interrupted and dist_env.pause_requested():
+                if dist_env.is_main():
+                    dist_env.clear_pause_marker()
+                ctx.handle_interrupt(None, None)
+
             captions = batch["captions"]
 
             # 获取 latents（缓存模式或实时编码）

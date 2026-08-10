@@ -55,6 +55,8 @@ from .resources import (
     RESOURCE_LIGHT,
     job_resource_class,
 )
+from utils.distributed import PAUSE_MARKER_NAME
+
 from .cmd_builder import (
     _EVENT_MARKER,
     CmdBuilder,
@@ -608,8 +610,14 @@ class Supervisor:
             # Addendum 2 起 auto_epoch_state.pt 改落 task 档案 tasks/<id>/state/
             # —— 路径由子进程从 --monitor-state-file 推出（bootstrap，同 samples/）。
             # ADR-0009 PR-1 C6：TRACE_ENV + PROCESS_ENV 让 worker bootstrap 拿到。
+            # LORA_TASK_DIR：多卡暂停的文件通道用它定位标记文件
+            # （utils/distributed.py:pause_marker_path）。torchrun 下 supervisor 只
+            # 持有 elastic agent 的 pid，发 SIGINT 会被 agent 转成 SIGTERM 给 worker
+            # —— handle_interrupt 收不到，snapshot 写不出来。文件标记绕开信号语义，
+            # 且让所有 rank 在同一个循环位置看到请求（信号做不到同步）。
             proc = self._popen(cmd, log_fp, extra_env={
                 "LORA_TASK_ID": str(task["id"]),
+                "LORA_TASK_DIR": str(task_dir(int(task["id"]))),
                 TRACE_ENV: trace_id,
                 PROCESS_ENV: process_name,
             })
@@ -1504,7 +1512,35 @@ class Supervisor:
             logger.exception("send terminate signal failed")
 
     @staticmethod
-    def _send_pause_signal(proc: subprocess.Popen) -> None:
+    def _write_pause_marker(task_id: Optional[int]) -> bool:
+        """写暂停标记文件（多卡通道）。返回是否写成功。
+
+        多卡下信号送不到训练进程：torchrun 的进程树是
+        ``supervisor → elastic agent → N × worker``，我们只持有 agent 的 pid。发
+        SIGINT 给 agent，它接住后**转发 SIGTERM** 给 worker 并自己抛
+        SignalException —— worker 的 handle_interrupt 只注册了 SIGINT/SIGBREAK，
+        收不到 SIGTERM，于是 pause snapshot 不会被写出来、任务无法续训。
+
+        标记文件由训练循环每步轮询（utils/distributed.py:pause_requested），所有
+        rank 在同一个循环位置看到请求 —— 这也是信号做不到的：各 rank 收到信号的
+        时刻不同，一个已 sys.exit 而另一个还等在 all_reduce 上会挂住整组。
+
+        单卡也一起写：多一条冗余通道无害（谁先命中都走同一个 handle_interrupt），
+        而少一处「单卡/多卡走不同路」的分支就少一处能坏的地方。
+        """
+        if task_id is None:
+            return False
+        try:
+            d = task_dir(int(task_id))
+            d.mkdir(parents=True, exist_ok=True)
+            (d / PAUSE_MARKER_NAME).write_text("1", encoding="utf-8")
+            return True
+        except OSError:
+            logger.exception("写暂停标记失败 task=%s", task_id)
+            return False
+
+    @classmethod
+    def _send_pause_signal(cls, proc: subprocess.Popen, task_id: Optional[int] = None) -> None:
         """Pause 软信号 — 子进程 handle_interrupt 接住保 state。
 
         Windows：`CTRL_BREAK_EVENT` 送达 CREATE_NEW_PROCESS_GROUP 子进程组，
@@ -1512,7 +1548,16 @@ class Supervisor:
         POSIX：`SIGINT` — 跟 SIGTERM 分流，cancel 走 SIGTERM 不撞。
 
         信号链路经 spike 验证（决策见 ADR 0006）。
+
+        **多卡补充**：先写文件标记（见 :meth:`_write_pause_marker`），再照常发信号。
+        两条通道并存而不是二选一 —— 单卡靠信号（已验证多年、且 CLI Ctrl+C 走同一
+        条路），多卡靠文件；两者都指向同一个 handle_interrupt，先命中的生效。
+        信号在多卡下会打到 elastic agent 上，agent 收到后转 SIGTERM 杀 worker，
+        但那发生在 worker 已经因文件标记走完 pause 流程之后（worker 每步轮询，
+        而 agent 的 30s grace 由 _signal_pause_async 的「不超时降级」保证不会提前
+        强杀），所以不会互相打断。
         """
+        cls._write_pause_marker(task_id)
         try:
             if os.name == "nt":
                 proc.send_signal(signal.CTRL_BREAK_EVENT)  # type: ignore[attr-defined]
@@ -1532,7 +1577,11 @@ class Supervisor:
         if not slot.proc:
             return
         slot.pause_pending = True
-        self._send_pause_signal(slot.proc)
+        # slot.id 是 task id（slot.kind == "task" 时）—— 文件标记通道要用它定位
+        # task 档案目录。job slot 没有暂停语义，传 None 让标记那步自然跳过。
+        self._send_pause_signal(
+            slot.proc, slot.id if slot.kind == "task" else None,
+        )
 
     def _persist_last_state(self, task_id: int, payload: dict[str, Any]) -> None:
         """把 auto_epoch_backup_written 的恢复点信息写进 tasks 行（ADR Addendum 2）。
