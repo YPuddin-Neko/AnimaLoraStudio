@@ -22,8 +22,11 @@ import { useToast } from './Toast'
 const TIMEOUT_MS = 30_000
 
 type PhaseState =
+  // step: null = 走了 task_state_changed 兜底、没拿到真实步数。**不能填 0**——
+  // 真机上 epoch 9 暂停时 UI 报「已暂停在 step 0」，看起来像 9 个 epoch 全白跑了。
+  // resume 用的是 .pt 里存的 step，与这里无关，但这个数字会骗人。
   | { phase: 'saving' }
-  | { phase: 'saved'; step: number }
+  | { phase: 'saved'; step: number | null }
   | { phase: 'timeout' }
   | { phase: 'failed'; exitCode: number | null }
 
@@ -68,15 +71,20 @@ export function PauseProgressModal({ taskId, taskName, onClose }: PauseProgressM
     useCallback((evt: StudioEvent) => {
       if (evt.task_id !== taskId) return
       if (evt.type === 'pause_state') {
-        // 子进程已落盘 .pt + snapshot → 标 saved；step 来自 payload（PR-2 emit）
-        const step = typeof evt.step === 'number' ? evt.step : 0
+        // 子进程已落盘 .pt + snapshot → 标 saved；step 来自 payload（PR-2 emit）。
+        // 不设 phase 守卫：这个事件带真实步数，即使 task_state_changed 的兜底已经
+        // 先把 phase 标成 saved，也要用它把 step 补上（真机上两个事件的到达顺序
+        // 不保证，兜底先到就会把步数永久钉在「未知」）。
+        const step = typeof evt.step === 'number' ? evt.step : null
         setState({ phase: 'saved', step })
         return
       }
       if (evt.type === 'task_state_changed') {
         if (evt.status === 'paused' && phaseRef.current !== 'saved') {
-          // 兜底：万一 pause_state 事件丢了，task_state_changed='paused' 也算成功
-          setState({ phase: 'saved', step: 0 })
+          // 兜底：万一 pause_state 事件丢了，task_state_changed='paused' 也算成功。
+          // step 给 null 而不是 0 —— 这里根本不知道步数，编一个 0 会让用户以为
+          // 进度全丢了。
+          setState({ phase: 'saved', step: null })
         } else if (evt.status === 'failed' || evt.status === 'canceled') {
           // 子进程异常退出 / 用户从外面 cancel 了 → 失败态
           if (phaseRef.current === 'saving' || phaseRef.current === 'timeout') {
@@ -157,7 +165,9 @@ export function PauseProgressModal({ taskId, taskName, onClose }: PauseProgressM
         {state.phase === 'saved' && (
           <div className="flex flex-col gap-3" data-testid="pause-saved">
             <span className="text-sm text-ok">
-              ✓ {t('queue.pauseProgress.saved', { step: state.step })}
+              ✓ {state.step === null
+                ? t('queue.pauseProgress.savedNoStep')
+                : t('queue.pauseProgress.saved', { step: state.step })}
             </span>
             <div className="flex justify-end gap-2">
               <button

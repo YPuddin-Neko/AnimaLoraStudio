@@ -307,7 +307,14 @@ def run(ctx: TrainingContext) -> None:
             # 所有 rank 在同一个 batch_idx 上看到标记 → 一起走 handle_interrupt →
             # 一起 sys.exit。信号做不到这种同步：各 rank 收到的时刻不同，一个已退出
             # 而另一个还等在 all_reduce 上会挂住整组。
-            if _is_group_end_pre and not ctx.interrupted and dist_env.pause_requested():
+            # 两条通道都看：文件标记（supervisor 写，多卡主通道）和信号标志
+            # （多卡下 SIGINT 只置标志，见 context.request_pause_from_signal）。
+            # 只看文件的话，CLI 里 Ctrl+C 起的多卡训练永远等不到标记文件。
+            if (
+                _is_group_end_pre
+                and not ctx.interrupted
+                and (dist_env.pause_requested() or ctx.pause_signal_seen)
+            ):
                 if dist_env.is_main():
                     dist_env.clear_pause_marker()
                 ctx.handle_interrupt(None, None)
@@ -940,6 +947,34 @@ def run(ctx: TrainingContext) -> None:
 
         # epoch 结束后的操作
         ctx.current_epoch = epoch + 1
+
+        # 暂停检查点 ②：epoch 末、**采样之前**。
+        #
+        # 上面那条只在 batch 循环的组末生效，管不到 epoch 末这一整段
+        # （保存 → 采样 → auto backup，中间有 5 处 barrier）。少了这道闸的真机后果：
+        # 暂停信号在 epoch 9 的采样期间到达 —— rank 0 正在 is_main() 里出图，
+        # 收到 SIGINT 走 handle_interrupt 并 sys.exit(0)；rank 1 早已越过采样前的
+        # barrier，此刻**阻塞在采样后那个 barrier 上**等永远不会来的 rank 0。
+        # NCCL 的 barrier 阻塞在 C++ 里，Python 的信号处理器要等当前 C 调用返回才有
+        # 机会跑，所以 rank 1 连自己的 SIGINT 都处理不了，30 秒宽限期后被 torchrun
+        # SIGKILL（日志：22:13:28 发信号 → 22:13:58 "forcefully exiting via 9"），
+        # 死在集合操作中间，RCCL 通信器没正常销毁。
+        #
+        # 放在这里而不是采样内部：batch 循环刚退出，所有 rank 天然同步在这一点上
+        # （dl_len 分片时截断对齐过），一起看到标记、一起 handle_interrupt、一起
+        # sys.exit —— 谁都不会单独撞进后面那些 barrier。
+        #
+        # 本处**不带** _is_group_end_pre：batch 循环已经退出，不存在
+        # mid-accumulation 悬挂梯度的问题（那是循环内那条闸的约束）。
+        #
+        # 此时 last_auto_epoch_state_path 指向**上一个** epoch 末的备份：本 epoch 的
+        # auto backup 还没写。代价是丢掉刚跑完的这个 epoch，换来所有 rank 干净退出，
+        # 也符合 ADR 0006 Addendum 1「恢复点 = 最近一次 epoch 末」的既有语义。
+        if not ctx.interrupted and (dist_env.pause_requested() or ctx.pause_signal_seen):
+            if dist_env.is_main():
+                dist_env.clear_pause_marker()
+            ctx.handle_interrupt(None, None)
+
         if epoch_step_count > 0:
             ctx.wandb_monitor.log(
                 {

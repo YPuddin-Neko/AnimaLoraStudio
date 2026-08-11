@@ -94,10 +94,34 @@ def run(ctx: TrainingContext) -> None:
     #   POSIX：SIGINT（CLI Ctrl+C / supervisor `os.kill(pid, SIGINT)`）
     #   Windows：SIGINT 留给 CLI Ctrl+C，SIGBREAK 接 supervisor 发的
     #     CTRL_BREAK_EVENT（CREATE_NEW_PROCESS_GROUP 子进程组收不到 CTRL_C_EVENT）
-    signal.signal(signal.SIGINT, ctx.handle_interrupt)
-    if os.name == "nt":
-        # SIGBREAK 在 POSIX 上不存在；只 Windows 注册
-        signal.signal(signal.SIGBREAK, ctx.handle_interrupt)  # type: ignore[attr-defined]
+    #
+    # 多卡：信号**不能**直接退出，只置标志，由训练循环里已有的轮询点在
+    # 「所有 rank 都到得了的同步位置」响应。
+    #
+    # 直接退出的真机后果（epoch 9 暂停）：信号在采样期间到达，rank 0 正在
+    # is_main() 里出图，handle_interrupt 跑完就 sys.exit(0)；rank 1 早已越过采样前
+    # 的 barrier、此刻阻塞在采样后那个 barrier 上等永不到来的 rank 0。NCCL 的
+    # barrier 阻塞在 C++ 里，Python 信号处理器要等当前 C 调用返回才有机会跑，
+    # 所以 rank 1 连自己的信号都处理不了 —— 30 秒宽限期后被 torchrun SIGKILL
+    # （日志：22:13:28 发信号 → 22:13:58 "forcefully exiting via 9"），
+    # 死在集合操作中间，RCCL 通信器没正常销毁。
+    #
+    # supervisor 的文件标记通道（_write_pause_marker）本来就是为多卡设计的，
+    # 但它的注释假设「worker 每步轮询」—— 采样一次 3-7 分钟，那不是一个训练步，
+    # 期间没有轮询点，所以光有文件通道不够，还必须把信号这条路也改成异步。
+    #
+    # 单卡保持原样：没有集合操作，立即退出是安全的，且 CLI Ctrl+C 依赖它的即时性。
+    if dist_env.world_size() > 1:
+        signal.signal(signal.SIGINT, ctx.request_pause_from_signal)
+        if os.name == "nt":
+            signal.signal(  # type: ignore[attr-defined]
+                signal.SIGBREAK, ctx.request_pause_from_signal,  # type: ignore[attr-defined]
+            )
+    else:
+        signal.signal(signal.SIGINT, ctx.handle_interrupt)
+        if os.name == "nt":
+            # SIGBREAK 在 POSIX 上不存在；只 Windows 注册
+            signal.signal(signal.SIGBREAK, ctx.handle_interrupt)  # type: ignore[attr-defined]
 
     ctx.current_epoch = ctx.start_epoch
     ctx.model.train()

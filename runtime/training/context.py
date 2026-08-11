@@ -124,6 +124,9 @@ class TrainingContext:
     sample_prompts: list = field(default_factory=list)
     sample_prompt_idx: int = 0
     interrupted: bool = False
+    # 多卡下信号只置这个标志，不立即退出 —— 见 request_pause_from_signal。
+    # 训练循环的轮询点把它和文件标记一起看（loop.py 的两处 pause 检查）。
+    pause_signal_seen: bool = False
 
     # ─── 采样周期的 rank 不变副本（多卡专用）───
     #
@@ -271,3 +274,27 @@ class TrainingContext:
         else:
             self.emit("首个 epoch 未完成，无 auto 备份可恢复 → 任务将标 canceled。")
         sys.exit(0)
+
+    def request_pause_from_signal(self, signum, frame) -> None:  # noqa: ARG002
+        """多卡下的信号处理器：**只置标志**，不退出。
+
+        为什么不能像单卡那样直接 ``handle_interrupt``：那会让收到信号的 rank 单独
+        走掉，其余 rank 继续阻塞在下一个集合操作上等它，直到被 torchrun SIGKILL
+        （真机 epoch 9 暂停就是这么挂的，详见 phases/resume.py 里信号注册处的注释）。
+
+        置了标志之后由训练循环的轮询点响应 —— 那些位置所有 rank 都到得了，
+        于是「一起看到、一起退出」。代价是响应延迟：最坏情况要等当前采样跑完
+        （3-7 分钟）。UI 那个 30 秒 modal 会先弹「保存耗时超过预期」，
+        文案已按此调整。
+
+        重复按（标志已置）= 用户等不下去了，按单卡语义立即强退。这条路径下
+        各 rank 状态本就要丢，不再顾虑集合操作。
+        """
+        if self.pause_signal_seen:
+            self.emit("再次收到暂停信号 → 强制退出（放弃本次 epoch 的干净收尾）...")
+            sys.exit(1)
+        self.pause_signal_seen = True
+        self.emit(
+            "收到暂停信号，将在下一个安全点退出（多卡需所有 rank 同步；"
+            "若正在采样要等它跑完）..."
+        )

@@ -108,29 +108,75 @@ def test_marker_name_is_shared_constant():
 # ---------------------------------------------------------------------------
 
 
+def _interrupt_sites() -> list[tuple[int, str]]:
+    """[(行号, 包裹条件)]，取 loop.py 里每处真实的 handle_interrupt 调用。
+
+    用 AST 而非正则：条件写成多行（黑格式化后很常见）时 ``if ... pause_requested()``
+    的单行正则就匹配不到了，会静默落到**另一处**闸上去检查，等于测了错的东西。
+    """
+    import ast
+    import pathlib
+    import textwrap
+
+    src = textwrap.dedent(
+        pathlib.Path("runtime/training/loop.py").read_text(encoding="utf-8")
+    )
+    sites: list[tuple[int, str]] = []
+
+    def walk(node, conds):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.If):
+                t = ast.unparse(child.test)
+                for s in child.body:
+                    walk_stmt(s, [*conds, t])
+                for s in child.orelse:
+                    walk_stmt(s, conds)
+            else:
+                walk(child, conds)
+
+    def walk_stmt(stmt, conds):
+        for sub in ast.walk(stmt):
+            if (
+                isinstance(sub, ast.Call)
+                and isinstance(sub.func, ast.Attribute)
+                and sub.func.attr == "handle_interrupt"
+            ):
+                sites.append((getattr(stmt, "lineno", -1), " and ".join(conds)))
+                return
+        if isinstance(stmt, ast.If):
+            walk(ast.Module(body=[stmt], type_ignores=[]), conds)
+            return
+        walk(stmt, conds)
+
+    walk(ast.parse(src), [])
+    return sites
+
+
 def test_loop_checks_pause_only_at_group_end():
-    """轮询必须在**组末步**才响应，不能在梯度累积中间退出。
+    """batch 循环内的轮询必须在**组末步**才响应，不能在梯度累积中间退出。
 
     mid-accumulation 退出会留下悬挂的 partial backward 梯度（与 ADR 0006
     Addendum 1 放弃 mid-epoch save 的理由同源）。等到组末再响应，最多多跑
     grad_accum-1 个 micro-batch。
 
-    静态检查：条件里必须同时含 _is_group_end_pre 与 pause_requested。
+    注意有**两处**暂停闸，要求不同：
+      - batch 循环内（本测试）：必须带 _is_group_end_pre
+      - epoch 末、采样之前：batch 循环已退出，不存在 mid-accumulation，
+        所以**不该**要求组末判定（见 test_pause_multigpu_signal.py）
     """
-    import pathlib
-    import re
+    sites = _interrupt_sites()
+    assert sites, "loop.py 里找不到 handle_interrupt 调用"
 
-    src = pathlib.Path("runtime/training/loop.py").read_text(encoding="utf-8")
-    m = re.search(r"if [^\n]*pause_requested\(\)[^\n]*:", src)
-    assert m, "loop.py 里没有 pause_requested() 的轮询"
-    cond = m.group(0)
-    assert "_is_group_end_pre" in cond, (
-        "暂停轮询没和组末判定绑定 —— mid-accumulation 退出会留悬挂梯度"
+    group_end_sites = [(ln, c) for ln, c in sites if "_is_group_end_pre" in c]
+    assert group_end_sites, (
+        "找不到带 _is_group_end_pre 的暂停闸 —— batch 循环内的轮询若不绑组末判定，"
+        f"mid-accumulation 退出会留悬挂梯度。实际各处条件：{sites}"
     )
-    assert "not ctx.interrupted" in cond, (
-        "没挡已 interrupted 状态 —— handle_interrupt 二次触发会走强退分支 exit(1)，"
-        "把正常暂停变成失败退出"
-    )
+    for lineno, cond in sites:
+        assert "not ctx.interrupted" in cond, (
+            f"loop.py:{lineno} 的暂停闸没挡已 interrupted 状态 —— handle_interrupt "
+            f"二次触发会走强退分支 exit(1)，把正常暂停变成失败退出。\n条件：{cond}"
+        )
 
 
 # ---------------------------------------------------------------------------

@@ -72,6 +72,40 @@ describe('PauseProgressModal', () => {
     expect(screen.getByTestId('pause-saving')).toBeInTheDocument()
   })
 
+  it('shows the real step from pause_state, not a placeholder', () => {
+    render(<PauseProgressModal taskId={42} onClose={vi.fn()} />)
+    act(() => {
+      onEventCb?.({ type: 'pause_state', task_id: 42, step: 324 })
+    })
+    expect(screen.getByTestId('pause-saved').textContent).toContain('324')
+  })
+
+  it('task_state_changed=paused fallback does NOT claim step 0', () => {
+    // 真机上 epoch 9 暂停时 UI 报「已暂停在 step 0」—— 兜底分支把 step 写死成 0，
+    // 看起来像 9 个 epoch 全白跑了。步数未知时必须不显示数字，不能编一个。
+    render(<PauseProgressModal taskId={42} onClose={vi.fn()} />)
+    act(() => {
+      onEventCb?.({ type: 'task_state_changed', task_id: 42, status: 'paused' })
+    })
+    const saved = screen.getByTestId('pause-saved')
+    expect(saved).toBeInTheDocument()
+    expect(saved.textContent).not.toContain('0')
+  })
+
+  it('late pause_state still fills in the step after the fallback fired', () => {
+    // 两个事件的到达顺序不保证。兜底先到时若给 saved 分支加 phase 守卫，
+    // 步数会被永久钉在「未知」——真机就是这个顺序。
+    render(<PauseProgressModal taskId={42} onClose={vi.fn()} />)
+    act(() => {
+      onEventCb?.({ type: 'task_state_changed', task_id: 42, status: 'paused' })
+    })
+    expect(screen.getByTestId('pause-saved').textContent).not.toContain('324')
+    act(() => {
+      onEventCb?.({ type: 'pause_state', task_id: 42, step: 324 })
+    })
+    expect(screen.getByTestId('pause-saved').textContent).toContain('324')
+  })
+
   it('saving → timeout after 30s', () => {
     vi.useFakeTimers()
     render(<PauseProgressModal taskId={42} onClose={vi.fn()} />)
