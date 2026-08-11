@@ -1019,37 +1019,39 @@ def run(ctx: TrainingContext) -> None:
             # 到 state_dir()）—— 用户周期 save 仍走上面的 state_dir() 不动。
             auto_state_path = build_auto_epoch_state_path(ctx.auto_state_dir())
             auto_config_path = build_auto_epoch_config_path(ctx.auto_state_dir())
-            monitor_data = None
-            if ctx.monitor_server:
-                try:
-                    from train_monitor import get_state
-                    monitor_data = get_state()
-                except Exception:
-                    pass
-            # config snapshot 先写 — 体积小、失败概率低
-            write_config_snapshot(auto_config_path, args, ctx.sample_prompts)
-            with optimizer_eval_mode(ctx.optimizer):
-                save_training_state(
-                    auto_state_path, ctx.injector, ctx.optimizer,
-                    ctx.current_epoch, ctx.global_step, ctx.loss_history,
-                    monitor_state=monitor_data, scheduler=ctx.scheduler,
-                    timestep_sampler=ctx.timestep_sampler,
-                    sra_aligner=ctx.sra_aligner,
-                    scaler=ctx.scaler,
-                    model_family=ctx.family.spec.family_id,
-                )
-            ctx.wandb_monitor.upload_state_auto(auto_state_path)
-            # 更新 ctx 字段供 handle_interrupt emit pause_state 用
-            ctx.last_auto_epoch_state_path = auto_state_path
-            ctx.last_auto_epoch_config_path = auto_config_path
-            # supervisor 端 `_on_line` 抓此 event → 标 slot.last_auto_epoch_state_path
-            # → is_pausable 升级条件满足 → SSE 解锁 UI 暂停按钮（ADR Addendum 1 §UI）
-            emit_event("auto_epoch_backup_written", {
-                "state_path": str(auto_state_path),
-                "config_path": str(auto_config_path),
-                "epoch": ctx.current_epoch,
-                "step": ctx.global_step,
-            })
+            if dist_env.is_main():
+                monitor_data = None
+                if ctx.monitor_server:
+                    try:
+                        from train_monitor import get_state
+                        monitor_data = get_state()
+                    except Exception:
+                        pass
+                # config snapshot 先写 — 体积小、失败概率低
+                write_config_snapshot(auto_config_path, args, ctx.sample_prompts)
+                with optimizer_eval_mode(ctx.optimizer):
+                    save_training_state(
+                        auto_state_path, ctx.injector, ctx.optimizer,
+                        ctx.current_epoch, ctx.global_step, ctx.loss_history,
+                        monitor_state=monitor_data, scheduler=ctx.scheduler,
+                        timestep_sampler=ctx.timestep_sampler,
+                        sra_aligner=ctx.sra_aligner,
+                        scaler=ctx.scaler,
+                        model_family=ctx.family.spec.family_id,
+                    )
+                ctx.wandb_monitor.upload_state_auto(auto_state_path)
+                # 更新 ctx 字段供 handle_interrupt emit pause_state 用
+                ctx.last_auto_epoch_state_path = auto_state_path
+                ctx.last_auto_epoch_config_path = auto_config_path
+                # supervisor 端 `_on_line` 抓此 event → 标 slot.last_auto_epoch_state_path
+                # → is_pausable 升级条件满足 → SSE 解锁 UI 暂停按钮（ADR Addendum 1 §UI）
+                emit_event("auto_epoch_backup_written", {
+                    "state_path": str(auto_state_path),
+                    "config_path": str(auto_config_path),
+                    "epoch": ctx.current_epoch,
+                    "step": ctx.global_step,
+                })
+            dist_env.barrier()
 
         # 检查 max_steps
         if args.max_steps and ctx.global_step >= args.max_steps:
