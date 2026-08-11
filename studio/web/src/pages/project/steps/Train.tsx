@@ -13,6 +13,7 @@ import {
   type VersionConfigResponse,
 } from '../../../api/client'
 import { parseFolderMeta } from '../../../lib/folderMeta'
+import { estimateSteps, positiveInt } from '../../../lib/trainSteps'
 import { useLocalStorageState } from '../../../lib/useLocalStorageState'
 import ConfigSkeleton from '../../../components/ConfigSkeleton'
 import ConfigYamlPanel from '../../../components/ConfigYamlPanel'
@@ -1033,31 +1034,28 @@ function DatasetStatsPanel({
     return () => { cancelled = true }
   }, [projectId, vid, distSig])
 
-  // 单 epoch 优化器步数估算（与 sd-scripts max_train_steps 同语义）。
-  // - 常规路径：样本 ÷ (batch × ga)。不算 AR bucketing 损失（每桶最后一 batch
-  //   可能不满），相同 AR 数据集误差 < 5%。
-  // - navit_packing：batch_size 不参与分批（NavitPackBatchSampler 按 token 预算
-  //   拼包，一步 = 一包）——steps/epoch = ceil(包数 ÷ ga)，包数来自后端真打包模拟；
-  //   模拟结果没到手前不显示估算（宁缺毋假）。
-  // schema 字段：batch_size / grad_accum / epochs / max_steps（max_steps=0 表示不限）。
-  const bs = Number(config?.batch_size) || 1
-  const ga = Number(config?.grad_accum) || 1
-  const epochs = Number(config?.epochs) || 0
-  const maxSteps = Number(config?.max_steps) || 0
+  // 单 epoch 优化器步数估算（与 sd-scripts max_train_steps 同语义）。算术在
+  // lib/trainSteps.ts —— 它镜像后端 optimizer.py:62 的分段取整，必须有测试，
+  // 而埋在组件里的表达式没法测（多卡漏除卡数的 bug 就是这么静默存在的）。
+  // schema 字段：batch_size / grad_accum / ddp_num_processes / epochs / max_steps。
+  const bs = positiveInt(config?.batch_size, 1)
+  const ga = positiveInt(config?.grad_accum, 1)
+  const ddpProcs = positiveInt(config?.ddp_num_processes, 1)
+  const epochs = positiveInt(config?.epochs, 0)
+  const maxSteps = positiveInt(config?.max_steps, 0)
   const navitEst = navitOn ? (dist?.navit ?? null) : null
-  const stepsPerEpoch = navitOn
-    ? (navitEst && navitEst.packs_per_epoch > 0
-        ? Math.ceil(navitEst.packs_per_epoch / ga)
-        : null)
-    : (totalEffective > 0 ? Math.ceil(totalEffective / (bs * ga)) : null)
-  const naturalTotal = stepsPerEpoch !== null && epochs > 0
-    ? stepsPerEpoch * epochs
-    : null
-  const finalTotal = naturalTotal !== null && maxSteps > 0
-    ? Math.min(maxSteps, naturalTotal)
-    : naturalTotal
-  const maxStepsTruncates =
-    maxSteps > 0 && naturalTotal !== null && maxSteps < naturalTotal
+  const { stepsPerEpoch, naturalTotal, finalTotal, maxStepsTruncates } = estimateSteps({
+    totalEffective,
+    batchSize: bs,
+    gradAccum: ga,
+    ddpProcs,
+    epochs,
+    maxSteps,
+    navitOn,
+    // 后端打包模拟给的是**全局**包数（versions.py:897 不知道卡数），分片同样
+    // 走 _ddp_shard（dataset.py:1796），除卡数在 estimateSteps 里做。
+    packsPerEpoch: navitEst ? navitEst.packs_per_epoch : null,
+  })
   // navit 下有效样本以真打包模拟为准（native 收拢多分辨率 fan-out、含 reg），
   // 前端 folderEffective 的 resoCount fan-out 在该模式下会虚算
   const shownEffective = navitEst && navitEst.samples > 0
@@ -1101,9 +1099,15 @@ function DatasetStatsPanel({
                   value={`≈ ${navitEst.packs_per_epoch}`}
                   dim
                 />
-                {ga > 1 && stepsPerEpoch !== null && (
+                {/* ga=1 单卡时步数就等于包数，这行是重复信息所以藏掉；但只要
+                    ga>1 **或** 多卡，步数就已经不等于上面那个包数了，必须显示。 */}
+                {(ga > 1 || ddpProcs > 1) && stepsPerEpoch !== null && (
                   <Row
-                    label={t('train.navitGaLine', { ga })}
+                    label={
+                      ddpProcs > 1
+                        ? t('train.navitGaCardsLine', { ga, cards: ddpProcs })
+                        : t('train.navitGaLine', { ga })
+                    }
                     value={`≈ ${stepsPerEpoch} steps/epoch`}
                     dim
                   />
@@ -1115,7 +1119,11 @@ function DatasetStatsPanel({
           ) : (
             stepsPerEpoch !== null && (
               <Row
-                label={`÷ batch × ga (${bs} × ${ga})`}
+                label={
+                  ddpProcs > 1
+                    ? t('train.stepsDivCardsLine', { bs, ga, cards: ddpProcs })
+                    : t('train.stepsDivLine', { bs, ga })
+                }
                 value={`≈ ${stepsPerEpoch} steps/epoch`}
                 dim
               />
