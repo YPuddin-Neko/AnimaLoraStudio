@@ -253,44 +253,128 @@ def test_run_sample_no_clear_method_does_not_crash() -> None:
 
 # ── test 4: bypass_mode invariant ──────────────────────────────────────────
 #
-# 设计 invariant：AnimaLycorisAdapter.inject() 只允许两条 bypass 路径：
+# 设计 invariant：AnimaLycorisAdapter.inject() 只允许三条 bypass 路径：
 #   1. self.algo == "lora" and not self.weight_decompose
-#   2. self.algo == "lokr" and has_fp8_base
-# algo == "tlora" 永远不进这两条分支，必走 rebuild (make_weight) 路径，
+#   2. self.algo == "lokr" and not self.weight_decompose and not self.rank_dropout
+#   3. self.algo == "lokr" and has_fp8_base   （FP8 下 bypass 是必需而非优化）
+# algo == "tlora" 永远不进这些分支，必走 rebuild (make_weight) 路径，
 # 让 _install_tlora_masks 的 mask patch 真正生效。
 #
 # 这里不依赖完整 inject (lycoris preset 与本机版本不兼容)，直接 inspect
 # AnimaLycorisAdapter.inject 源码确认 tlora 不会被设 bypass_mode=True。
+#
+# 判据取**该赋值所在 if/elif 的真实条件**（AST），不用「赋值前 N 字符」的文本窗口：
+# 后者会因为相邻分支的条件恰好落在窗口里而误判通过 —— 三条分支写在一起时，
+# 每条都能「看见」上一条的 self.algo == "lora"，守卫就形同虚设。
+
+
+def _bypass_assignments_with_conditions() -> list[tuple[int, str]]:
+    """AST 找出 inject() 里每处 `extra["bypass_mode"] = ...`，配上它所在分支的条件。
+
+    返回 [(行号, 该赋值实际受哪些条件保护的源码文本)]。条件取自包裹该赋值的
+    if/elif 链：对 `elif` 分支，ast 把它表示成嵌套在 orelse 里的 If 节点，
+    所以逐层向下走时收集的就是**这一条**分支自己的 test，不会混进兄弟分支的。
+    """
+    import ast
+    import inspect
+    import textwrap
+
+    src = textwrap.dedent(inspect.getsource(AnimaLycorisAdapter.inject))
+    tree = ast.parse(src)
+
+    def is_bypass_assign(node: ast.AST) -> bool:
+        if not isinstance(node, ast.Assign):
+            return False
+        for tgt in node.targets:
+            if (
+                isinstance(tgt, ast.Subscript)
+                and isinstance(tgt.value, ast.Name)
+                and tgt.value.id == "extra"
+                and isinstance(tgt.slice, ast.Constant)
+                and tgt.slice.value == "bypass_mode"
+            ):
+                return True
+        return False
+
+    found: list[tuple[int, str]] = []
+
+    def walk(node: ast.AST, conds: list[str]) -> None:
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.If):
+                test_src = ast.unparse(child.test)
+                for stmt in child.body:
+                    walk_stmt(stmt, [*conds, test_src])
+                # orelse 里的条件与 body 无关：elif 链走这一支，
+                # 且必须**不带** body 的 test（那是兄弟分支的条件）
+                for stmt in child.orelse:
+                    walk_stmt(stmt, conds)
+            else:
+                walk(child, conds)
+
+    def walk_stmt(stmt: ast.AST, conds: list[str]) -> None:
+        if is_bypass_assign(stmt):
+            found.append((getattr(stmt, "lineno", -1), " and ".join(conds)))
+            return
+        if isinstance(stmt, ast.If):
+            walk(ast.Module(body=[stmt], type_ignores=[]), conds)
+            return
+        walk(stmt, conds)
+
+    walk(tree, [])
+    return found
 
 
 def test_tlora_inject_never_sets_bypass_mode() -> None:
-    """inject() 只允许 LoRA 或 FP8 LoKr 设置 bypass_mode=True；
+    """inject() 只允许 lora / lokr / FP8-lokr 设置 bypass_mode=True；
     algo='tlora' 不进，必走 make_weight rebuild 路径让 mask patch 生效。
 
-    防止后续维护误把 tlora 也加进 bypass 路径让 mask 静默失效。"""
-    import re
-    import inspect
-    src = inspect.getsource(AnimaLycorisAdapter.inject)
-    # 找形如 `extra["bypass_mode"] = ...` 或 `extra['bypass_mode'] = ...` 的赋值
-    pattern = re.compile(r'extra\[["\']bypass_mode["\']\]\s*=', re.MULTILINE)
-    matches = list(pattern.finditer(src))
-    assert matches, (
+    防止后续维护误把 tlora 也加进 bypass 路径让 mask 静默失效。
+
+    判据是该赋值所在分支的**真实条件**（AST），不是它周围的文本 —— 三条 bypass
+    分支写在一起，用文本窗口的话每条都能看见邻居的 self.algo == 'lora'，
+    守卫会因为邻近而误判通过。
+    """
+    assigns = _bypass_assignments_with_conditions()
+    assert assigns, (
         "inject 源码里找不到 extra['bypass_mode'] 赋值；"
         "源码结构变了，需重写本 invariant 测试或重新评估 bypass_mode 默认行为。"
     )
-    for m in matches:
-        # 该赋值之前 ~250 字符内必须出现两个受支持守卫之一，且不能提到 tlora。
-        # FP8 LoKr 必须同时检查 has_fp8_base，避免普通 LoKr 被误切到 bypass。
-        ctx_start = max(0, m.start() - 250)
-        ctx = src[ctx_start:m.start()]
-        has_lora_guard = bool(re.search(r'self\.algo\s*==\s*["\']lora["\']', ctx))
-        has_fp8_lokr_guard = bool(re.search(
-            r'self\.algo\s*==\s*["\']lokr["\']\s+and\s+has_fp8_base', ctx,
-        ))
-        mentions_tlora_nearby = "tlora" in ctx.lower()
-        assert (has_lora_guard or has_fp8_lokr_guard) and not mentions_tlora_nearby, (
-            f"extra['bypass_mode'] 赋值 (位置 {m.start()}) 上方 250 字符内未见到"
-            f" LoRA 或 FP8 LoKr 的独立守卫；可能让 tlora / 普通 LoKr 误走"
-            f" bypass，让 make_weight 路径静默失效。"
-            f" 上下文：\n{ctx[-200:]}"
+    for lineno, cond in assigns:
+        # 每处赋值都必须由一个明确的 algo 相等判断把门。tlora 走不进 'lora' /
+        # 'lokr' 任何一支（self.algo 保持 'tlora'，只有 net_module 映射成 locon）。
+        gated_on_algo = ("self.algo == 'lora'" in cond) or ("self.algo == 'lokr'" in cond)
+        assert gated_on_algo, (
+            f"第 {lineno} 行的 extra['bypass_mode'] 赋值所在分支条件里没有 "
+            f"self.algo 的相等判断，tlora 可能落进来让 mask patch 静默失效。\n"
+            f"实际条件：{cond}"
+        )
+        assert "tlora" not in cond.lower(), (
+            f"第 {lineno} 行的 bypass 赋值条件里出现了 tlora：{cond}"
+        )
+
+
+def test_lokr_bypass_is_gated_on_rank_dropout() -> None:
+    """普通 LoKr（非 FP8）走 bypass 的那一支必须同时挡住 rank_dropout 与 DoRA。
+
+    bypass_forward_diff 不施加 rank_drop（lycoris base.py:255-258），开了会让
+    rank_dropout 静默失效 —— 不报错、不 OOM，只是正则化没生效。
+    FP8 那一支例外：那里 bypass 是必需（float8 无 mul/add kernel），改为显式 warn。
+    """
+    assigns = _bypass_assignments_with_conditions()
+    lokr_plain = [
+        (ln, c) for ln, c in assigns
+        if "self.algo == 'lokr'" in c and "has_fp8_base" not in c
+    ]
+    assert lokr_plain, (
+        "找不到「普通 LoKr 走 bypass」的分支。若该特性被回退，请连同 "
+        "tests/test_lycoris_bypass.py 的 lokr 等价性测试一起改。"
+    )
+    for lineno, cond in lokr_plain:
+        assert "rank_dropout" in cond, (
+            f"第 {lineno} 行让普通 LoKr 走 bypass，但条件里没有 rank_dropout 守卫；"
+            f"开了 rank_dropout 的用户会拿到静默失效的正则化。\n实际条件：{cond}"
+        )
+        assert "weight_decompose" in cond, (
+            f"第 {lineno} 行让普通 LoKr 走 bypass，但条件里没有 weight_decompose "
+            f"守卫；DoRA 会静默失效。\n实际条件：{cond}"
         )

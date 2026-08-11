@@ -172,13 +172,44 @@ class LycorisAdapter:
         if self.rs_lora:
             extra["rs_lora"] = True
 
-        # algo='lora' (LoCon) 默认走 bypass_mode：lycoris LoConModule 默认 forward 会
-        # rebuild ΔW=up@down (out,in) 再多跑一次 F.linear，等于每层 ~2× FLOPs。
-        # bypass_mode=True 走 bypass_forward_diff = org_forward(x) + lora_up(lora_down(x))，
-        # 是 LoRA 论文 + sd-scripts + PEFT 的标准 forward；对外行为完全等价但 ~2× 快。
-        # DoRA(weight_decompose) 路径数学上必须 rebuild —— lycoris bypass forward 不走 wd
-        # 分支，会让 DoRA 静默失效；这里 guard。参考 lycoris docs/Network-Args.md "Bypass Mode"。
+        # lora (LoCon) / lokr 默认走 bypass_mode。lycoris 的 rebuild forward 会把
+        # ΔW 物化成 (out,in) 稠密矩阵，再对它多跑一次全量 matmul：
+        #
+        #   _rebuild_forward:  base = org_forward(x)          ← matmul #1
+        #                      delta = op(x, 稠密ΔW)           ← matmul #2
+        #                      return base + delta
+        #
+        # 即每个注入层 ~2× FLOPs。这不是一直如此 —— lycoris ac2616f (2025-10-04,
+        # "only apply incremental delta so that we can use apply_to multiple times")
+        # 之前 rebuild 是合并权重后**一次** matmul，那次重构为了 stacked wrapper
+        # 把它改成了两次。upstream 至今没把它当性能问题看，因为 Network-Args.md 把
+        # bypass_mode 定位成量化功能（"Designed for bnb 8bit/4bit linear layer"），
+        # 只在 FP8 / QuantLinears / 非 Linear 类时自动开（lycoris base.py:227-243）。
+        #
+        # bypass_forward_diff 对两种 algo 都是数学等价的另一种算法：
+        #   lora: org_forward(x) + lora_up(lora_down(x))，即 LoRA 论文 / sd-scripts / PEFT
+        #         的标准 forward（upstream issue #182）。
+        #   lokr: Kronecker 恒等式 (A⊗B)vec(X) = vec(B X Aᵀ)，全程不物化 ΔW。
+        #         逐元素等价（见 tests/test_lycoris_bypass.py 的等价性测试），而第二次
+        #         matmul 只需 1/factor 的量：factor=8 时注入层 2.0 → 1.125 单位。
+        #
+        # 两个 guard：
+        # - DoRA(weight_decompose)：数学上必须 rebuild。lycoris bypass forward 不走 wd
+        #   分支，开了会让 DoRA 静默失效。docs/Network-Args.md "Weight Decompose" 也写明
+        #   它会强制 bypass_mode=False。
+        # - rank_dropout：lokr/loha 的两条路径语义不同，lycoris base.py:255-258 自己写着
+        #       g(x) = WX + drop(ΔWX)         非 LoCon, bypass    ← 不施加 rank_drop
+        #       g(x) = (W + rank_drop(ΔW))X   非 LoCon, rebuild   ← 施加
+        #   bypass_forward_diff 只调 self.drop，不调 self.rank_drop，也不走 get_weight()
+        #   （rank_dropout 逻辑在 lokr.py:375-380 那里面）。所以开了 rank_dropout 的
+        #   lokr 必须留在 rebuild，否则正则化静默失效 —— 不报错、不 OOM，只是没生效。
+        #   lora 不受此限：LoConModule 的 bypass 走 Brank_drop(AX)，rank_drop 照样施加。
+        # 两个守卫条件在每个分支上**字面写全**，不抽成局部别名：这是个安全门，
+        # tests/test_lycoris_tlora.py 用 AST 取分支的真实条件来校验它，
+        # 别名会让守卫在源码和测试两边都变成看不见的东西。
         if self.algo == "lora" and not self.weight_decompose:
+            extra["bypass_mode"] = True
+        elif self.algo == "lokr" and not self.weight_decompose and not self.rank_dropout:
             extra["bypass_mode"] = True
 
         # Krea2 FP8 checkpoints keep frozen Linear weights in float8 and
@@ -195,6 +226,16 @@ class LycorisAdapter:
         if self.algo == "lokr" and has_fp8_base:
             extra["bypass_mode"] = True
             logger.info("FP8 base detected: forcing LoKr bypass forward")
+            # FP8 下 bypass 不是优化而是**必需**（float8 没有 mul/add kernel），所以它
+            # 必须盖过上面那条 rank_dropout 偏好。但 bypass 不施加 rank_drop，于是这个
+            # 组合下 rank_dropout 会静默失效 —— 唯一的静默点，必须显式 warn。
+            if self.rank_dropout:
+                logger.warning(
+                    "FP8 基座 + LoKr 必须走 bypass forward（float8 无 mul/add kernel），"
+                    "而 bypass 路径不施加 rank_dropout（lycoris base.py:255-258）—— "
+                    "当前 rank_dropout=%s 将不生效。需要 rank_dropout 请改用非 FP8 基座。",
+                    self.rank_dropout,
+                )
 
         with _suppress_lokr_dropout_spam() as _dropout_filter:
             self.network = LycorisNetwork(
@@ -260,7 +301,17 @@ class LycorisAdapter:
         self._injected_model = model
 
         n = len(self.network.loras)
-        forward_path = "bypass (low-rank)" if extra.get("bypass_mode") else "rebuild (ΔW)"
+        # forward 路径连同**原因**一起打：rebuild 比 bypass 每层多一次全量 matmul，
+        # 用户看到 rebuild 时需要知道是哪个开关把自己留在了慢路径上。
+        if extra.get("bypass_mode"):
+            # LoKr 的 bypass 不是「低秩」—— 是 Kronecker 恒等式，full matrix 下同样适用。
+            forward_path = "bypass (kron)" if self.algo == "lokr" else "bypass (low-rank)"
+        elif self.weight_decompose:
+            forward_path = "rebuild (ΔW) — DoRA 要求"
+        elif self.algo == "lokr" and self.rank_dropout:
+            forward_path = f"rebuild (ΔW) — rank_dropout={self.rank_dropout} 要求"
+        else:
+            forward_path = "rebuild (ΔW)"
         logger.info(f"注入 {self.algo.upper()} 到 {n} 层（lycoris-lora, forward={forward_path}）")
         if self.use_lokr:
             full_matrix = [lora for lora in self.network.loras if getattr(lora, "use_w2", False)]
