@@ -54,17 +54,28 @@ class GpuStats:
     结构，字段顺序不同（JSON key 顺序会变），且 API schema 该由 studio 层自己
     拥有，免得 utils 的重构直接漏到前端契约上。
 
-    ``util_pct`` 可能为 None：DCU 上利用率要靠解析 hy-smi 文本，没有稳定的机器
-    可读接口，accelerator 侧当前不报（详 ``accelerator._torch_device_stats``）。
+    除显存外都可能为 None，前端一律按可缺失渲染（``util_pct`` 靠解析 hy-smi 文本、
+    功率与频率靠 sysfs，都是 best-effort，详 ``accelerator._torch_device_stats``）。
     """
 
     index: int
     name: str
-    #: 加速器利用率百分比；DCU 上暂为 None（前端需按可缺失渲染）
+    #: 加速器利用率百分比；解析不到时 None（前端需按可缺失渲染）
     util_pct: Optional[int]
     vram_used_gb: float
     vram_total_gb: float
     temp_c: Optional[int] = None
+    #: 实时功率（瓦）。**只有 DCU 有**，走 sysfs `power1_average`——
+    #: hy-smi 的 AvgPwr 列实测偏差 6-7 倍，不能用。
+    power_w: Optional[int] = None
+    #: 功率上限（瓦），sysfs `power1_cap_max`。是天花板不是目标：真实负载点亮的是
+    #: 芯片不同部分，平均功率远低于上限属正常。
+    power_cap_w: Optional[int] = None
+    #: 当前核心频率（MHz）。要配 `sclk_max_mhz` 看才有意义。
+    sclk_mhz: Optional[int] = None
+    #: 最高档核心频率（MHz）。`sclk_mhz == sclk_max_mhz` = 没降频，是健康状态；
+    #: 撞功率墙或温度墙的卡会主动降档 —— 这比看功率数字可靠。
+    sclk_max_mhz: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -117,6 +128,10 @@ def _collect_gpu() -> Optional[list[GpuStats]]:
             vram_used_gb=d.vram_used_gb,
             vram_total_gb=d.vram_total_gb,
             temp_c=d.temp_c,
+            power_w=d.power_w,
+            power_cap_w=d.power_cap_w,
+            sclk_mhz=d.sclk_mhz,
+            sclk_max_mhz=d.sclk_max_mhz,
         )
         for d in stats
     ]

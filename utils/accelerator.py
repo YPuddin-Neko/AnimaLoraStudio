@@ -485,11 +485,19 @@ def _torch_free_bytes() -> Optional[int]:
 
 @dataclass(frozen=True)
 class DeviceStats:
-    """单卡实时指标。``util_pct`` / ``temp_c`` 拿不到时为 None。
+    """单卡实时指标。除显存外都可能为 None。
 
-    显存是**必有**字段（torch ``mem_get_info`` 在两个后端上都可靠），利用率与温度
-    是 best-effort：NVIDIA 走 NVML 能拿全，DCU 侧需要解析 hy-smi 文本，当前实现
-    留 None（topbar 会隐藏这两项，显存与卡名照常显示）。
+    显存是**必有**字段（torch ``mem_get_info`` 在两个后端上都可靠）；其余是
+    best-effort，拿不到就留 None，topbar 按可缺失渲染：
+
+    - ``util_pct`` / ``temp_c``：NVIDIA 走 NVML；DCU 解析 hy-smi 文本。
+    - ``power_w`` / ``sclk_mhz``：**只有 DCU 有**，走 sysfs（见
+      :func:`_sysfs_power_clock`）。NVIDIA 侧 NVML 能给功率但本项目暂未接，
+      留 None。
+
+    ``sclk_mhz`` 单看没有意义（不知道满频是多少），要配 ``sclk_max_mhz`` 一起看 ——
+    「当前 1500 / 最高 1500」才说明没降频。判断卡有没有被限制时这一对比功率可靠：
+    撞功率墙或温度墙的卡会主动降档，而满频且功率有余量说明瓶颈在算力本身。
     """
 
     index: int
@@ -498,6 +506,10 @@ class DeviceStats:
     vram_total_gb: float
     util_pct: Optional[int] = None
     temp_c: Optional[int] = None
+    power_w: Optional[int] = None
+    power_cap_w: Optional[int] = None
+    sclk_mhz: Optional[int] = None
+    sclk_max_mhz: Optional[int] = None
 
 
 def device_stats() -> Optional[list[DeviceStats]]:
@@ -741,9 +753,13 @@ def usable_sdpa_backends():
 #:     HCU     Temp     AvgPwr     Perf     PwrCap     VRAM%      HCU%      Dec%   Enc%   Mode
 #:     0       50.0C    80.0W      auto     1000.0W    0%         0.0%      0.0%   0.0%   Normal
 #:
-#: 只抓需要的三列：卡号、温度、HCU%（= GPU 利用率）。刻意不抓 VRAM% —— 它是百分比，
-#: 而 topbar 要显示绝对值，torch ``mem_get_info`` 给的数更准也更细。
-#: 中间几列用宽松的 ``\S+`` 跳过，避免 DTK 版本间增删列就整条失配。
+#: 只抓需要的三列：卡号、温度、HCU%（= GPU 利用率）。中间几列用宽松的 ``\S+`` 跳过，
+#: 避免 DTK 版本间增删列就整条失配。
+#:
+#: 刻意不抓另外两列：
+#: - ``VRAM%``：是百分比，而 topbar 要显示绝对值，torch ``mem_get_info`` 更准更细。
+#: - ``AvgPwr``：**实测不可信**。训练满载同一时刻 hy-smi 报 79 W / 95 W，而 sysfs
+#:   ``power1_average`` 是 564 W / 563 W。功率走 :func:`_sysfs_card_metrics`。
 _HY_SMI_ROW = re.compile(
     r"^\s*(\d+)\s+([\d.]+)C\s+\S+\s+\S+\s+\S+\s+\S+%\s+([\d.]+)%",
 )
@@ -778,21 +794,160 @@ def _dcu_smi_metrics() -> dict[int, tuple[Optional[int], Optional[int]]]:
     return _parse_hy_smi_metrics(_run([smi]) or "")
 
 
+#: DRM sysfs 根目录。模块级常量是为了测试能 monkeypatch 到 tmp_path —— 逐卡功率
+#: 这条路径必须能在没有 DCU 的机器上测。
+_DRM_ROOT = "/sys/class/drm"
+
+#: 容器可见的 DRM 设备节点目录。``/dev/dri/cardN`` 是内核给本容器暴露的节点，
+#: 与 hy-smi 无关 —— 后者在容器里会枚举到宿主机的全部卡。
+_DRI_ROOT = "/dev/dri"
+
+
+def _read_sysfs_int(path: str) -> Optional[int]:
+    """读一个整数 sysfs 文件。任何异常（不存在 / 权限 / 非数字）返回 None。
+
+    热路径（topbar 2-3s 轮询）上不抛异常，也不打日志 —— 缺文件是常态
+    （不同 DTK 版本暴露的字段不同）。
+    """
+    try:
+        with open(path, encoding="utf-8") as f:
+            return int(f.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _parse_dpm_sclk(text: str) -> tuple[Optional[int], Optional[int]]:
+    """解析 ``pp_dpm_sclk`` → (当前频率 MHz, 最高档频率 MHz)。
+
+    真机格式（DTK 26.04 / BW1000，每行一档，``*`` 标当前档）::
+
+        0: 300Mhz
+        1: 600Mhz
+        ...
+        10: 1500Mhz *
+
+    返回「当前」和「最高」两个值：单独一个当前频率没法判断有没有降频，
+    得知道满频是多少才有意义。
+    """
+    cur: Optional[int] = None
+    mx: Optional[int] = None
+    for line in (text or "").splitlines():
+        m = re.search(r"(\d+)\s*Mhz", line, re.IGNORECASE)
+        if not m:
+            continue
+        try:
+            mhz = int(m.group(1))
+        except ValueError:
+            continue
+        if mx is None or mhz > mx:
+            mx = mhz
+        if "*" in line:
+            cur = mhz
+    return cur, mx
+
+
+def visible_drm_cards() -> list[int]:
+    """本容器可见的 DRM 卡号，数字升序。真机上是 ``[6, 8]``（宿主机有 8+ 张）。
+
+    为什么用 ``/dev/dri`` 而不是 hy-smi 的卡号：容器里 hy-smi **会枚举到宿主机
+    的全部卡**，而 ``/dev/dri`` 只有内核分给本容器的节点 —— 这是设备节点级的隔离，
+    比任何工具的报数都可靠。
+
+    卡号**不固定**：容器重建后可能从 [6, 8] 变成别的，所以每次读、不跨调用缓存。
+    """
+    try:
+        nums = [
+            name[4:] for name in os.listdir(_DRI_ROOT)
+            if name.startswith("card") and name[4:].isdigit()
+        ]
+    except OSError:
+        return []
+    return sorted(int(n) for n in nums)
+
+
+def _sysfs_card_metrics(card_no: int) -> dict[str, Optional[int]]:
+    """单张 DRM 卡的 (功率 W, 功率上限 W, 当前频率 MHz, 最高频率 MHz)。
+
+    **为什么功率不取 hy-smi 的 AvgPwr 列**：真机实测（DTK 26.04 / BW1000，训练满载
+    同一时刻）——
+
+        hy-smi AvgPwr :  79 W /  95 W
+        sysfs power1_average : 564 W / 563 W
+
+    差 6-7 倍。而同一份 hy-smi 输出里 ``VRAM%`` / ``HCU%`` / ``Temp`` 三列都与 sysfs
+    吻合（83% vs 53/63GiB、98.8% vs busy 100%、70C 介于核心 58C 与热点 75C 之间），
+    所以**不是读错了卡**，是 AvgPwr 这一列本身不可信。sysfs 的值可交叉验证：满载
+    577-580 W、同机空闲卡 76-89 W，区分度正常。
+    """
+    d = f"{_DRM_ROOT}/card{card_no}/device"
+    out: dict[str, Optional[int]] = {
+        "power_w": None, "power_cap_w": None,
+        "sclk_mhz": None, "sclk_max_mhz": None,
+    }
+    # hwmon 目录名（hwmon7 / hwmon13 ...）随卡而异，遍历取第一个有 power1_average 的。
+    try:
+        hwmons = sorted(os.listdir(f"{d}/hwmon"))
+    except OSError:
+        hwmons = []
+    for h in hwmons:
+        uw = _read_sysfs_int(f"{d}/hwmon/{h}/power1_average")
+        if uw is None:
+            continue
+        out["power_w"] = int(round(uw / 1_000_000))  # 微瓦 → 瓦
+        cap = _read_sysfs_int(f"{d}/hwmon/{h}/power1_cap_max")
+        if cap is None:
+            cap = _read_sysfs_int(f"{d}/hwmon/{h}/power1_cap")
+        if cap is not None:
+            out["power_cap_w"] = int(round(cap / 1_000_000))
+        break
+    try:
+        with open(f"{d}/pp_dpm_sclk", encoding="utf-8") as f:
+            out["sclk_mhz"], out["sclk_max_mhz"] = _parse_dpm_sclk(f.read())
+    except OSError:
+        pass
+    return out
+
+
+def _dcu_sysfs_metrics(device_count: int) -> dict[int, dict[str, Optional[int]]]:
+    """DCU 逐卡 sysfs 指标，键是 **torch 序号**。拿不到映射时返回空 dict。
+
+    映射依据：``/dev/dri`` 里可见卡号按数字升序 ↔ torch 序号 0..N-1。这个对应关系
+    有实测支撑 —— hy-smi 的 ``VRAM%`` / ``HCU%`` / ``Temp`` 三列与按此映射读到的
+    sysfs 值一致（见 :func:`_sysfs_card_metrics` 的数据）。
+
+    可见卡数与 ``device_count`` 不一致时**整体放弃**而不是部分填充：宁可前端不显示
+    功率，也不能把 A 卡的功率标到 B 卡上 —— 那种错误看不出来，比缺失有害得多。
+    """
+    cards = visible_drm_cards()
+    if not cards or len(cards) != device_count:
+        if cards:
+            logger.debug(
+                "DRM 可见卡数 %d != torch device_count %d，跳过 sysfs 功率采集"
+                "（避免卡号错位把功率标到错的卡上）", len(cards), device_count,
+            )
+        return {}
+    return {i: _sysfs_card_metrics(no) for i, no in enumerate(cards)}
+
+
 def _torch_device_stats() -> Optional[list[DeviceStats]]:
-    """torch 视角逐卡指标：显存走 torch，利用率 / 温度在 DCU 上补 smi 解析。
+    """torch 视角逐卡指标。三个数据源各管一段，都是 best-effort。
 
     DCU 的主路径。分工的理由：
     - **显存**用 torch ``mem_get_info`` —— 绝对值、按卡精确，而 smi 只给 ``VRAM%``。
-    - **利用率 / 温度**用 smi —— torch 压根不暴露这两项。
+    - **利用率 / 温度**用 hy-smi —— torch 压根不暴露这两项，而 smi 这两列实测可信。
+    - **功率 / 频率**用 sysfs —— hy-smi 的 ``AvgPwr`` 列实测偏差 6-7 倍
+      （见 :func:`_sysfs_card_metrics`），频率它压根不给。
 
-    smi 那半是 best-effort：解析失败 / 工具不存在时两项留 None，显存照常返回
-    （前端对这两项已按可缺失渲染）。NVIDIA 走不到这里（NVML 路径优先，见
+    三段都可以缺：解析失败 / 工具不存在 / 卡号映射对不上时相应字段留 None，
+    显存照常返回（前端按可缺失渲染）。NVIDIA 走不到这里（NVML 路径优先，见
     :func:`device_stats`），所以不必担心多跑一次 nvidia-smi。
     """
     info = detect()
     if not info.is_gpu:
         return None
-    metrics = _dcu_smi_metrics() if info.backend == "dcu" else {}
+    is_dcu = info.backend == "dcu"
+    metrics = _dcu_smi_metrics() if is_dcu else {}
+    sysfs = _dcu_sysfs_metrics(info.device_count) if is_dcu else {}
     try:
         import torch
 
@@ -800,6 +955,7 @@ def _torch_device_stats() -> Optional[list[DeviceStats]]:
         for i in range(info.device_count):
             free, total = torch.cuda.mem_get_info(i)
             util, temp = metrics.get(i, (None, None))
+            sf = sysfs.get(i, {})
             out.append(DeviceStats(
                 index=i,
                 name=info.device_names[i] if i < len(info.device_names) else "?",
@@ -807,6 +963,10 @@ def _torch_device_stats() -> Optional[list[DeviceStats]]:
                 vram_total_gb=round(total / 1024**3, 2),
                 util_pct=util,
                 temp_c=temp,
+                power_w=sf.get("power_w"),
+                power_cap_w=sf.get("power_cap_w"),
+                sclk_mhz=sf.get("sclk_mhz"),
+                sclk_max_mhz=sf.get("sclk_max_mhz"),
             ))
         return out
     except Exception:  # noqa: BLE001

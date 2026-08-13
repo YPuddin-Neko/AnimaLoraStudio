@@ -438,6 +438,7 @@ def test_device_stats_torch_path_reports_vram_without_smi(monkeypatch):
     """
     _install(monkeypatch, _fake_torch(hip="6.3.0", device_names=("Hygon BW1000",)))
     monkeypatch.setattr(accelerator, "smi_command", lambda: None)
+    monkeypatch.setattr(accelerator, "_dcu_sysfs_metrics", lambda _n: {})
     stats = accelerator.device_stats()
     assert stats is not None and len(stats) == 1
     d = stats[0]
@@ -458,6 +459,7 @@ def test_device_stats_smi_partial_coverage_leaves_missing_cards_none(monkeypatch
         _fake_torch(hip="6.3.0", device_names=("Hygon BW1000", "Hygon BW1000")),
     )
     monkeypatch.setattr(accelerator, "smi_command", lambda: "/opt/hyhal/bin/hy-smi")
+    monkeypatch.setattr(accelerator, "_dcu_sysfs_metrics", lambda _n: {})
     monkeypatch.setattr(accelerator, "_parse_hy_smi_metrics", lambda _text: {1: (12, 55)})
     monkeypatch.setattr(accelerator, "_run", lambda args, timeout=10: "irrelevant")
     stats = accelerator.device_stats()
@@ -725,6 +727,7 @@ def test_torch_device_stats_fills_util_temp_from_smi_on_dcu(monkeypatch):
     """
     _install(monkeypatch, _fake_torch(hip="6.3.0", device_names=("BW", "BW")))
     monkeypatch.setattr(accelerator, "smi_command", lambda: "/opt/hyhal/bin/hy-smi")
+    monkeypatch.setattr(accelerator, "_dcu_sysfs_metrics", lambda _n: {})
     monkeypatch.setattr(accelerator, "_run", lambda args, timeout=10: _REAL_HY_SMI)
     stats = accelerator.device_stats()
     assert stats is not None and len(stats) == 2
@@ -738,6 +741,7 @@ def test_torch_device_stats_survives_smi_missing(monkeypatch):
     """smi 不存在时显存照常返回，两项指标留 None（前端隐藏那两个 pill）。"""
     _install(monkeypatch, _fake_torch(hip="6.3.0", device_names=("BW",)))
     monkeypatch.setattr(accelerator, "smi_command", lambda: None)
+    monkeypatch.setattr(accelerator, "_dcu_sysfs_metrics", lambda _n: {})
     stats = accelerator.device_stats()
     assert stats is not None
     assert stats[0].util_pct is None and stats[0].temp_c is None
@@ -787,6 +791,15 @@ def test_no_dcu_test_reaches_the_real_smi_binary() -> None:
     #: 允许 stub 的目标：任一即可。
     SMI_STUBS = {"smi_command", "_dcu_smi_metrics", "_parse_hy_smi_metrics", "_run"}
 
+    #: sysfs 功率 / 频率那条路径的 stub 目标，同样任一即可。
+    #: 与 SMI_STUBS 分开断言：两条路径的数据源不同（shell 工具 vs 文件系统），
+    #: stub 了一个不代表另一个也挡住了。在开发机上 /sys/class/drm 不存在会静默
+    #: 退化成 None（测试照样绿），而真机上会读到真功率 —— 正是这条守卫要防的形态。
+    SYSFS_STUBS = {
+        "_dcu_sysfs_metrics", "_sysfs_card_metrics", "visible_drm_cards",
+        "_DRM_ROOT", "_DRI_ROOT", "_read_sysfs_int",
+    }
+
     def _calls_and_strings(fn: ast.FunctionDef) -> tuple[set[str], set[str]]:
         """``(被调用的函数名, monkeypatch.setattr 的目标名)``。
 
@@ -822,7 +835,8 @@ def test_no_dcu_test_reaches_the_real_smi_binary() -> None:
                 return True
         return False
 
-    offenders = []
+    smi_offenders = []
+    sysfs_offenders = []
     for node in tree.body:
         if not isinstance(node, ast.FunctionDef) or not node.name.startswith("test_"):
             continue
@@ -831,13 +845,241 @@ def test_no_dcu_test_reaches_the_real_smi_binary() -> None:
             continue
         if not _uses_dcu(node):            # 非 DCU 路径（NVML / 无卡）不受这条约束
             continue
-        if patched & SMI_STUBS:
-            continue
-        offenders.append(node.name)
+        if not patched & SMI_STUBS:
+            smi_offenders.append(node.name)
+        if not patched & SYSFS_STUBS:
+            sysfs_offenders.append(node.name)
 
-    assert not offenders, (
+    assert not smi_offenders, (
         "下列 DCU 测试调了 device_stats 却没 stub smi 依赖，会在真机上真跑 hy-smi ——\n"
-        + "\n".join(f"  {name}" for name in offenders)
+        + "\n".join(f"  {name}" for name in smi_offenders)
         + "\n加一行 monkeypatch.setattr(accelerator, 'smi_command', lambda: None) "
         "（或按需返回假读数）。"
     )
+    assert not sysfs_offenders, (
+        "下列 DCU 测试调了 device_stats 却没 stub sysfs 依赖，会在真机上真读 "
+        "/sys/class/drm 拿到真功率 ——\n"
+        + "\n".join(f"  {name}" for name in sysfs_offenders)
+        + "\n加一行 monkeypatch.setattr(accelerator, '_dcu_sysfs_metrics', lambda n: {}) "
+        "（或指到 tmp_path 造假 sysfs）。"
+    )
+
+
+# ---------------------------------------------------------------------------
+# sysfs 功率 / 频率（DCU）
+#
+# 起因是真机上一次误判：容器里 hy-smi 的 AvgPwr 列报 79W / 95W，看着像"卡没跑满"，
+# 而同一时刻 sysfs power1_average 是 564W / 563W —— 差 6-7 倍。同一份 hy-smi 输出的
+# VRAM% / HCU% / Temp 三列都与 sysfs 吻合，所以不是读错了卡，是那一列本身不可信。
+# 功率因此改从 sysfs 读，这一组测试锁住解析与"拿不到就留 None"两件事。
+#
+# 全部用 tmp_path 造假 sysfs，不碰真硬件 —— 上面 test_no_dcu_test_reaches_the_real_smi_binary
+# 那条守卫会盯着这一点。
+# ---------------------------------------------------------------------------
+
+#: 真机 pp_dpm_sclk 原文（DTK 26.04 / BW1000，满载时第 10 档带 *）。
+_REAL_DPM_SCLK = """\
+0: 300Mhz 
+1: 600Mhz 
+2: 800Mhz 
+3: 1000Mhz 
+4: 1150Mhz 
+5: 1220Mhz 
+6: 1300Mhz 
+7: 1350Mhz 
+8: 1400Mhz 
+9: 1450Mhz 
+10: 1500Mhz *
+"""
+
+
+def _fake_card(root, card_no: int, *, power_uw=None, cap_uw=None,
+               sclk: str | None = None, hwmon_name: str = "hwmon7") -> None:
+    """在 root 下造出 card{n}/device/{hwmon,pp_dpm_sclk} 结构。
+
+    hwmon 目录名可变：真机上是 hwmon7 / hwmon13 之类按卡递增的名字，
+    实现必须遍历而不能硬编码。
+    """
+    d = root / f"card{card_no}" / "device"
+    (d / "hwmon" / hwmon_name).mkdir(parents=True, exist_ok=True)
+    if power_uw is not None:
+        (d / "hwmon" / hwmon_name / "power1_average").write_text(str(power_uw))
+    if cap_uw is not None:
+        (d / "hwmon" / hwmon_name / "power1_cap_max").write_text(str(cap_uw))
+    if sclk is not None:
+        (d / "pp_dpm_sclk").write_text(sclk)
+
+
+def test_parse_dpm_sclk_real_machine_full_speed() -> None:
+    """真机原文：当前 1500，最高 1500 —— 相等即"没降频"。"""
+    cur, mx = accelerator._parse_dpm_sclk(_REAL_DPM_SCLK)
+    assert (cur, mx) == (1500, 1500)
+
+
+def test_parse_dpm_sclk_detects_throttled_card() -> None:
+    """* 落在低档 → 当前 < 最高。这是判断卡被限制的唯一可靠信号。
+
+    功率低本身说明不了问题（上限是天花板不是目标），但降频说明确实撞了墙。
+    """
+    throttled = _REAL_DPM_SCLK.replace("10: 1500Mhz *", "10: 1500Mhz ").replace(
+        "1: 600Mhz ", "1: 600Mhz *"
+    )
+    cur, mx = accelerator._parse_dpm_sclk(throttled)
+    assert (cur, mx) == (600, 1500)
+
+
+def test_parse_dpm_sclk_empty_and_garbage_return_none() -> None:
+    """空 / 无 * / 非数字都返回 None，不抛 —— 这是 2-3s 轮询的热路径。"""
+    assert accelerator._parse_dpm_sclk("") == (None, None)
+    assert accelerator._parse_dpm_sclk("no star here: 800Mhz") == (None, 800)
+    assert accelerator._parse_dpm_sclk("garbage\n\n") == (None, None)
+
+
+def test_sysfs_card_metrics_real_machine_values(monkeypatch, tmp_path) -> None:
+    """真机数值：564W / 1000W 上限 / 1500 满频。微瓦 → 瓦的换算别错了数量级。"""
+    monkeypatch.setattr(accelerator, "_DRM_ROOT", str(tmp_path))
+    _fake_card(tmp_path, 6, power_uw=564_000_000, cap_uw=1_000_000_000,
+               sclk=_REAL_DPM_SCLK)
+    m = accelerator._sysfs_card_metrics(6)
+    assert m == {
+        "power_w": 564, "power_cap_w": 1000,
+        "sclk_mhz": 1500, "sclk_max_mhz": 1500,
+    }
+
+
+def test_sysfs_card_metrics_walks_hwmon_dirs(monkeypatch, tmp_path) -> None:
+    """hwmon 目录名按卡递增（hwmon7 / hwmon13 ...），实现必须遍历不能硬编码。"""
+    monkeypatch.setattr(accelerator, "_DRM_ROOT", str(tmp_path))
+    _fake_card(tmp_path, 8, power_uw=563_000_000, hwmon_name="hwmon13")
+    assert accelerator._sysfs_card_metrics(8)["power_w"] == 563
+
+
+def test_sysfs_card_metrics_missing_files_give_none_not_zero(monkeypatch, tmp_path) -> None:
+    """文件缺失时必须是 None 而不是 0。
+
+    前端按 `!= null` 决定显示不显示这个 pill —— 填 0 会渲染出"功耗 0W"，
+    比不显示更误导（用户会以为卡真的没在耗电）。
+    """
+    monkeypatch.setattr(accelerator, "_DRM_ROOT", str(tmp_path))
+    _fake_card(tmp_path, 6)                      # 只建目录，什么文件都不写
+    assert accelerator._sysfs_card_metrics(6) == {
+        "power_w": None, "power_cap_w": None,
+        "sclk_mhz": None, "sclk_max_mhz": None,
+    }
+
+
+def test_sysfs_card_metrics_absent_card_does_not_raise(monkeypatch, tmp_path) -> None:
+    """卡目录整个不存在（开发机上的常态）：全 None，不抛。"""
+    monkeypatch.setattr(accelerator, "_DRM_ROOT", str(tmp_path))
+    m = accelerator._sysfs_card_metrics(99)
+    assert all(v is None for v in m.values())
+
+
+def test_visible_drm_cards_sorted_numerically(monkeypatch, tmp_path) -> None:
+    """卡号按**数字**升序，不是字典序 —— card10 不能排在 card6 前面。
+
+    真机上是 [6, 8]（宿主机 8+ 张，容器只分到两张）。
+    """
+    monkeypatch.setattr(accelerator, "_DRI_ROOT", str(tmp_path))
+    for name in ("card6", "card8", "card10", "renderD133", "renderD135", "by-path"):
+        (tmp_path / name).mkdir()
+    assert accelerator.visible_drm_cards() == [6, 8, 10]
+
+
+def test_visible_drm_cards_missing_dri_returns_empty(monkeypatch, tmp_path) -> None:
+    """/dev/dri 不存在（Windows 开发机 / 无卡容器）：空列表，不抛。"""
+    monkeypatch.setattr(accelerator, "_DRI_ROOT", str(tmp_path / "nope"))
+    assert accelerator.visible_drm_cards() == []
+
+
+def test_dcu_sysfs_metrics_maps_visible_cards_to_torch_index(monkeypatch, tmp_path) -> None:
+    """/dev/dri 的 [6, 8] 按升序对应 torch 序号 [0, 1]。
+
+    映射依据是实测：hy-smi 的 VRAM% / HCU% / Temp 与按此映射读到的 sysfs 一致。
+    """
+    monkeypatch.setattr(accelerator, "_DRM_ROOT", str(tmp_path / "drm"))
+    monkeypatch.setattr(accelerator, "_DRI_ROOT", str(tmp_path / "dri"))
+    (tmp_path / "dri").mkdir()
+    for n in (6, 8):
+        (tmp_path / "dri" / f"card{n}").mkdir()
+    (tmp_path / "drm").mkdir()
+    _fake_card(tmp_path / "drm", 6, power_uw=564_000_000)
+    _fake_card(tmp_path / "drm", 8, power_uw=173_000_000)
+
+    got = accelerator._dcu_sysfs_metrics(2)
+    assert got[0]["power_w"] == 564      # torch 0 ← card6
+    assert got[1]["power_w"] == 173      # torch 1 ← card8
+
+
+def test_dcu_sysfs_metrics_bails_on_count_mismatch(monkeypatch, tmp_path) -> None:
+    """可见卡数 != device_count → 整体放弃，返回 {}。
+
+    宁可前端不显示功率，也不能把 A 卡的功率标到 B 卡上：那种错误在界面上看不出来，
+    比缺失有害得多。这是这个映射唯一可能产出**错数据**的地方，所以单独锁住。
+    """
+    monkeypatch.setattr(accelerator, "_DRM_ROOT", str(tmp_path / "drm"))
+    monkeypatch.setattr(accelerator, "_DRI_ROOT", str(tmp_path / "dri"))
+    (tmp_path / "dri").mkdir()
+    for n in (6, 8, 10):                 # 可见 3 张
+        (tmp_path / "dri" / f"card{n}").mkdir()
+    assert accelerator._dcu_sysfs_metrics(2) == {}      # torch 说 2 张 → 放弃
+
+
+def test_dcu_sysfs_metrics_no_cards_returns_empty(monkeypatch, tmp_path) -> None:
+    """一张卡都看不到：返回 {}，且不该打 warning（开发机上是常态）。"""
+    monkeypatch.setattr(accelerator, "_DRI_ROOT", str(tmp_path / "nope"))
+    assert accelerator._dcu_sysfs_metrics(2) == {}
+
+
+def test_device_stats_surfaces_power_and_clock_on_dcu(monkeypatch, tmp_path) -> None:
+    """端到端：device_stats() 把 sysfs 的功率 / 频率填进 DeviceStats。
+
+    复刻真机形态 —— 两张卡满频，一张 564W 一张 563W。同时验证功率**不是**来自
+    hy-smi：这里喂进去的 hy-smi 原文里 AvgPwr 列是 80W / 89W，而断言要求 564 / 563。
+    """
+    _install(monkeypatch, _fake_torch(hip="6.3.0", device_names=("BW", "BW")))
+    monkeypatch.setattr(accelerator, "smi_command", lambda: "/opt/hyhal/bin/hy-smi")
+    monkeypatch.setattr(accelerator, "_run", lambda args, timeout=10: _REAL_HY_SMI)
+    monkeypatch.setattr(accelerator, "_DRM_ROOT", str(tmp_path / "drm"))
+    monkeypatch.setattr(accelerator, "_DRI_ROOT", str(tmp_path / "dri"))
+    (tmp_path / "dri").mkdir()
+    for n in (6, 8):
+        (tmp_path / "dri" / f"card{n}").mkdir()
+    (tmp_path / "drm").mkdir()
+    _fake_card(tmp_path / "drm", 6, power_uw=564_000_000, cap_uw=1_000_000_000,
+               sclk=_REAL_DPM_SCLK)
+    _fake_card(tmp_path / "drm", 8, power_uw=563_000_000, cap_uw=1_000_000_000,
+               sclk=_REAL_DPM_SCLK, hwmon_name="hwmon13")
+
+    stats = accelerator.device_stats()
+    assert stats is not None and len(stats) == 2
+    assert [s.power_w for s in stats] == [564, 563]      # 不是 hy-smi 的 80 / 89
+    assert [s.power_cap_w for s in stats] == [1000, 1000]
+    assert [s.sclk_mhz for s in stats] == [1500, 1500]
+    assert [s.sclk_max_mhz for s in stats] == [1500, 1500]
+
+
+def test_device_stats_power_none_when_sysfs_absent(monkeypatch, tmp_path) -> None:
+    """sysfs 读不到时功率留 None，显存照常返回 —— best-effort 不能拖垮主字段。"""
+    _install(monkeypatch, _fake_torch(hip="6.3.0", device_names=("BW",)))
+    monkeypatch.setattr(accelerator, "smi_command", lambda: None)
+    monkeypatch.setattr(accelerator, "_dcu_sysfs_metrics", lambda _n: {})
+
+    stats = accelerator.device_stats()
+    assert stats is not None and len(stats) == 1
+    assert stats[0].power_w is None
+    assert stats[0].sclk_mhz is None
+    assert stats[0].vram_total_gb > 0        # 显存不受影响
+
+
+def test_nvidia_path_leaves_power_fields_none(monkeypatch) -> None:
+    """NVIDIA 走 NVML 分支，不该去碰 DCU 的 sysfs（那些路径在 NV 机器上没有意义）。"""
+    _install(monkeypatch, _fake_torch(cuda="12.8", device_names=("RTX 4090",)))
+
+    def _boom(_n):
+        raise AssertionError("NVIDIA 路径不应调用 _dcu_sysfs_metrics")
+
+    monkeypatch.setattr(accelerator, "_dcu_sysfs_metrics", _boom)
+    stats = accelerator.device_stats()
+    assert stats is not None
+    assert all(s.power_w is None and s.sclk_mhz is None for s in stats)

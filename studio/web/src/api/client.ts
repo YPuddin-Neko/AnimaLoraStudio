@@ -24,6 +24,27 @@ export interface GpuStats {
   vram_used_gb: number
   vram_total_gb: number
   temp_c: number | null
+  // 下面四项是后加的，写成**可选**（`?`）而不是 `| null` 必填：前端可能比后端先
+  // 更新（或反之），旧后端不发这些 key 时应优雅退化成"隐藏功耗 pill"，而不是
+  // 类型对不上。消费处统一用 `!= null` 判断，同时覆盖 null 与 undefined。
+  /**
+   * 实时功率（瓦）。**只有海光 DCU 有**，走 sysfs `power1_average`——
+   * hy-smi 的 AvgPwr 列实测偏差 6-7 倍（满载报 79W 而 sysfs 是 564W），不可用。
+   * NVIDIA 侧后端暂未接。
+   */
+  power_w?: number | null
+  /**
+   * 功率上限（瓦）。是**天花板不是目标**：真实负载里 matmul / attention / 显存搬运
+   * 点亮的是芯片不同部分，平均功率远低于上限属正常，不代表「没跑满」。
+   */
+  power_cap_w?: number | null
+  /** 当前核心频率（MHz）。单看没意义，要配 `sclk_max_mhz`。 */
+  sclk_mhz?: number | null
+  /**
+   * 最高档核心频率（MHz）。`sclk_mhz === sclk_max_mhz` = 没降频，是健康状态。
+   * 判断卡有没有被限制时这一对比功率可靠：撞功率墙 / 温度墙的卡会主动降档。
+   */
+  sclk_max_mhz?: number | null
 }
 
 export interface SystemStats {

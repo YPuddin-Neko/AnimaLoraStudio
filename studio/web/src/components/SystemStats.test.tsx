@@ -201,4 +201,74 @@ describe('SystemStats', () => {
     await new Promise((r) => setTimeout(r, 200))
     expect(spy).toHaveBeenCalledTimes(1)
   })
+
+  // ── 功耗 pill（DCU 专有）─────────────────────────────────────────────
+  //
+  // 起因：容器里 hy-smi 的 AvgPwr 列报 79W/95W，被读成「卡没跑满」，而 sysfs
+  // 同一时刻是 564W/563W。后端改读 sysfs 后，这个 pill 把真值显示出来，
+  // hover 给频率 —— 判断卡有没有被限制靠的是频率档位，不是瓦数。
+
+  function twoCardsWithPower(): Stats {
+    return makeStats({
+      gpu: [
+        {
+          index: 0, name: 'BW', util_pct: 100, vram_used_gb: 53.0, vram_total_gb: 63.0,
+          temp_c: 58, power_w: 564, power_cap_w: 1000, sclk_mhz: 1500, sclk_max_mhz: 1500,
+        },
+        {
+          index: 1, name: 'BW', util_pct: 100, vram_used_gb: 53.0, vram_total_gb: 63.0,
+          temp_c: 61, power_w: 563, power_cap_w: 1000, sclk_mhz: 1500, sclk_max_mhz: 1500,
+        },
+      ],
+    })
+  }
+
+  it('sums power across cards (physical quantity, not averaged)', async () => {
+    vi.spyOn(api, 'systemStats').mockResolvedValue(twoCardsWithPower())
+    render(<SystemStats />)
+    // 功率可加，与显存同口径：564 + 563 = 1127W。**不是**取均值 563。
+    await waitFor(() => expect(screen.getByText('1127W')).toBeInTheDocument())
+    expect(screen.getByText('PWR×2')).toBeInTheDocument()
+  })
+
+  it('shows per-card clock in the power tooltip and marks full speed', async () => {
+    vi.spyOn(api, 'systemStats').mockResolvedValue(twoCardsWithPower())
+    const { container } = render(<SystemStats />)
+    await waitFor(() => expect(screen.getByText('1127W')).toBeInTheDocument())
+    const titles = Array.from(container.querySelectorAll('[title]'))
+      .map((el) => el.getAttribute('title') ?? '')
+    const pwr = titles.find((t) => t.includes('1500/1500MHz'))
+    expect(pwr).toBeTruthy()
+    // 频率与上限都要在 tooltip 里 —— 这是这个 pill 的重点
+    expect(pwr).toContain('564W / 1000W')
+    expect(pwr).toContain('满频')       // 满频
+  })
+
+  it('marks a throttled card as such', async () => {
+    const s = twoCardsWithPower()
+    s.gpu![0] = { ...s.gpu![0], sclk_mhz: 600, sclk_max_mhz: 1500, power_w: 90 }
+    vi.spyOn(api, 'systemStats').mockResolvedValue(s)
+    const { container } = render(<SystemStats />)
+    await waitFor(() => expect(screen.getByText('653W')).toBeInTheDocument())
+    const titles = Array.from(container.querySelectorAll('[title]'))
+      .map((el) => el.getAttribute('title') ?? '')
+    expect(titles.some((t) => t.includes('600/1500MHz') && t.includes('降频'))).toBe(true)
+  })
+
+  it('hides the power pill when no card reports power (NVIDIA / old backend)', async () => {
+    // 旧后端不发这些 key（前端字段是可选的）→ 整个 pill 隐藏，不显示 "0W"
+    vi.spyOn(api, 'systemStats').mockResolvedValue(twoCards())
+    render(<SystemStats />)
+    await waitFor(() => expect(screen.getByText('36.0/128G')).toBeInTheDocument())
+    expect(screen.queryByText(/PWR/)).toBeNull()
+  })
+
+  it('excludes cards without power from the cap denominator', async () => {
+    // 一张报得出、一张报不出：分母只算报得出的那张（1000W），否则比例被拉低一半
+    const s = twoCardsWithPower()
+    s.gpu![1] = { ...s.gpu![1], power_w: null, power_cap_w: null }
+    vi.spyOn(api, 'systemStats').mockResolvedValue(s)
+    render(<SystemStats />)
+    await waitFor(() => expect(screen.getByText('564W')).toBeInTheDocument())
+  })
 })
