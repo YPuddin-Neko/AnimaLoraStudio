@@ -456,14 +456,57 @@ def free_vram_bytes() -> Optional[int]:
     return _torch_free_bytes()
 
 
+def torch_device_pci_bus_id() -> Optional[str]:
+    """torch 当前设备的 PCI bus id（NVML busId 格式）；拿不到返回 None。
+
+    多卡下 torch（默认 FASTEST_FIRST，快卡在前）与 NVML / nvidia-smi（PCI 插槽
+    顺序）是**两套编号** —— 拿一边的 index 去另一边查会读错卡（上游 #491：训练
+    在 3070 上，护栏却读 2080 的空闲显存）。PCI bus id 是全机唯一的硬件地址，
+    能跨两套编号定位同一张卡。
+
+    与 ``runtime/training/sysmem.py`` 里的同名函数是同一份逻辑。刻意各存一份而不是
+    互相 import：``utils`` 是底层，不能反向依赖 ``runtime/training``；而 sysmem 那份
+    是上游维护的，两边独立演进比强行合并成一处更省事。改动时记得同步。
+    """
+    try:
+        import torch
+
+        if not torch.cuda.is_available():
+            return None
+        props = torch.cuda.get_device_properties(torch.cuda.current_device())
+        domain = getattr(props, "pci_domain_id", None)
+        bus = getattr(props, "pci_bus_id", None)
+        device = getattr(props, "pci_device_id", None)
+        if domain is None or bus is None or device is None:
+            return None
+        return f"{domain:08X}:{bus:02X}:{device:02X}.0"
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _nvml_handle_for_torch_device(pynvml):
+    """torch 正在用的那张卡的 NVML handle；匹配不上回退 index 0（单卡等价）。"""
+    bus_id = torch_device_pci_bus_id()
+    if bus_id is not None:
+        try:
+            return pynvml.nvmlDeviceGetHandleByPciBusId(bus_id.encode())
+        except Exception:  # noqa: BLE001
+            pass
+    return pynvml.nvmlDeviceGetHandleByIndex(0)
+
+
 def _nvml_free_bytes() -> Optional[int]:
-    """NVML 视角的 0 号卡空闲显存；NVIDIA 专用。"""
+    """NVML 视角的空闲显存，**取 torch 实际在用的那张卡**；NVIDIA 专用。
+
+    原实现硬编码 ``GetHandleByIndex(0)``，多卡下会读到没在训练的卡 —— 见
+    :func:`torch_device_pci_bus_id` 里的编号错位说明。
+    """
     try:
         import pynvml
 
         pynvml.nvmlInit()
         try:
-            handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+            handle = _nvml_handle_for_torch_device(pynvml)
             return int(pynvml.nvmlDeviceGetMemoryInfo(handle).free)
         finally:
             pynvml.nvmlShutdown()
@@ -506,6 +549,11 @@ class DeviceStats:
     vram_total_gb: float
     util_pct: Optional[int] = None
     temp_c: Optional[int] = None
+    #: 本进程的 torch 实际在用的这张卡。多卡下 torch（FASTEST_FIRST）与 NVML
+    #: （PCI 序）编号不同构，前端盲选 ``gpu[0]`` 会显示没在训练的卡（上游 #491）。
+    #: 判定放在本模块是因为「哪张卡在用」属于后端知识；解析不出时全 False，
+    #: 调用方回退第 0 张。
+    active: bool = False
     power_w: Optional[int] = None
     power_cap_w: Optional[int] = None
     sclk_mhz: Optional[int] = None
@@ -529,6 +577,50 @@ def device_stats() -> Optional[list[DeviceStats]]:
     return _torch_device_stats()
 
 
+def _env_selected_gpu_index() -> Optional[int]:
+    """选卡设置注入的 env → NVML index；非注入形态（缺失 / UUID / 多值）→ None。
+
+    Studio 的「计算显卡」设置在启动早期注入 ``CUDA_DEVICE_ORDER=PCI_BUS_ID`` +
+    ``CUDA_VISIBLE_DEVICES=n``。这两个一起出现时 PCI 序与 NVML 枚举同构，所以
+    直接就是答案，不必 import torch 去问 —— 这条零成本路径要走在 PCI 比对之前。
+    """
+    if os.environ.get("CUDA_DEVICE_ORDER") != "PCI_BUS_ID":
+        return None
+    raw = str(os.environ.get("CUDA_VISIBLE_DEVICES", "")).strip()
+    return int(raw) if raw.isdigit() else None
+
+
+def _nvml_active_index(pynvml, count: int) -> Optional[int]:
+    """NVML 枚举里哪一个 index 是 torch 在用的那张；判定不出返回 None。
+
+    三级判定，按成本从低到高：
+      1. 单卡 → 就是它（绝大多数用户，零成本）；
+      2. 选卡 env 已注入 → 直接映射（零成本，见 :func:`_env_selected_gpu_index`）；
+      3. 多卡且无 env → 问 torch 的 PCI bus id 再逐卡比对。``import torch`` +
+         CUDA init 有一次性开销，不该让前两种情况白付。
+    """
+    if count <= 1:
+        return 0 if count == 1 else None
+    env_idx = _env_selected_gpu_index()
+    if env_idx is not None:
+        return env_idx if 0 <= env_idx < count else None
+    bus_id = torch_device_pci_bus_id()
+    if bus_id is None:
+        return None
+    want = bus_id.upper()
+    for i in range(count):
+        try:
+            h = pynvml.nvmlDeviceGetHandleByIndex(i)
+            got = pynvml.nvmlDeviceGetPciInfo(h).busId
+            if isinstance(got, bytes):
+                got = got.decode(errors="replace")
+            if got.upper() == want:
+                return i
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
 def _nvml_device_stats() -> Optional[list[DeviceStats]]:
     """NVML 逐卡指标（利用率 / 温度齐全）；失败返回 None 让调用方 fallback。"""
     try:
@@ -540,7 +632,9 @@ def _nvml_device_stats() -> Optional[list[DeviceStats]]:
         return None
     try:
         out: list[DeviceStats] = []
-        for i in range(pynvml.nvmlDeviceGetCount()):
+        count = pynvml.nvmlDeviceGetCount()
+        active_idx = _nvml_active_index(pynvml, count)
+        for i in range(count):
             h = pynvml.nvmlDeviceGetHandleByIndex(i)
             name = pynvml.nvmlDeviceGetName(h)
             if isinstance(name, bytes):
@@ -561,6 +655,7 @@ def _nvml_device_stats() -> Optional[list[DeviceStats]]:
                 vram_total_gb=round(mem.total / 1024**3, 2),
                 util_pct=util,
                 temp_c=temp,
+                active=(active_idx is not None and i == active_idx),
             ))
         return out
     except Exception:  # noqa: BLE001
@@ -951,6 +1046,13 @@ def _torch_device_stats() -> Optional[list[DeviceStats]]:
     try:
         import torch
 
+        # 这条路径的列表**本来就按 torch 序**逐卡建（下面 mem_get_info(i)），
+        # 所以 active 直接是 current_device()，不需要 NVML 那套 PCI 比对。
+        try:
+            active_idx = torch.cuda.current_device()
+        except Exception:  # noqa: BLE001
+            active_idx = None
+
         out: list[DeviceStats] = []
         for i in range(info.device_count):
             free, total = torch.cuda.mem_get_info(i)
@@ -963,6 +1065,7 @@ def _torch_device_stats() -> Optional[list[DeviceStats]]:
                 vram_total_gb=round(total / 1024**3, 2),
                 util_pct=util,
                 temp_c=temp,
+                active=(active_idx is not None and i == active_idx),
                 power_w=sf.get("power_w"),
                 power_cap_w=sf.get("power_cap_w"),
                 sclk_mhz=sf.get("sclk_mhz"),

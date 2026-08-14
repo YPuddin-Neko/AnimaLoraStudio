@@ -24,9 +24,10 @@ export interface GpuStats {
   vram_used_gb: number
   vram_total_gb: number
   temp_c: number | null
-  // 下面四项是后加的，写成**可选**（`?`）而不是 `| null` 必填：前端可能比后端先
-  // 更新（或反之），旧后端不发这些 key 时应优雅退化成"隐藏功耗 pill"，而不是
-  // 类型对不上。消费处统一用 `!= null` 判断，同时覆盖 null 与 undefined。
+  // 下面几项都是后加的，写成**可选**（`?`）而不是 `| null` 必填：前端可能比后端先
+  // 更新（或反之），旧后端不发这些 key 时应优雅退化（隐藏功耗 pill / active 回退
+  // gpu[0]），而不是类型对不上。消费处统一用 `!= null` 判断，同时覆盖 null 与
+  // undefined。
   /**
    * 实时功率（瓦）。**只有海光 DCU 有**，走 sysfs `power1_average`——
    * hy-smi 的 AvgPwr 列实测偏差 6-7 倍（满载报 79W 而 sysfs 是 564W），不可用。
@@ -45,6 +46,8 @@ export interface GpuStats {
    * 判断卡有没有被限制时这一对比功率可靠：撞功率墙 / 温度墙的卡会主动降档。
    */
   sclk_max_mhz?: number | null
+  /** torch 实际在用的卡（多卡机器显示这张）；后端解析不出时全 false。 */
+  active?: boolean
 }
 
 export interface SystemStats {
@@ -495,6 +498,17 @@ export interface AcceleratorInfo {
   capabilities: AcceleratorCapabilities
 }
 
+/** 系统 tab「环境」section 的只读概览。 */
+export interface EnvSummary {
+  python_version: string
+  platform: string | null
+  driver_version: string | null
+  /** 驱动支持的 CUDA 版本上限（NVML 直读，回退 nvidia-smi 解析）。 */
+  driver_cuda_version: string | null
+  /** 环境真实在用的 CUDA（torch 自带的 runtime 版本）；CPU build/未装 torch 为 null。 */
+  cuda_version: string | null
+}
+
 /** PR-S2 — PyTorch 安装状态 + 驱动检测 + 推荐 cu tag。 */
 export type TorchCuTag = 'cu128' | 'cu126' | 'cu124' | 'cu118' | 'cpu'
 /** torch build 标签：CUDA wheel 的 cuXXX / 'cpu'，或海光 DTK wheel 的 'dtk'。 */
@@ -717,9 +731,9 @@ export interface GenerateSecretsConfig {
   /** 系统内存水位保护：加载大模型前可用物理内存不足 6GB 时中止并报错
    * （默认开）；关闭后继续加载，可能触发整机换页卡顿。 */
   ram_guard: boolean
-  /** 换出到内存的 DiT 层数（0=关闭，krea2 生效）。与 vram_policy 分工不同：
+  /** 换出到内存的 DiT 层数（0=关闭）。与 vram_policy 分工不同：
    * vram_policy 管模型之间谁让位，本项管单个 DiT 内部——单个模型自己就装不下
-   * 显存时唯一的办法。每步出图都要搬一遍换出的层。 */
+   * 显存时唯一的办法。每步出图都要搬一遍换出的层；超过总层数按全换出处理。 */
   blocks_to_swap: number
   /** 开后每次出图自动落盘到 studio_data/test/<date>/{single,xy}/image_N.png。
    * 默认关；compare 模式始终不落盘。 */
@@ -734,6 +748,9 @@ export interface SystemPrefsConfig {
   update_channel: 'stable' | 'dev'
   /** @deprecated use update_channel */
   show_dev_channel: boolean
+  /** 计算显卡（多卡机器，#491）：NVML/nvidia-smi 的 PCI 序号；null = 未设置
+   *  （CUDA 自选，快卡优先）。启动期注入 CUDA env，重启生效。 */
+  gpu_index?: number | null
 }
 
 export interface ProxyConfig {
@@ -1657,45 +1674,29 @@ export interface GenerateRequest {
   params_snapshot?: Record<string, unknown> | null
 }
 
-/** GET /api/generate/cache/index — 当前 session 加密磁盘 cache 索引。
- *  server 端 SessionCache 按 task_id 聚合返回；前端转成 CacheEntry。 */
-export interface CacheGenerateHistoryEntry {
-  /** "cache:<task_id>" */
-  id: string
-  taskId: number
-  mode: 'single' | 'xy'
-  /** Unix timestamp ms */
-  createdAt: number
-  /** 该 task 的所有文件名（XY 时按文件名排序） */
-  filenames: string[]
-  /** GenerateParamsSnapshot dict */
-  params: Record<string, unknown>
-  /** 仅 mode=xy 存在；列每张图的 xy 位置，PreviewXYGrid 重建网格用 */
-  samples?: Array<{
-    filename: string
-    xy: { xi: number; yi: number; xv: string | number; yv: string | number | null }
-  }>
-}
-
-/** 落盘测试图历史 entry（GET /api/generate/disk-history）。
- *  params 是 GenerateParamsSnapshot（前端用 paramsSnapshot.ts 的类型解读），
- *  这里用 unknown 让 api/client.ts 不依赖 pages 层类型。 */
-export interface DiskGenerateHistoryEntry {
-  /** 稳定 ID："disk:<date>:<mode>:image_<N>"；前端按此 dedup */
-  id: string
-  /** YYYY-MM-DD */
-  date: string
-  mode: 'single' | 'xy'
-  filename: string
-  /** 服务端绝对路径，用于和 IDB entry.diskPath 做 dedup */
-  path: string
-  /** /api/generate/disk-image/<date>/<mode>/<filename> */
+/** GET /api/generate/timeline — 出图时间线（DB 单源，tasks 表台账）。
+ *  行 = 一次图片任务；图不在（temp 会话结束 / 文件手删）→ available=false，
+ *  前端显示「已释放」，params 仍可回填。 */
+export interface GenerateTimelineImage {
   url: string
-  /** Unix timestamp（sidecar 写入或 fallback 文件 mtime） */
+  thumb_url?: string
+  xi?: number
+  yi?: number
+}
+export interface GenerateTimelineEntry {
+  task_id: number
+  status: string
+  /** Unix 秒（tasks.created_at） */
   created_at: number
-  schema_version: number
-  /** sidecar 里的 params object（前端按 GenerateParamsSnapshot 解读） */
-  params: Record<string, unknown>
+  mode: 'single' | 'xy'
+  storage: 'disk' | 'temp'
+  /** GenerateParamsSnapshot dict（老行可能 null） */
+  params: Record<string, unknown> | null
+  images: GenerateTimelineImage[]
+  available: boolean
+  xy_folder?: string
+  /** 盘上有 composite 大图时给（下载 / 外站上传入口） */
+  composite_url?: string
 }
 
 /** version output/ 下扫到的 training_state_step*.pt（断点续训用）。 */
@@ -2879,15 +2880,11 @@ export const api = {
   /** PR-9 — 启动测试出图 task。Phase 2 起：图走 server 内存 cache，关页面即丢。 */
   enqueueGenerate: (body: GenerateRequest) =>
     req<Task>('/api/generate', { method: 'POST', body: JSON.stringify(body) }),
-  /** 落盘历史：扫 studio_data/test/&lt;date&gt;/{single,xy}/image_N.json sidecar，
-   *  按 created_at desc 返回；用于历史栏跨会话回看已落盘的测试图。
-   *  注意路径用 disk/ 子前缀避开 `/api/generate/{task_id}` 的单段 catch-all。 */
-  listDiskGenerateHistory: (limit = 500) =>
-    req<{ entries: DiskGenerateHistoryEntry[] }>(`/api/generate/disk/history?limit=${limit}`),
-  /** 当前 session 加密磁盘 cache 历史（save_test_images=false 时唯一来源）。
-   *  server 重启 / SSE 断连 30s + LRU 后 entry 消失；刷新 / 切路由都拉这里。 */
-  listCacheGenerateHistory: () =>
-    req<{ entries: CacheGenerateHistoryEntry[] }>('/api/generate/cache/index'),
+  /** 出图时间线（DB 单源）：所有 generate 任务行，id desc 分页。 */
+  listGenerateTimeline: (limit = 500, offset = 0) =>
+    req<{ entries: GenerateTimelineEntry[]; total: number; offset: number }>(
+      `/api/generate/timeline?limit=${limit}&offset=${offset}`,
+    ),
   /** 查询测试 task 状态。 */
   getGenerateTask: (id: number) => req<Task>(`/api/generate/${id}`),
   /** 测试出图单张 URL（task 跑中或刚完成时拉；客户端断连 30s + LRU 后 404）。 */
@@ -3160,6 +3157,8 @@ export const api = {
 
   // PR-S2 — PyTorch 运行时 / 一键重装 ---------------------------------------
   /** 当前 torch 状态：版本 / CUDA build / cuda.is_available / 驱动检测 / 推荐 cu tag。 */
+  /** 机器级环境事实（系统 tab「环境」section 只读概览）；拿不到的字段为 null。 */
+  getEnvSummary: () => req<EnvSummary>('/api/env/summary'),
   getTorchStatus: () => req<TorchStatus>('/api/torch/status'),
   /** 卸装重装 torch + torchvision；同步 pip，可能 5-30 分钟，UI 必须带 loading。
    *  装完必须重启 Studio（C extension 不能热替换）。 */

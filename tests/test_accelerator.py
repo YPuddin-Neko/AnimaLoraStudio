@@ -1083,3 +1083,126 @@ def test_nvidia_path_leaves_power_fields_none(monkeypatch) -> None:
     stats = accelerator.device_stats()
     assert stats is not None
     assert all(s.power_w is None and s.sclk_mhz is None for s in stats)
+
+
+# ---------------------------------------------------------------------------
+# active 卡判定（多卡，上游 #491）
+#
+# 多卡下 torch（默认 FASTEST_FIRST，快卡在前）与 NVML/nvidia-smi（PCI 插槽序）是
+# 两套编号，前端盲选 gpu[0] 会显示没在训练的那张（上游现象：console 报 3070、
+# topbar 显示 2080）。判定三级：单卡短路 → 选卡 env → PCI bus id 逐卡比对。
+#
+# 这组测试原本在 tests/test_system_stats.py（上游 c264088），随判定逻辑一起下沉到
+# 本层 —— system_stats 现在委托 accelerator，不再自己碰 pynvml，那边 stub pynvml
+# 已经测不到东西了。
+# ---------------------------------------------------------------------------
+
+
+def _fake_pynvml_two_cards(bus_ids=("00000000:01:00.0", "00000000:07:00.0")):
+    """两张卡的 pynvml 替身：NVML 序 0=bus01(2080), 1=bus07(3070)。"""
+    mod = types.ModuleType("pynvml")
+
+    class _Pci:
+        def __init__(self, b): self.busId = b.encode()
+
+    pci = {f"h{i}": _Pci(b) for i, b in enumerate(bus_ids)}
+    mod.nvmlDeviceGetCount = lambda: len(bus_ids)
+    mod.nvmlDeviceGetHandleByIndex = lambda i: f"h{i}"
+    mod.nvmlDeviceGetPciInfo = lambda h: pci[h]
+    return mod
+
+
+def test_active_index_single_card_short_circuits(monkeypatch) -> None:
+    """单卡直接返回 0，不查 env、不 import torch（零成本路径）。"""
+    def _boom():
+        raise AssertionError("单卡不该去问 torch 的 PCI bus id")
+
+    monkeypatch.setattr(accelerator, "torch_device_pci_bus_id", _boom)
+    assert accelerator._nvml_active_index(_fake_pynvml_two_cards(), 1) == 0
+
+
+def test_active_index_zero_cards_is_none() -> None:
+    assert accelerator._nvml_active_index(_fake_pynvml_two_cards(), 0) is None
+
+
+def test_active_index_follows_pci_bus_id(monkeypatch) -> None:
+    """多卡无 env：torch 报 bus07 → NVML 序 1（不是 0）。"""
+    monkeypatch.delenv("CUDA_DEVICE_ORDER", raising=False)
+    monkeypatch.setattr(
+        accelerator, "torch_device_pci_bus_id", lambda: "00000000:07:00.0",
+    )
+    assert accelerator._nvml_active_index(_fake_pynvml_two_cards(), 2) == 1
+
+
+def test_active_index_pci_match_is_case_insensitive(monkeypatch) -> None:
+    """NVML 的 busId 大小写与 torch 拼出来的不一定一致，比对必须忽略大小写。"""
+    monkeypatch.delenv("CUDA_DEVICE_ORDER", raising=False)
+    monkeypatch.setattr(
+        accelerator, "torch_device_pci_bus_id", lambda: "00000000:07:00.0",
+    )
+    fake = _fake_pynvml_two_cards(("00000000:01:00.0", "00000000:07:00.0"))
+    orig = fake.nvmlDeviceGetPciInfo
+
+    class _Lower:
+        def __init__(self, b): self.busId = b
+
+    fake.nvmlDeviceGetPciInfo = lambda h: _Lower(
+        orig(h).busId.decode().lower().encode()
+    )
+    assert accelerator._nvml_active_index(fake, 2) == 1
+
+
+def test_active_index_from_selection_env(monkeypatch) -> None:
+    """选卡 env 已注入 → 直接映射，**不问 torch**（零成本）。
+
+    Studio 的「计算显卡」设置注入 CUDA_DEVICE_ORDER=PCI_BUS_ID + CUDA_VISIBLE_DEVICES=n，
+    此时 PCI 序与 NVML 枚举同构，n 就是答案。
+    """
+    monkeypatch.setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")
+
+    def _boom():
+        raise AssertionError("env 已给出答案，不该再 import torch")
+
+    monkeypatch.setattr(accelerator, "torch_device_pci_bus_id", _boom)
+    assert accelerator._nvml_active_index(_fake_pynvml_two_cards(), 2) == 1
+
+
+def test_active_index_env_out_of_range_is_none(monkeypatch) -> None:
+    """env 指向不存在的卡（eGPU 拔线后卡数变少）→ None，不越界、不乱标。"""
+    monkeypatch.setenv("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "7")
+    assert accelerator._nvml_active_index(_fake_pynvml_two_cards(), 2) is None
+
+
+def test_active_index_env_ignored_without_pci_order(monkeypatch) -> None:
+    """只有 CUDA_VISIBLE_DEVICES 而没有 PCI_BUS_ID：编号不同构，不能直接映射。
+
+    用户手设 CUDA_VISIBLE_DEVICES 时是 torch 序（FASTEST_FIRST），拿它当 NVML
+    index 用会指错卡 —— 必须退回 PCI 比对。
+    """
+    monkeypatch.delenv("CUDA_DEVICE_ORDER", raising=False)
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "1")
+    monkeypatch.setattr(
+        accelerator, "torch_device_pci_bus_id", lambda: "00000000:01:00.0",
+    )
+    assert accelerator._nvml_active_index(_fake_pynvml_two_cards(), 2) == 0
+
+
+def test_active_index_unresolvable_is_none(monkeypatch) -> None:
+    """多卡、无 env、torch 也问不出 PCI（CPU-only torch / 老版本无字段）→ None。
+
+    调用方据此回退第 0 张；不能瞎标一张，那会让 UI 显示错的卡还看不出来。
+    """
+    monkeypatch.delenv("CUDA_DEVICE_ORDER", raising=False)
+    monkeypatch.setattr(accelerator, "torch_device_pci_bus_id", lambda: None)
+    assert accelerator._nvml_active_index(_fake_pynvml_two_cards(), 2) is None
+
+
+def test_active_index_no_match_is_none(monkeypatch) -> None:
+    """torch 报的 bus id 在 NVML 里找不到 → None（而不是错标一张）。"""
+    monkeypatch.delenv("CUDA_DEVICE_ORDER", raising=False)
+    monkeypatch.setattr(
+        accelerator, "torch_device_pci_bus_id", lambda: "00000000:99:00.0",
+    )
+    assert accelerator._nvml_active_index(_fake_pynvml_two_cards(), 2) is None

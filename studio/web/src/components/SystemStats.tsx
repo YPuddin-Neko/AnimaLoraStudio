@@ -75,6 +75,13 @@ export default function SystemStats() {
 
   if (!stats) return null
 
+  // 上游在这里算过一个 gpu0（`gpu.find(g => g.active) ?? gpu[0]`），给「pill 只显示
+  // 一张卡」的旧 UI 用。本分支的 pill 已改成全卡汇总 + tooltip 逐卡明细，没有
+  // 「选一张显示」这回事，所以不需要 gpu0。
+  //
+  // 但 active 这个信息本身有用：多卡机器上「哪张卡在跑训练」不看不出来（torch 与
+  // NVML 编号不同构，上游 #491）。所以改成在逐卡明细里给那张打标记，见下面
+  // activeMark —— 信息保留，且不必牺牲汇总视图。
   const ramPct = stats.ram_total_gb > 0 ? (stats.ram_used_gb / stats.ram_total_gb) * 100 : 0
 
   // ── 多卡汇总 ────────────────────────────────────────────────────────
@@ -109,19 +116,24 @@ export default function SystemStats() {
   // 温度跟着利用率而不是显存：它俩都是「卡当前忙不忙」的即时状态，且温度只有
   // 一个数、并进利用率行不会太长；显存那行本身已有 used/total/百分比三个数。
 
+  /** 逐卡行的「在用」标记。多卡下 torch 与 NVML 编号不同构，光看 #0/#1 分不出
+   *  哪张在跑（上游 #491）。单卡不标 —— 只有一张，标了是废话。 */
+  const activeMark = (g: { active?: boolean }) =>
+    multi && g.active ? ' ←在用' : ''
+
   /** 逐卡显存：`#0 BW  12.3/64G (19%)`。 */
   const perCardVram = gpus.map((g) => {
     const pct = g.vram_total_gb > 0
       ? ` (${((g.vram_used_gb / g.vram_total_gb) * 100).toFixed(0)}%)`
       : ''
-    return `#${g.index} ${g.name}  ${g.vram_used_gb.toFixed(1)}/${Math.round(g.vram_total_gb)}G${pct}`
+    return `#${g.index} ${g.name}  ${g.vram_used_gb.toFixed(1)}/${Math.round(g.vram_total_gb)}G${pct}${activeMark(g)}`
   }).join('\n')
 
   /** 逐卡利用率 + 温度：`#0 BW  90% · 70°C`。缺失项省略而非填 0 —— 0% 是合法读数。 */
   const perCardUtil = gpus.map((g) => {
     const util = g.util_pct != null ? `${g.util_pct}%` : '利用率不可用'
     const temp = g.temp_c != null ? ` · ${g.temp_c}°C` : ''
-    return `#${g.index} ${g.name}  ${util}${temp}`
+    return `#${g.index} ${g.name}  ${util}${temp}${activeMark(g)}`
   }).join('\n')
 
   // ── 功耗（只有 DCU 有；NVIDIA 侧后端暂不报 → 整个 pill 隐藏）───────────
@@ -156,7 +168,7 @@ export default function SystemStats() {
         ? ` · ${g.sclk_mhz}/${g.sclk_max_mhz}MHz${g.sclk_mhz >= g.sclk_max_mhz ? ' 满频' : ' 降频'}`
         : ` · ${g.sclk_mhz}MHz`
     }
-    return `#${g.index} ${g.name}  ${pw}${cap}${clk}`
+    return `#${g.index} ${g.name}  ${pw}${cap}${clk}${activeMark(g)}`
   }).join('\n')
 
   // 单卡时不重复显示汇总行（与逐卡行内容完全一样，纯噪音）

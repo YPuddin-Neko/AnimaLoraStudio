@@ -164,7 +164,19 @@ def _log_vram_watermark(stage: str, *, peak_label: str = "") -> None:
         try:
             stats = device_stats()
             if stats:
-                line += f" 全卡={stats[0].vram_used_gb:.1f}GB"
+                # 取**本进程在用的那张**而不是第 0 张：多卡下 torch 序号与
+                # NVML/PCI 序号是两套编号，硬编码 0 会读到没在训练的卡
+                # （上游 #491：训练在 3070、水位读 2080）。device_stats() 的
+                # torch 分支就是按 torch 序号逐卡建的，所以直接用
+                # current_device() 索引即为正确那张；多卡 DDP 下每个 rank
+                # 各自报自己的卡。
+                #
+                # 注意 NVIDIA 上 device_stats() 走 NVML 分支，那个列表是 PCI 序，
+                # 与 torch 序不一定同构 —— 上游 sysmem.nvml_handle_for_torch_device
+                # 是那条路的正解，等 device_stats 的 NVML 分支也接上之后这里自动受益。
+                idx = torch.cuda.current_device()
+                if idx < len(stats):
+                    line += f" 全卡={stats[idx].vram_used_gb:.1f}GB"
         except Exception:  # noqa: BLE001  日志不阻塞训练
             pass
         logger.info(line)

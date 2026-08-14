@@ -44,6 +44,77 @@ _probe_lock = threading.Lock()
 _probe_state: dict[str, Any] = {"disabled": False, "ever_ok": False}
 
 
+# ── active GPU（torch 实际在用的卡）解析 ─────────────────────────────
+# 多卡机器上 torch（默认 FASTEST_FIRST，快卡在前）与 NVML/nvidia-smi
+# （PCI 插槽顺序）是**两套编号**，gpu[0] 不一定是训练/出图在用的卡
+# （#491：console 报 3070、topbar 显示 2080）。active 判定三级：
+#   1. 单卡 → 就是它（零成本，绝大多数用户）；
+#   2. 选卡 env 已注入（CUDA_DEVICE_ORDER=PCI_BUS_ID + CUDA_VISIBLE_DEVICES=n，
+#      PCI 序与 NVML 同构）→ NVML index n（零成本）；
+#   3. 多卡且无 env → 问 torch 当前设备的 PCI bus id，与 NVML 各卡比对。
+#      懒解析 + 永久缓存（含失败）：import torch + CUDA init 有一次性
+#      开销，不能让 2.5s 的采样 tick 反复付。
+_torch_pci_lock = threading.Lock()
+_torch_pci_state: dict[str, Any] = {"resolved": False, "bus_id": None}
+
+
+def _torch_pci_bus_id() -> Optional[str]:
+    """torch 当前 CUDA 设备的 PCI bus id（NVML busId 格式）；失败 None。"""
+    with _torch_pci_lock:
+        if _torch_pci_state["resolved"]:
+            return _torch_pci_state["bus_id"]
+        _torch_pci_state["resolved"] = True
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                props = torch.cuda.get_device_properties(
+                    torch.cuda.current_device())
+                domain = getattr(props, "pci_domain_id", None)
+                bus = getattr(props, "pci_bus_id", None)
+                device = getattr(props, "pci_device_id", None)
+                if None not in (domain, bus, device):
+                    _torch_pci_state["bus_id"] = (
+                        f"{domain:08X}:{bus:02X}:{device:02X}.0"
+                    )
+        except Exception:  # noqa: BLE001
+            logger.info("torch PCI bus id 查询失败；GPU active 标记停用")
+        return _torch_pci_state["bus_id"]
+
+
+def _env_selected_index() -> Optional[int]:
+    """选卡设置注入的 env → NVML index；非注入形态（缺失/UUID/列表）→ None。"""
+    import os
+
+    if os.environ.get("CUDA_DEVICE_ORDER") != "PCI_BUS_ID":
+        return None
+    raw = str(os.environ.get("CUDA_VISIBLE_DEVICES", "")).strip()
+    return int(raw) if raw.isdigit() else None
+
+
+def _resolve_active_index(
+    pynvml: Any, handles: list[Any],
+) -> Optional[int]:
+    if len(handles) == 1:
+        return 0
+    env_idx = _env_selected_index()
+    if env_idx is not None:
+        return env_idx if 0 <= env_idx < len(handles) else None
+    bus_id = _torch_pci_bus_id()
+    if bus_id is None:
+        return None
+    for i, h in enumerate(handles):
+        try:
+            nvml_bus = pynvml.nvmlDeviceGetPciInfo(h).busId
+            if isinstance(nvml_bus, bytes):
+                nvml_bus = nvml_bus.decode(errors="replace")
+            if nvml_bus.upper() == bus_id.upper():
+                return i
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
 # ── 数据结构 ─────────────────────────────────────────────────────────
 @dataclass(frozen=True)
 class GpuStats:
@@ -65,6 +136,9 @@ class GpuStats:
     vram_used_gb: float
     vram_total_gb: float
     temp_c: Optional[int] = None
+    #: torch 实际在用的卡（多卡机器前端显示这张，而不是盲选 gpu[0]）。
+    #: 解析不出（CPU-only torch / PCI 匹配失败）时全 False，前端回退 gpu[0]。
+    active: bool = False
     #: 实时功率（瓦）。**只有 DCU 有**，走 sysfs `power1_average`——
     #: hy-smi 的 AvgPwr 列实测偏差 6-7 倍，不能用。
     power_w: Optional[int] = None
@@ -103,6 +177,11 @@ def _collect_gpu() -> Optional[list[GpuStats]]:
     if _probe_state["disabled"]:
         return None
     try:
+        # 上游这里原本自己跑 NVML 循环（含 active 判定）。改为委托 accelerator：
+        # NVML 是 NVIDIA 专有，海光 DCU 上 nvmlDeviceGetCount 直接抛，于是整个
+        # GPU 监控在 DCU 上永久关闭。accelerator 是「按后端选查询路径」的单一权威源
+        # （NVIDIA→NVML、DCU→torch mem_get_info + hy-smi + sysfs），active 判定也
+        # 一并下沉到那里（两个后端各自算，见 DeviceStats.active）。
         stats = accelerator.device_stats()
     except Exception:  # noqa: BLE001  采集不该让轮询接口 500
         logger.exception("gpu stats collection failed")
@@ -128,6 +207,7 @@ def _collect_gpu() -> Optional[list[GpuStats]]:
             vram_used_gb=d.vram_used_gb,
             vram_total_gb=d.vram_total_gb,
             temp_c=d.temp_c,
+            active=d.active,
             power_w=d.power_w,
             power_cap_w=d.power_cap_w,
             sclk_mhz=d.sclk_mhz,

@@ -434,6 +434,21 @@ def _try_enable_flash_attn() -> None:
         )
 
 
+def _apply_gpu_selection() -> None:
+    """按 Settings 里的计算显卡选择注入 CUDA env（#491，多卡机器）。
+
+    必须在 `_check_torch_cuda` import torch 之前——CUDA 只在 init 时读一次
+    env；launcher 注入后 server 及其 spawn 的训练/出图子进程全部继承。
+    launcher 是常驻进程（restart 循环），每轮重新调用让改动随重启生效。
+    """
+    try:
+        from studio.services.runtime.gpu_select import apply_gpu_selection_env  # noqa: PLC0415
+
+        apply_gpu_selection_env()
+    except Exception:  # noqa: BLE001
+        pass  # 选卡是 nice-to-have，不挡启动
+
+
 def _check_torch_cuda() -> None:
     """启动期检查 torch 能不能上卡；CPU-only torch 跑训练 / 出图会极慢。
 
@@ -788,6 +803,7 @@ def cmd_run(args: argparse.Namespace) -> int:
                     return rc
         if not getattr(args, 'skip_pending', False):
             _apply_pending_install()
+        _apply_gpu_selection()
         _check_torch_cuda()
         _try_enable_flash_attn()
         _check_onnxruntime()
@@ -843,6 +859,7 @@ def cmd_dev(args: argparse.Namespace) -> int:
         return rc
     if not getattr(args, 'skip_pending', False):
         _apply_pending_install()
+    _apply_gpu_selection()
     _check_torch_cuda()
     _try_enable_flash_attn()
     _check_onnxruntime()

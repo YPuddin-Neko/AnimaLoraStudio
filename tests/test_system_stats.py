@@ -118,7 +118,7 @@ def test_device_stats_fields_map_through(monkeypatch: pytest.MonkeyPatch):
         system_stats.accelerator, "device_stats",
         lambda: [DeviceStats(
             index=0, name="Mock GPU", vram_used_gb=4.0, vram_total_gb=24.0,
-            util_pct=67, temp_c=50,
+            util_pct=67, temp_c=50, active=True,
         )],
     )
     result = system_stats._collect_gpu()
@@ -126,6 +126,10 @@ def test_device_stats_fields_map_through(monkeypatch: pytest.MonkeyPatch):
     g = result[0]
     assert (g.index, g.name, g.util_pct, g.temp_c) == (0, "Mock GPU", 67, 50)
     assert (g.vram_used_gb, g.vram_total_gb) == (4.0, 24.0)
+    # active 由 accelerator 判定后透传（单卡短路恒真）。本文件的 fixture 直接给
+    # DeviceStats，所以这里断言的是「透传不丢字段」；判定逻辑本身在
+    # tests/test_accelerator.py 测。
+    assert g.active is True
 
 
 def test_missing_util_and_temp_pass_through_as_none(monkeypatch: pytest.MonkeyPatch):
