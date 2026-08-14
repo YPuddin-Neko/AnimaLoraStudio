@@ -193,40 +193,26 @@ describe('SystemStats', () => {
     expect(screen.queryByText('GPU')).toBeNull()
   })
 
-  it('marks the active card in per-card tooltips (multi-GPU)', async () => {
-    // 上游 #491：NVML 序 0=2080、1=3070，torch 实际在 3070 上。上游的做法是让
-    // pill 只显示 active 那张；本分支 pill 是全卡汇总，所以改成在逐卡明细里标出
-    // 来 —— 信息保留，且不牺牲「两张卡的显存都看得见」。
+  it('never marks an "active" card in tooltips, and shows every card', async () => {
+    // 后端会给 active（上游 #491：让 pill 只显示 torch 在用那张），但本分支的 pill
+    // 是全卡汇总，逐卡明细里**不该**标「在用」：
+    //   - topbar 是 server 进程报的，current_device() 只反映 server 自己那张，
+    //     与训练子进程用哪张无关；
+    //   - 多卡 DDP 下每个 rank 各占一张，「在用」根本不是单张。
+    // 真机上标出来就是「#0 0% ←在用 / #1 100%」，看着像读数矛盾。
     vi.spyOn(api, 'systemStats').mockResolvedValue(makeStats({
       gpu: [
-        { index: 0, name: 'RTX 2080', util_pct: 1, vram_used_gb: 1.1, vram_total_gb: 8.0, temp_c: 57, active: false },
-        { index: 1, name: 'RTX 3070', util_pct: 80, vram_used_gb: 12.0, vram_total_gb: 16.0, temp_c: 43, active: true },
+        { index: 0, name: 'BW', util_pct: 0, vram_used_gb: 1.1, vram_total_gb: 64.0, temp_c: 54, active: true },
+        { index: 1, name: 'BW', util_pct: 100, vram_used_gb: 53.0, vram_total_gb: 64.0, temp_c: 62, active: false },
       ],
     }))
     render(<SystemStats />)
-    const vram = await screen.findByText('13.1/24G')
+    const vram = await screen.findByText('54.1/128G')
     const tip = vram.closest('[title]')?.getAttribute('title') ?? ''
-    expect(tip).toContain('#1 RTX 3070')
-    expect(tip).toContain('←在用')          // ←在用
-    // 标记只落在 active 那张：#0 那行不带
-    const line0 = tip.split('\n').find((l) => l.includes('#0')) ?? ''
-    expect(line0).not.toContain('←在用')
-    // 两张卡的显存都仍然可见（这是与上游做法的关键差别）
-    expect(tip).toContain('1.1/8G')
-    expect(tip).toContain('12.0/16G')
-  })
-
-  it('does not mark the active card on single-GPU machines', async () => {
-    // 只有一张卡时标「在用」是废话，且会让单卡用户的 tooltip 与改动前不一致
-    vi.spyOn(api, 'systemStats').mockResolvedValue(makeStats({
-      gpu: [
-        { index: 0, name: 'BW', util_pct: 50, vram_used_gb: 4.0, vram_total_gb: 24.0, temp_c: 55, active: true },
-      ],
-    }))
-    render(<SystemStats />)
-    const vram = await screen.findByText('4.0/24G')
-    const tip = vram.closest('[title]')?.getAttribute('title') ?? ''
-    expect(tip).not.toContain('←在用')
+    expect(tip).not.toContain('在用')
+    // 两张卡都要出现在明细里（全卡汇总的意义就在这）
+    expect(tip).toContain('1.1/64G')
+    expect(tip).toContain('53.0/64G')
   })
 
   it('only fetches once on mount (SSE 化后无轮询)', async () => {
