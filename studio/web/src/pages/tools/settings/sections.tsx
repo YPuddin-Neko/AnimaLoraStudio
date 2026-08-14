@@ -894,6 +894,9 @@ export function PyTorchSection() {
   // 都会把它换成 CPU / NVIDIA 版，环境直接报废且装不回来（只能重建容器）。所以
   // DCU 上整段重装 UI 必须置灰。判据取后端给的 can_manage_torch_install（单一权威源
   // 是 utils/accelerator.py），缺字段时默认 true = 旧行为。
+  // 为 false 时下方 primary / advanced 都**不渲染**（而不是置灰）：置灰按钮还留着
+  // 会让用户反复试着点，正确交互是「这个功能在此环境不存在」。onRefresh 保留 ——
+  // 挂载 /dev/kfd 重启容器后要能重新检测。
   const canManage = status?.can_manage_torch_install ?? true
   // DCU 上「装了 GPU build 但设备不可用」用后端中立的 is_backend_unavailable，
   // 原 is_cuda_build_unavailable 的文案是 NVIDIA 驱动 / WSL 口径，对 DCU 是误导。
@@ -941,15 +944,34 @@ export function PyTorchSection() {
       ),
     })
   }
-  if (status?.is_cuda_build_unavailable) {
+  // GPU build 但运行时不可用。NVIDIA：驱动 / WSL 问题；DCU：容器多半没挂
+  // /dev/kfd 或 DTK 装得不全 —— 两套文案完全不同，不能共用一条。
+  // 判据用 backendUnavailable 而非 is_cuda_build_unavailable：后者在 DCU 上恒为
+  // false（那是 NVIDIA 驱动口径），会让「DTK 装了但设备起不来」这种真故障不提示。
+  if (backendUnavailable) {
     notices.push({
-      key: 'cuda-unavailable', tone: 'warn',
-      content: (
+      key: 'backend-unavailable', tone: 'warn',
+      content: isDcu ? (
+        <Trans
+          i18nKey="settings.torchDcuUnavailableWarning"
+          values={{ vendor }}
+          components={{ code: <code className="font-mono" /> }}
+        />
+      ) : (
         <Trans
           i18nKey="settings.torchCudaUnavailableWarning"
           components={{ code: <code className="font-mono" /> }}
         />
       ),
+    })
+  }
+  // DCU：本项目不接管 torch 安装。原因用后端给的 manage_disabled_reason
+  // （与 CLI 文案同一份措辞），不在前端再写一遍。
+  if (status && !canManage) {
+    notices.push({
+      key: 'manage-disabled', tone: 'info',
+      content: status.manage_disabled_reason
+        ?? t('settings.torchManageDisabled', { vendor }),
     })
   }
 
@@ -974,7 +996,7 @@ export function PyTorchSection() {
         />
       )}
       notices={notices}
-      primary={status ? {
+      primary={status && canManage ? {
         label: busy
           ? t('settings.installing')
           : !status.installed
@@ -991,7 +1013,7 @@ export function PyTorchSection() {
       } : undefined}
       onRefresh={() => void refresh()}
       busy={busy}
-      advanced={status ? {
+      advanced={status && canManage ? {
         label: t('settings.manualVariantToggle'),
         open: advancedOpen,
         onToggle: () => setAdvancedOpen(!advancedOpen),
