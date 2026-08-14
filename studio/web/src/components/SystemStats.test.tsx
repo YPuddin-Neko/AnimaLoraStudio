@@ -209,8 +209,7 @@ describe('SystemStats', () => {
     expect(tip).toContain('#1 RTX 3070')
     expect(tip).toContain('←在用')          // ←在用
     // 标记只落在 active 那张：#0 那行不带
-    const line0 = tip.split('
-').find((l) => l.includes('#0')) ?? ''
+    const line0 = tip.split('\n').find((l) => l.includes('#0')) ?? ''
     expect(line0).not.toContain('←在用')
     // 两张卡的显存都仍然可见（这是与上游做法的关键差别）
     expect(tip).toContain('1.1/8G')
