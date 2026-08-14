@@ -253,7 +253,7 @@ describe('SystemStats', () => {
     expect(screen.getByText('PWR×2')).toBeInTheDocument()
   })
 
-  it('shows per-card clock in the power tooltip and marks full speed', async () => {
+  it('shows per-card power and clock (current/max) in the power tooltip', async () => {
     vi.spyOn(api, 'systemStats').mockResolvedValue(twoCardsWithPower())
     const { container } = render(<SystemStats />)
     await waitFor(() => expect(screen.getByText('1127W')).toBeInTheDocument())
@@ -261,12 +261,13 @@ describe('SystemStats', () => {
       .map((el) => el.getAttribute('title') ?? '')
     const pwr = titles.find((t) => t.includes('1500/1500MHz'))
     expect(pwr).toBeTruthy()
-    // 频率与上限都要在 tooltip 里 —— 这是这个 pill 的重点
+    // 功率与上限、频率当前与最高 —— 这是这个 pill 的重点
     expect(pwr).toContain('564W / 1000W')
-    expect(pwr).toContain('满频')       // 满频
   })
 
-  it('marks a throttled card as such', async () => {
+  it('shows a throttled clock as plain numbers, without a verdict word', async () => {
+    // 只摆 `当前/最高`，不加「满频 / 降频」的判词：两个数并排本身就说明了状态，
+    // 再补一个词是同义重复（真机上用户反馈这类文案没用）。
     const s = twoCardsWithPower()
     s.gpu![0] = { ...s.gpu![0], sclk_mhz: 600, sclk_max_mhz: 1500, power_w: 90 }
     vi.spyOn(api, 'systemStats').mockResolvedValue(s)
@@ -274,7 +275,23 @@ describe('SystemStats', () => {
     await waitFor(() => expect(screen.getByText('653W')).toBeInTheDocument())
     const titles = Array.from(container.querySelectorAll('[title]'))
       .map((el) => el.getAttribute('title') ?? '')
-    expect(titles.some((t) => t.includes('600/1500MHz') && t.includes('降频'))).toBe(true)
+    const pwr = titles.find((t) => t.includes('600/1500MHz'))
+    expect(pwr).toBeTruthy()
+    expect(pwr).not.toContain('降频')
+    expect(pwr).not.toContain('满频')
+  })
+
+  it('keeps the power tooltip free of editorial footer text', async () => {
+    // 早先末行有「满频即未受限；上限是天花板不是目标」——真机上用户直接指出没用。
+    // tooltip 只列数据，不写结论。
+    vi.spyOn(api, 'systemStats').mockResolvedValue(twoCardsWithPower())
+    const { container } = render(<SystemStats />)
+    await waitFor(() => expect(screen.getByText('1127W')).toBeInTheDocument())
+    const titles = Array.from(container.querySelectorAll('[title]'))
+      .map((el) => el.getAttribute('title') ?? '')
+    const pwr = titles.find((t) => t.includes('1500/1500MHz')) ?? ''
+    expect(pwr).not.toContain('天花板')
+    expect(pwr).not.toContain('未受限')
   })
 
   it('hides the power pill when no card reports power (NVIDIA / old backend)', async () => {

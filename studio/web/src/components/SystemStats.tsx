@@ -138,11 +138,8 @@ export default function SystemStats() {
   // hy-smi 的 AvgPwr 列报 79W/95W，而 sysfs 同一时刻是 564W/563W（差 6-7 倍）。
   // 后端已改成读 sysfs，这里把真实值显示出来。
   //
-  // **hover 显示频率**是这个 pill 的重点，而不是附赠信息：功率低本身说明不了问题
-  // （上限是天花板不是目标，真实负载点亮芯片不同部分，均值远低于上限很正常），
-  // 真正能判断卡有没有被限制的是频率档位 —— 撞功率墙或温度墙的卡会主动降档，
-  // 而「当前 = 最高」就是健康状态。所以 tooltip 里频率和上限一起给，让用户能自己
-  // 得出结论而不是盯着瓦数猜。
+  // tooltip 里连频率一起给（当前 / 最高）：判断卡有没有被限制靠的是频率档位，
+  // 撞功率墙或温度墙的卡会主动降档。只摆数据，不在 UI 里写结论。
   const powerValues = gpus.map((g) => g.power_w).filter((p): p is number => p != null)
   // 合计而非平均：功率是物理量，可加（与显存同口径，与利用率相反）。
   const powerTotal = powerValues.length > 0
@@ -154,14 +151,17 @@ export default function SystemStats() {
     .filter((g) => g.power_w != null && g.power_cap_w != null)
     .reduce((s, g) => s + (g.power_cap_w as number), 0) || null
 
-  /** 逐卡功率 + 频率：`#0 BW  564W / 1000W · 1500/1500MHz 满频`。 */
+  /** 逐卡功率 + 频率：`#0 BW  564W / 1000W · 1500/1500MHz`。
+   *
+   *  只给数，不加「满频 / 降频」的判词：`当前/最高` 两个数并排本身就说明了状态，
+   *  再补一个词是同义重复。 */
   const perCardPower = gpus.map((g) => {
     const pw = g.power_w != null ? `${g.power_w}W` : '功率不可用'
     const cap = g.power_cap_w != null ? ` / ${g.power_cap_w}W` : ''
     let clk = ''
     if (g.sclk_mhz != null) {
       clk = g.sclk_max_mhz != null
-        ? ` · ${g.sclk_mhz}/${g.sclk_max_mhz}MHz${g.sclk_mhz >= g.sclk_max_mhz ? ' 满频' : ' 降频'}`
+        ? ` · ${g.sclk_mhz}/${g.sclk_max_mhz}MHz`
         : ` · ${g.sclk_mhz}MHz`
     }
     return `#${g.index} ${g.name}  ${pw}${cap}${clk}`
@@ -178,11 +178,10 @@ export default function SystemStats() {
         ? `GPU 利用率均值 ${utilAvg.toFixed(0)}% · ${gpus.length} 卡\n${perCardUtil}`
         : `GPU 利用率 · ${perCardUtil}`)
     : ''
-  // 末行那句提示是刻意留的：这个 pill 存在的起因就是有人把低功率读成"没跑满"。
   const powerTooltip = hasGpu && powerTotal != null
     ? (multi
-        ? `功耗合计 ${powerTotal}W · ${gpus.length} 卡\n${perCardPower}\n\n满频即未受限；上限是天花板不是目标`
-        : `功耗 ${perCardPower}\n\n满频即未受限；上限是天花板不是目标`)
+        ? `功耗合计 ${powerTotal}W · ${gpus.length} 卡\n${perCardPower}`
+        : `功耗 ${perCardPower}`)
     : ''
 
   return (
