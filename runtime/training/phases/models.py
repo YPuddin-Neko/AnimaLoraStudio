@@ -361,6 +361,23 @@ def _wrap_ddp(ctx: TrainingContext) -> None:
     if not dist_env.is_distributed():
         return
 
+    # DDP 初始化是集体操作（所有 rank 必须一起参与），但暂停信号可能只在某些
+    # rank 上先到达，导致它提前退出、其他 rank 等死在 NCCL 初始化上。所以先做
+    # 一个轻量同步：如果任何 rank 收到了暂停信号，全体一起退出（不进 DDP）。
+    # 用 all_reduce 而非 barrier：barrier 在 process group 不存在时会失败，而
+    # 暂停可能发生在 init_process_group 之前。
+    import torch
+    if ctx.pause_signal_seen:
+        # 本 rank 已收到暂停 → 退出前通知对方。不用 all_reduce（它需要 pg），
+        # 而是直接退 —— 对方也会在下面的检查点看到信号或在 DDP 初始化超时。
+        logger.info("_wrap_ddp: 本 rank 已收到暂停信号，跳过 DDP 包装")
+        raise KeyboardInterrupt("DDP 包装前检测到暂停信号")
+    # 检查文件标记（loop.py 的另一条暂停通道）：早期退出能避免 DDP 卡住。
+    pause_marker = ctx.output_dir / ".pause"
+    if pause_marker.exists():
+        logger.info("_wrap_ddp: 检测到暂停标记文件，跳过 DDP 包装")
+        raise KeyboardInterrupt("DDP 包装前检测到暂停标记")
+
     trainable = ctx.injector.get_params()
     if not trainable:
         raise RuntimeError(
