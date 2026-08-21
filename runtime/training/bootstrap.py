@@ -10,9 +10,14 @@
 
 from __future__ import annotations
 
+import logging
 import subprocess
 import sys
 from pathlib import Path
+
+from studio.infrastructure.log_messages import msg
+
+logger = logging.getLogger(__name__)
 
 
 #: torch 生态包：``--auto-install`` 在海光 DCU 上**不能**碰这些。
@@ -43,11 +48,13 @@ def ensure_dependencies(auto_install: bool = False) -> None:
     if not missing:
         return
     missing_list = ", ".join(sorted(set(missing)))
-    print(f"Missing dependencies: {missing_list}")
     if not auto_install:
-        print(f"Install them with:\n  {sys.executable} -m pip install {missing_list}")
+        logger.error(
+            "Dependency check failed: missing=%s — training aborted; "
+            "install with: %s -m pip install %s",
+            missing_list, sys.executable, missing_list,
+        )
         raise SystemExit(1)
-
     # DCU 上把 torch 生态包从自动安装清单里剔掉（理由见 _TORCH_FAMILY_PACKAGES）。
     # 只在 DCU 上 gate：NVIDIA 路径行为保持原样，避免为了这个护栏改动既有用户的体验。
     auto_targets = sorted(set(missing))
@@ -56,21 +63,29 @@ def ensure_dependencies(auto_install: bool = False) -> None:
     if is_dcu():
         blocked = [p for p in auto_targets if p in _TORCH_FAMILY_PACKAGES]
         if blocked:
-            print(
-                f"Refusing to auto-install on Hygon DCU: {', '.join(blocked)}\n"
-                f"  DTK torch/torchvision are preinstalled in the vendor image and are\n"
-                f"  NOT on PyPI. Installing from PyPI would pull a CPU-only torch and\n"
-                f"  overwrite the DTK build, breaking the environment beyond pip repair.\n"
-                f"  Get the matching DTK wheels from the Hygon developer channel instead."
+            # 这条走 logger.error 而不是 print：日志改写后 run.log 是单一出口，
+            # print 会绕过级别与格式（设计 D3）。而它紧接着 SystemExit(1)，
+            # 属于致命错误而非提示。
+            logger.error(
+                "Refusing to auto-install on Hygon DCU: %s\n"
+                "  DTK torch/torchvision are preinstalled in the vendor image and are\n"
+                "  NOT on PyPI. Installing from PyPI would pull a CPU-only torch and\n"
+                "  overwrite the DTK build, breaking the environment beyond pip repair.\n"
+                "  Get the matching DTK wheels from the Hygon developer channel instead.",
+                ", ".join(blocked),
             )
             raise SystemExit(1)
 
+    logger.info(msg("train.deps_installing", missing=missing_list))
     cmd = [sys.executable, "-m", "pip", "install", *auto_targets]
-    print("Installing missing dependencies...")
     try:
         subprocess.run(cmd, check=False)
     except Exception as exc:
-        print(f"Auto-install failed: {exc}")
+        logger.exception(
+            "Dependency auto-install failed: %s — training aborted; "
+            "install manually: %s -m pip install %s",
+            exc, sys.executable, missing_list,
+        )
         raise SystemExit(1)
     still_missing = []
     for module_name, pip_name in required.items():
@@ -80,7 +95,11 @@ def ensure_dependencies(auto_install: bool = False) -> None:
             still_missing.append(pip_name)
     if still_missing:
         still_list = ", ".join(sorted(set(still_missing)))
-        print(f"Still missing: {still_list}")
+        logger.error(
+            "Dependency check failed after auto-install: missing=%s — training "
+            "aborted; install manually: %s -m pip install %s",
+            still_list, sys.executable, still_list,
+        )
         raise SystemExit(1)
 
 
@@ -89,7 +108,11 @@ def load_yaml_config(config_path):
     try:
         import yaml
     except ImportError:
-        print("PyYAML not installed. Install with: pip install pyyaml")
+        logger.error(
+            "Dependency check failed: missing=pyyaml — config file cannot be read, "
+            "training aborted; install with: %s -m pip install pyyaml",
+            sys.executable,
+        )
         raise SystemExit(1)
 
     config_path = Path(config_path)
@@ -116,8 +139,8 @@ def apply_yaml_config(args, config):
     命令行显式参数优先于 YAML：parse_args 以 suppress_defaults 构建 parser，
     args 只含显式键，优先级是精确判定而非「值==默认值」近似。
 
-    校验失败逐条打印到 stderr 后 SystemExit(2) —— 与能力防线同款 fail-fast，
-    supervisor 截 stderr 尾部作为任务错误信息。
+    校验失败以一条 ERROR 记录（逐条错误作续行）落日志后 SystemExit(2) ——
+    与能力防线同款 fail-fast，supervisor 从 run.log 尾部取错误块作为任务错误信息。
     """
     from pydantic import ValidationError
 
@@ -128,10 +151,11 @@ def apply_yaml_config(args, config):
         return namespace_from_config(args, dict(config or {}), TrainingConfig)
     except ValidationError as exc:
         errors = exc.errors()
-        print(f"配置校验失败（{len(errors)} 处）:", file=sys.stderr)
+        lines = [f"Config validation failed: {len(errors)} problem(s) — training aborted"]
         for err in errors:
             loc = ".".join(str(p) for p in err["loc"]) or "config"
-            print(f"  {loc}: {err['msg']}", file=sys.stderr)
+            lines.append(f"  {loc}: {err['msg']}")
+        logger.error("\n".join(lines))
         raise SystemExit(2) from exc
 
 

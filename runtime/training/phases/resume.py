@@ -5,12 +5,12 @@
 
 from __future__ import annotations
 
-import logging
 import os
 import signal
 import time
 from pathlib import Path
 
+from studio.infrastructure.log_messages import msg
 from training.bootstrap import init_progress
 from training.context import TrainingContext
 from training.observability import render_curve_panel
@@ -18,9 +18,6 @@ from training.sample_runner import run_sample
 from utils import distributed as dist_env
 from training.snapshot import emit_event
 from training.state import load_training_state
-
-
-logger = logging.getLogger(__name__)
 
 
 def run(ctx: TrainingContext) -> None:
@@ -68,7 +65,7 @@ def run(ctx: TrainingContext) -> None:
             scaler=ctx.scaler,
             expected_family=ctx.family.spec.family_id,
         )
-        ctx.emit(f"从断点恢复训练: epoch={ctx.start_epoch}, step={ctx.global_step}")
+        # resume 的叙事行由 load_training_state 打（state.py），此处不重复。
 
         # 恢复监控面板的历史数据（loss 曲线等）
         if ctx.monitor_server and saved_monitor_state:
@@ -82,9 +79,16 @@ def run(ctx: TrainingContext) -> None:
                     step=ctx.global_step,
                     total_steps=ctx.total_steps,
                 )
-                ctx.emit(f"监控面板历史数据已恢复: {len(saved_monitor_state.get('losses', []))} 个 loss 点")
+                ctx.emit(msg(
+                    "train.monitor_history_restored",
+                    n=len(saved_monitor_state.get("losses", [])),
+                ))
             except Exception as e:
-                ctx.emit(f"监控数据恢复失败: {e}")
+                ctx.emit(
+                    f"Dashboard history could not be restored: {e} — the loss chart "
+                    f"starts from this step, training itself is not affected",
+                    level="warning",
+                )
 
         # ADR §`_on_line` 识别此事件后清理上次 pause 文件对（PR-3 cmd_builder 接入）。
         emit_event("resume_state_loaded", {"path": str(args.resume_state)})
@@ -157,9 +161,12 @@ def run(ctx: TrainingContext) -> None:
         ctx.sample_steps_all_ranks > 0 or ctx.sample_every_all_ranks > 0
     )
     if ctx.global_step == 0 and sampling_enabled:
+        # barrier 在 if 外侧、is_main() 在里侧 —— 集合操作必须所有 rank 都执行。
+        # 采样前也挡一次：让 rank 0 在其余 rank 的激活都已释放之后才开始出图，
+        # 否则两者的显存峰值叠在同一时间窗口（真机上直接 OOM）。
         dist_env.barrier()
         if dist_env.is_main():
-            ctx.emit("采样中 (step 0, 基线)...")
+            ctx.emit(msg("train.baseline_sampling"))
             for i, prompt in enumerate(ctx.sample_prompts[:3]):  # 最多测试 3 个
                 sample_path = ctx.sample_dir / f"step_0_baseline_{i}.png"
                 run_sample(
@@ -173,7 +180,7 @@ def run(ctx: TrainingContext) -> None:
                 )
         dist_env.barrier()
     elif ctx.global_step > 0 and sampling_enabled:
-        ctx.emit(f"跳过启动基线采样（从 step {ctx.global_step} 恢复，非 step 0）")
+        ctx.emit(msg("train.baseline_sampling_skipped", step=ctx.global_step))
 
     # ADR §8.1 is_pausable 信号：resume phase 全部跑完 → 训练进入主循环 →
     # 允许用户暂停。supervisor `_on_line` 收到此事件后 slot.train_loop_started = True

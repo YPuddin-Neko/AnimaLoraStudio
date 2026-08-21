@@ -89,7 +89,7 @@ def run_sample(
     # 训练都走 PCIe，表现为采样后持续整机卡顿（显存/内存数字反而稳定）。
     # 采样前这次顺带结算「上一段训练步」的峰值并重置，于是采样后那次报出的
     # 就是纯采样期峰值 —— 两个数字合起来才能回答「这张卡够不够」
-    _log_vram_watermark("采样前", peak_label="训练步")
+    _log_vram_watermark("before_sample", peak_label="train_step")
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     try:
@@ -107,7 +107,9 @@ def run_sample(
                 seed=(s_seed + seed_offset) if s_seed else None,
             )
             img.save(sample_path)
-            ctx.emit(f"采样保存: {sample_path.name}")
+            # 与 loop.py 的「采样中」是同一次采样的两条记录；这条降 DEBUG 并
+            # 改直调 logger，默认视图只留前者。
+            logger.debug("sample: image saved name=%s", sample_path.name)
             if wandb_key and ctx.wandb_monitor.log_samples:
                 ctx.wandb_monitor.log_image(
                     wandb_key,
@@ -122,7 +124,10 @@ def run_sample(
                 except Exception:
                     pass
     except Exception as exc:
-        logger.warning("采样失败，已跳过本次预览，不中断训练: %s", exc, exc_info=True)
+        logger.warning(
+            "Sample image failed: %s — the preview is skipped, training continues",
+            exc, exc_info=True,
+        )
     finally:
         if was_training:
             ctx.model.train()
@@ -131,7 +136,7 @@ def run_sample(
         # 归还采样期的新形状分配，训练继续时 allocator 干净
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-        _log_vram_watermark("采样后", peak_label="采样期")
+        _log_vram_watermark("after_sample", peak_label="sampling")
 
 
 def _log_vram_watermark(stage: str, *, peak_label: str = "") -> None:
@@ -149,10 +154,12 @@ def _log_vram_watermark(stage: str, *, peak_label: str = "") -> None:
             return
         alloc = torch.cuda.memory_allocated() / 1e9
         reserved = torch.cuda.memory_reserved() / 1e9
-        line = f"[{stage}] 显存 alloc={alloc:.1f}GB reserved={reserved:.1f}GB"
+        line = (
+            f"[vram] {stage}: allocated={alloc:.2f} GB reserved={reserved:.2f} GB"
+        )
         if peak_label:
             peak = torch.cuda.max_memory_allocated() / 1e9
-            line += f" | {peak_label}峰值={peak:.1f}GB"
+            line += f" peak_{peak_label}={peak:.2f} GB"
             torch.cuda.reset_peak_memory_stats()
         # 全卡已用量：走 accelerator（按后端选 NVML / torch mem_get_info）。
         # 原实现直接 import pynvml —— NVIDIA 专有，海光 DCU 上 nvmlInit() 必失败，
@@ -171,14 +178,19 @@ def _log_vram_watermark(stage: str, *, peak_label: str = "") -> None:
                 # current_device() 索引即为正确那张；多卡 DDP 下每个 rank
                 # 各自报自己的卡。
                 #
+                # 为什么不用上游那条 pynvml 路径：NVML 是 NVIDIA 专有，海光 DCU 上
+                # nvmlInit() 必失败，于是「全卡已用」这一栏在 DCU 上永远缺失。
+                # device_stats() 是「按后端选查询路径」的单一权威源（NVIDIA→NVML、
+                # DCU→torch mem_get_info），两个后端都有数。
+                #
                 # 注意 NVIDIA 上 device_stats() 走 NVML 分支，那个列表是 PCI 序，
                 # 与 torch 序不一定同构 —— 上游 sysmem.nvml_handle_for_torch_device
                 # 是那条路的正解，等 device_stats 的 NVML 分支也接上之后这里自动受益。
                 idx = torch.cuda.current_device()
                 if idx < len(stats):
-                    line += f" 全卡={stats[idx].vram_used_gb:.1f}GB"
+                    line += f" device_used={stats[idx].vram_used_gb:.2f} GB"
         except Exception:  # noqa: BLE001  日志不阻塞训练
             pass
-        logger.info(line)
+        logger.debug(line)
     except Exception:
         pass
