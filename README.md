@@ -50,7 +50,7 @@ studio.bat          # Windows
 ### 海光 DCU
 
 DTK 是 ROCm 分支，训练链路与 NVIDIA 共用同一套代码（`torch.cuda.*` 经 HIP 映射），
-显存档位参照上面的分档。已在 `pytorch:2.9.0-ubuntu22.04-dtk26.04-py3.11` 镜像 + BW1000 验证。
+显存档位参照上面的分档。已在 `pytorch:2.5.1-ubuntu22.04-dtk26.04-py3.11` 镜像 + BW1000 验证。
 
 与 NVIDIA 的差异：
 
@@ -65,7 +65,7 @@ DTK 是 ROCm 分支，训练链路与 NVIDIA 共用同一套代码（`torch.cuda
   关掉不可用的后端）。代价是更慢、长序列更吃显存。装上 flash-attn 后自动恢复快路径，
   无需改配置。
 - 已验证组合：`pytorch:2.5.1-ubuntu22.04-dtk26.04-py3.11` + BW1000（64GB×2）+
-  flash-attn 2.6.1 + xformers 0.0.33（均为 `+das.opt1.dtk2604.torch251` 配套版本）。
+  flash-attn 2.8.3 + xformers 0.0.33（均为 `+das.opt1.dtk2604.torch251` 配套版本）。
   该组合下 bf16 训练、fp8 底模、block swap、flash attention、NaViT 打包全部可用。
 - **NaViT 打包需要 xformers**（依赖其块对角 varlen 内核）。装了海光配套 xformers 即可用；
   没装就关掉它，改用 ARB 分桶路径（功能等价、速度略低）。
