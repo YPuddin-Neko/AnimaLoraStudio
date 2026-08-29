@@ -179,6 +179,37 @@ def _pip_install(args: list[str]) -> int:
 _DCU_UNMANAGED_REQS: tuple[str, ...] = ("torch", "torchvision")
 
 
+def _dcu_constraints() -> Optional[Path]:
+    """DCU 上生成 pip 约束文件（把镜像预装的包钉住）；非 DCU / 无需约束返回 None。
+
+    与 `_requirements_for_install` 的删行是两种机制，针对两类包：
+    - 删行：torch / torchvision —— PyPI 上没有 DTK wheel，**不能装**。
+    - 约束：transformers 等 —— 能装，但版本必须跟镜像一致（镜像里的 vllm /
+      flash_attn 钉死了它们）。约束还能管住 requirements.txt 里没有的传递依赖
+      （tokenizers 就是 transformers 拉进来的）。
+    """
+    from studio.services.runtime import torch as torch_setup  # noqa: PLC0415
+
+    try:
+        dest = torch_setup.write_dcu_constraints(REPO_ROOT / "tmp" / "constraints.dcu.txt")
+    except OSError:
+        # 写不出来不该阻断安装（约束是加固，不是必需）；但要让用户知道少了这层保护。
+        _say(
+            "海光 DCU：无法生成 pip 约束文件，本次安装不会把 transformers 等包钉在"
+            "镜像版本上。若之后训练报 transformers / safetensors 相关错误，"
+            "手动执行：pip install \"transformers==<镜像版本>\"",
+            "warning",
+        )
+        return None
+    if dest is not None:
+        pinned = torch_setup.image_pinned_versions()
+        _say(
+            f"海光 DCU：已把镜像预装的 {len(pinned)} 个包钉住 —— "
+            + ", ".join(f"{k}=={v}" for k, v in sorted(pinned.items()))
+        )
+    return dest
+
+
 def _requirements_for_install() -> tuple[Path, Optional[Path]]:
     """返回 (要交给 pip 的 requirements 路径, 需要事后删的临时文件)。
 
@@ -221,14 +252,24 @@ def _ensure_python_deps() -> int:
     except Exception:
         pass
     _say(msg("cli.reinstall_python_deps"))
-    # DCU 上要用过滤后的 requirements（剔掉 torch 生态包，见 _requirements_for_install）：
-    # DTK torch 由镜像预装且不在 PyPI 上，照原样 pip install -r 会拉 CPU 版覆盖掉它。
+    # DCU 上两件事一起做：
+    # 1. 过滤 requirements（剔掉 torch / torchvision）—— PyPI 上没有 DTK wheel，
+    #    装了会覆盖镜像预装的、环境不可逆报废。
+    # 2. 加约束文件 —— transformers / safetensors / tokenizers / huggingface_hub
+    #    钉在镜像预装的版本上。它们 PyPI 上有、装得上，但镜像里的 DCU 组件
+    #    （vllm / flash_attn）钉死了版本，pip 装更新的到 venv 会遮蔽镜像版。
     target, cleanup = _requirements_for_install()
+    constraints = _dcu_constraints()
+    args = ["-r", str(target)]
+    if constraints is not None:
+        args += ["-c", str(constraints)]
     try:
-        return _pip_install(["-r", str(target)])
+        return _pip_install(args)
     finally:
         if cleanup is not None:
             cleanup.unlink(missing_ok=True)
+        if constraints is not None:
+            constraints.unlink(missing_ok=True)
 
 
 def npm_build(npm: str) -> int:

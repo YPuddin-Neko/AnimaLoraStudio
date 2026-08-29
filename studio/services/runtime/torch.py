@@ -96,6 +96,95 @@ def can_manage_torch_install() -> bool:
     return accelerator.probe_stdlib().backend != "dcu"
 
 
+#: DCU 上「镜像预装、pip 不该顶掉」的包。与 torch/torchvision 性质不同：
+#: 那两个在 PyPI 上**没有** DTK wheel，装了就报废环境，所以从 requirements 里整行删掉；
+#: 这几个 PyPI 上有、也装得上，但厂商镜像里的 DCU 组件（vllm / flash_attn 等）钉死了
+#: 具体版本，pip 装个更新的到 venv 里会遮蔽镜像版，于是那些组件在运行时对不上。
+#:
+#: 真机实测（DTK 26.04 镜像）：requirements 的 `transformers>=4.57.0` 无上限，
+#: 镜像里是 4.57.6 —— 但 venv 看不见它，pip 拉了 5.16.1，连带把 huggingface_hub
+#: 从 0.36.0 顶到 1.29.0（跨大版本）、tokenizers 0.22.2→0.23.1、safetensors
+#: 0.7.0→0.8.0。而镜像的 vllm 钉 `transformers==4.57.6`。
+#:
+#: 处理方式是**约束**（pip -c）而不是删行，两个原因：
+#: 1. 这些包该装（镜像没预装时 DCU 用户也要能用），只是版本要跟镜像一致；
+#: 2. `tokenizers` 压根不在 requirements.txt 里（transformers 的传递依赖），
+#:    删行拦不住它，而约束文件对传递依赖同样生效。
+_DCU_IMAGE_PINNED: tuple[str, ...] = (
+    "transformers",
+    "safetensors",
+    "tokenizers",
+    "huggingface-hub",
+)
+
+
+def _base_site_packages() -> Optional[Path]:
+    """venv 的**基础解释器**（镜像那份 python）的 site-packages 路径。
+
+    不在 venv 里时返回 None（此时 ``sys.prefix == sys.base_prefix``，无「镜像版 vs
+    venv 版」之分）。
+    """
+    if sys.prefix == sys.base_prefix:
+        return None
+    scheme = "nt" if sys.platform == "win32" else "posix_prefix"
+    try:
+        p = Path(sysconfig.get_paths(scheme=scheme, vars={
+            "base": sys.base_prefix, "platbase": sys.base_prefix,
+        })["purelib"])
+    except Exception:  # noqa: BLE001  sysconfig 布局异常不该阻断安装
+        return None
+    return p if p.is_dir() else None
+
+
+def image_pinned_versions() -> dict[str, str]:
+    """镜像预装的 :data:`_DCU_IMAGE_PINNED` 各包版本；非 DCU / 非 venv 返回空 dict。
+
+    只查**基础解释器**的 site-packages，不查 venv —— venv 里那份可能已经是被 pip
+    顶上去的新版本，拿它当基准就没意义了。查不到的包不出现在结果里（镜像没预装 →
+    不该约束，让 pip 自由装）。
+    """
+    if can_manage_torch_install():          # 非 DCU：不干预
+        return {}
+    base = _base_site_packages()
+    if base is None:
+        return {}
+    from importlib.metadata import distributions  # noqa: PLC0415  仅此处用
+
+    want = set(_DCU_IMAGE_PINNED)
+    found: dict[str, str] = {}
+    try:
+        for dist in distributions(path=[str(base)]):
+            name = (dist.metadata.get("Name") or "").strip().lower().replace("_", "-")
+            if name in want and name not in found:
+                found[name] = dist.version
+    except Exception:  # noqa: BLE001  元数据损坏不该阻断安装
+        logger.debug("读取镜像预装版本失败", exc_info=True)
+        return {}
+    return found
+
+
+def write_dcu_constraints(dest: Path) -> Optional[Path]:
+    """把镜像预装版本写成 pip 约束文件；无需约束时返回 None（不建文件）。
+
+    调用方把返回值作为 ``pip install -c <file>`` 传进去。约束**只限定版本**，
+    不导致安装，所以对「镜像没装这个包」的情形天然无害。
+    """
+    pinned = image_pinned_versions()
+    if not pinned:
+        return None
+    lines = [
+        "# 自动生成（studio/services/runtime/torch.py:write_dcu_constraints）——不要手改。",
+        "# 海光 DCU：把这些包钉在**厂商镜像预装的版本**上。",
+        "# 镜像里的 DCU 组件（vllm / flash_attn 等）钉死了它们的版本，pip 往 venv 里",
+        "# 装更新的会遮蔽镜像版，那些组件在运行时就对不上（真机实测：transformers",
+        "# 被顶到 5.x 后 Anima 文本编码器加载即崩）。",
+    ]
+    lines += [f"{name}=={ver}" for name, ver in sorted(pinned.items())]
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return dest
+
+
 def recommend_cu_tag(driver_version: Optional[str]) -> str:
     """根据 NVIDIA 驱动版本返回推荐 cu tag；驱动太旧 / 没驱动 → 'cpu'。
 

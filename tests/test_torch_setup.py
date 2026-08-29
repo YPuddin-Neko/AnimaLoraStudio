@@ -309,3 +309,138 @@ def test_reinstall_returns_stdout_tail(monkeypatch: pytest.MonkeyPatch) -> None:
     tail_lines = res["stdout_tail"].splitlines()
     assert len(tail_lines) <= 40
     assert tail_lines[-1] == "line 99"
+
+
+# ---------------------------------------------------------------------------
+# DCU：把镜像预装的 HF 栈钉住（image_pinned_versions / write_dcu_constraints）
+#
+# 真机踩到的事（DTK 26.04）：requirements 的 `transformers>=4.57.0` 没有上限，
+# 而 venv 看不见镜像预装的 4.57.6，于是 pip 拉了 5.16.1，连带把
+# huggingface_hub 0.36.0→1.29.0（跨大版本）、tokenizers 0.22.2→0.23.1、
+# safetensors 0.7.0→0.8.0。镜像里的 vllm 钉死 `transformers==4.57.6`，
+# 于是那些 DCU 组件在运行时对不上。
+#
+# 与 torch/torchvision 的删行是两种机制：那两个装不了（PyPI 无 DTK wheel），
+# 这几个装得上但版本要跟镜像一致 —— 所以用 pip 约束（-c），且约束能管住
+# requirements.txt 里没有的传递依赖（tokenizers 就是）。
+# ---------------------------------------------------------------------------
+
+
+class _FakeDist:
+    """importlib.metadata.Distribution 的最小替身（只要 metadata['Name'] + version）。"""
+
+    def __init__(self, name: str, version: str):
+        self.metadata = {"Name": name}
+        self.version = version
+
+
+def _fake_dcu(monkeypatch, *, in_venv: bool = True, base_exists: bool = True):
+    """把 ts 伪装成「DCU + 在 venv 里 + base site-packages 存在」。"""
+    monkeypatch.setattr(ts, "can_manage_torch_install", lambda: False)  # DCU
+    if in_venv and base_exists:
+        monkeypatch.setattr(ts, "_base_site_packages", lambda: __import__("pathlib").Path("/fake/base"))
+    else:
+        monkeypatch.setattr(ts, "_base_site_packages", lambda: None)
+
+
+def _fake_dists(monkeypatch, dists: list[_FakeDist]):
+    """替掉 importlib.metadata.distributions —— 它在函数体里 import，要打到源模块上。"""
+    import importlib.metadata as im
+
+    monkeypatch.setattr(im, "distributions", lambda path=None: iter(dists))
+
+
+def test_image_pinned_versions_reads_base_site_packages(monkeypatch):
+    """只报 _DCU_IMAGE_PINNED 里的包，版本取自 base site-packages。"""
+    _fake_dcu(monkeypatch)
+    _fake_dists(monkeypatch, [
+        _FakeDist("transformers", "4.57.6"),
+        _FakeDist("safetensors", "0.7.0"),
+        _FakeDist("tokenizers", "0.22.2"),
+        _FakeDist("huggingface_hub", "0.36.0"),   # 下划线要归一成横线
+        _FakeDist("numpy", "1.26.4"),             # 不在名单里 → 不该出现
+    ])
+    got = ts.image_pinned_versions()
+    assert got == {
+        "transformers": "4.57.6",
+        "safetensors": "0.7.0",
+        "tokenizers": "0.22.2",
+        "huggingface-hub": "0.36.0",
+    }
+
+
+def test_image_pinned_versions_empty_on_nvidia(monkeypatch):
+    """非 DCU 一律不干预 —— NVIDIA 用户的安装行为逐字节不变。"""
+    monkeypatch.setattr(ts, "can_manage_torch_install", lambda: True)
+
+    def _boom():
+        raise AssertionError("NVIDIA 路径不该去读 base site-packages")
+
+    monkeypatch.setattr(ts, "_base_site_packages", _boom)
+    assert ts.image_pinned_versions() == {}
+
+
+def test_image_pinned_versions_empty_outside_venv(monkeypatch):
+    """不在 venv 里就没有「镜像版 vs venv 版」之分，返回空。"""
+    _fake_dcu(monkeypatch, in_venv=False)
+    assert ts.image_pinned_versions() == {}
+
+
+def test_image_pinned_versions_skips_packages_the_image_lacks(monkeypatch):
+    """镜像没预装的包不出现在结果里 —— 不该约束，让 pip 自由装。
+
+    这条是「约束」相对「删行」的关键优势：删行会让镜像没装该包的机器彻底装不上。
+    """
+    _fake_dcu(monkeypatch)
+    _fake_dists(monkeypatch, [_FakeDist("transformers", "4.57.6")])
+    assert ts.image_pinned_versions() == {"transformers": "4.57.6"}
+
+
+def test_image_pinned_versions_survives_broken_metadata(monkeypatch):
+    """元数据损坏时返回空而不是抛 —— 约束是加固，不该阻断安装。"""
+    _fake_dcu(monkeypatch)
+    import importlib.metadata as im
+
+    def _boom(path=None):
+        raise RuntimeError("metadata corrupt")
+
+    monkeypatch.setattr(im, "distributions", _boom)
+    assert ts.image_pinned_versions() == {}
+
+
+def test_write_dcu_constraints_writes_pins(monkeypatch, tmp_path):
+    """约束文件内容是 `name==version`，每包一行，且带说明注释。"""
+    monkeypatch.setattr(ts, "image_pinned_versions", lambda: {
+        "transformers": "4.57.6", "safetensors": "0.7.0",
+    })
+    dest = tmp_path / "sub" / "constraints.dcu.txt"
+    out = ts.write_dcu_constraints(dest)
+    assert out == dest and dest.is_file()          # 父目录要自动建
+    text = dest.read_text(encoding="utf-8")
+    assert "transformers==4.57.6" in text
+    assert "safetensors==0.7.0" in text
+    # 注释里要写明为什么，否则后人看到这个自动生成的文件会不敢动
+    assert text.lstrip().startswith("#")
+    assert "vllm" in text
+
+
+def test_write_dcu_constraints_returns_none_when_nothing_to_pin(monkeypatch, tmp_path):
+    """没什么要钉的时候**不建文件** —— 调用方据此决定是否传 -c。"""
+    monkeypatch.setattr(ts, "image_pinned_versions", lambda: {})
+    dest = tmp_path / "constraints.dcu.txt"
+    assert ts.write_dcu_constraints(dest) is None
+    assert not dest.exists()
+
+
+def test_pinned_set_covers_the_packages_that_bit_us():
+    """名单必须覆盖真机上被顶掉的那四个。
+
+    这条是回归守卫：v0.25.0 合并后真机 pip 把这四个全顶了，其中 transformers
+    4.x→5.x 与 huggingface_hub 0.x→1.x 都是破坏性大版本。
+    """
+    assert set(ts._DCU_IMAGE_PINNED) >= {
+        "transformers", "safetensors", "tokenizers", "huggingface-hub",
+    }
+    # 名字必须是 pip 的规范形式（小写、横线）—— image_pinned_versions 按此比对
+    for name in ts._DCU_IMAGE_PINNED:
+        assert name == name.lower().replace("_", "-"), f"{name} 不是规范包名"
