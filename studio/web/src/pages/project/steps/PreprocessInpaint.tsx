@@ -35,19 +35,6 @@ interface HistoryEntry {
   stroke: InpaintStroke
 }
 
-/** 「这张图没有历史」的**稳定**空数组。
- *
- *  必须是模块级常量，不能就地写 `?? []`：那样每次渲染都产生新数组引用，让下面
- *  依赖它的两个 useMemo 每次都重算，再让 InpaintCanvas 的
- *  `useEffect([strokes])` 每次都触发一次全画布重绘（clearRect + drawImage 整图
- *  + 合成两个图层）。选中一张还没画过的图时，父组件任何一次重渲染（调笔刷大小、
- *  切模式、图片列表刷新）都会白重绘一次。
- *
- *  ESLint 建议的「给 activeHistory 再包一层 useMemo」也能修，但要多一个 hook 才
- *  达到同样效果 —— 稳定常量更省，且意图更直白。
- */
-const EMPTY_HISTORY: readonly HistoryEntry[] = []
-
 interface BrushState {
   color: string
   size: number
@@ -124,14 +111,19 @@ export default function PreprocessInpaintPage() {
     () => images.find((im) => im.name === activeName) ?? null,
     [images, activeName],
   )
-  // 缺失时回落到模块级 EMPTY_HISTORY（不是就地 `?? []`）—— 见该常量的注释：
-  // 就地字面量每次渲染都是新引用，会击穿下面两个 useMemo 并触发画布全量重绘。
-  const activeHistory: readonly HistoryEntry[] = activeName
-    ? (historyByImage[activeName] ?? EMPTY_HISTORY)
-    : EMPTY_HISTORY
-  const activeRedo: readonly HistoryEntry[] = activeName
-    ? (redoByImage[activeName] ?? EMPTY_HISTORY)
-    : EMPTY_HISTORY
+  // useMemo 而不是就地 `?? []`：后者每次渲染都产生新数组引用，会击穿下面两个
+  // useMemo（activePaintStrokes / activeMaskStrokes），再让 InpaintCanvas 的
+  // `useEffect([strokes])` 每次都跑一遍全画布重绘（clearRect + drawImage 整图 +
+  // 合成两个图层）。选中一张还没画过的图时，父组件任何一次重渲染（调笔刷大小、
+  // 切模式、图片列表刷新）都会白重绘一次。
+  const activeHistory = useMemo(
+    () => (activeName ? (historyByImage[activeName] ?? []) : []),
+    [activeName, historyByImage],
+  )
+  const activeRedo = useMemo(
+    () => (activeName ? (redoByImage[activeName] ?? []) : []),
+    [activeName, redoByImage],
+  )
   const activePaintStrokes = useMemo(
     () => activeHistory.filter((h) => h.kind === 'paint').map((h) => h.stroke),
     [activeHistory],
