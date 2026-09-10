@@ -391,6 +391,42 @@ Toast must not duplicate an error already announced inside the modal. Toast feed
 above the modal layer when an operation keeps the dialog open. Do not recreate modal
 backdrops, panel geometry, focus listeners, or title linkage in feature code.
 
+### Background model prerequisites and direct-edit task setup
+
+Settings owns model acquisition and selection through the shared model-source
+information architecture. Domains with selectable runtime models use the same
+`SourceSelect`, `ModelSourceCard`, download/local registration, status, removal,
+and fallback conventions. A task setup modal may select among currently installed
+catalog rows, but it is not a second model manager: when nothing compatible is
+installed, provide concise recovery guidance to Settings instead of embedding
+download controls or logs. A failed enqueue clears busy immediately and provides
+a local retry path.
+
+Automatic head masking is the representative direct-edit adoption. Its low-emphasis
+`Auto mask` ghost action matches Crop's optional prefill action and sits immediately
+before Save all, with Save current remaining the primary last action. The shared Modal
+is a short form containing
+Recognition model, scope (all/current), confidence, padding and feather. It has no
+explanatory subtitle, embedded model card, progress/review region, or Advanced
+section; IoU remains an internal established default. Validation stays at each
+field. The footer owns Cancel and Start; successful enqueue closes setup and
+restores opener focus without interrupting the page-owned background job.
+
+Completed non-stale detections become grouped unsaved edits on each affected
+image's existing mask layer. Exact rectangular geometry and feathering render and
+export through the same path as brush/eraser edits, coexist with loaded masks and
+manual strokes, and contribute to existing dirty indicators. Each affected image
+receives one undoable/redoable automatic operation; Save current and Save all are
+the only persistence boundary. Successful no-head, failed, skipped, and stale
+images remain clean. Open setup remains available when unsaved edits exist so the
+Modal can explain the save prerequisite, but Start remains blocked. Completion copy
+reports only applicable non-zero outcomes in plain user language; there is no proposal
+selection, bounding-box overlay, persistent review/log panel, Apply, or protected Undo
+in this UI; compatible legacy endpoints may remain.
+Project/version/job identity guards async completion, and unsaved edits block a new
+run. Only the matching preprocess stage can supply task state. After incorporation,
+the editor switches to Training mask and brush mode so users can correct results.
+
 ## 11. Overlay-drawer contract
 
 Use `Drawer` for an interruptive task that slides above the current workspace while

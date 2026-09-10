@@ -529,6 +529,8 @@ class ModelsConfig(BaseModel):
     - `selected_upscaler`：预处理默认放大器。可为预设 label（如 "4x-AnimeSharp"）
       或自定义/上传的文件名（如 "my-anime-model.pth"）。空串/None → 用
       DEFAULT_UPSCALER 兜底。
+    - `selected_head_detector`：自动遮罩默认识别模型。`builtin` 指固定校验模型，
+      也可为 detector 目录中的已登记下载文件名或已登记本地 ONNX 绝对路径。
     - `auto_sync_paths`：fork 预设到 version 时，是否自动用全局模型路径覆盖
       预设里的 4 个模型字段（transformer / vae / text_encoder / t5_tokenizer）。
       ON（默认）→ 多数用户：永不碰 4 字段，fork 始终用 Settings 全局值；
@@ -548,6 +550,7 @@ class ModelsConfig(BaseModel):
     # computed_field 保留旧客户端读面。
     custom: dict[str, list[str]] = Field(default_factory=dict)
     selected_upscaler: str = "4x-AnimeSharp"
+    selected_head_detector: str = "builtin"
     auto_sync_paths: bool = True
 
     @model_validator(mode="before")
@@ -708,7 +711,9 @@ class ProxyConfig(BaseModel):
 
 # 按类型分别选下载源的 key（双源类型）。固定 HF 的（cltagger / t5 / taeflux）
 # 不在此列，路由强制 HF。training = anima 主+VAE + qwen3 + t5 这一整组训练前置。
-DOWNLOAD_SOURCE_TYPES: tuple[str, ...] = ("training", "wd14", "upscaler")
+DOWNLOAD_SOURCE_TYPES: tuple[str, ...] = (
+    "training", "wd14", "upscaler", "head_detector",
+)
 DOWNLOAD_SOURCE_VALUES: tuple[str, ...] = ("huggingface", "modelscope")
 
 

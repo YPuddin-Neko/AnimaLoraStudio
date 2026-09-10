@@ -215,6 +215,25 @@ describe('Preprocess upscale controls', () => {
     expect(screen.queryByRole('radio', { name: '512² – 768² (0)' })).not.toBeInTheDocument()
   })
 
+  it.each(['crop', 'head_mask'])('does not display or cancel a %s job returned by an old/unfiltered server', async (stage) => {
+    vi.mocked(api.getPreprocessStatusTrain).mockResolvedValue({ job: { ...job, params_decoded: { stage } }, log_tail: 'foreign stage log', summary: { image_count: 2 } })
+    renderPage()
+    await ready()
+    expect(api.getPreprocessStatusTrain).toHaveBeenCalledWith(1, 2, 'upscale')
+    expect(screen.queryByText('foreign stage log')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '取消' })).not.toBeInTheDocument()
+    expect(api.cancelJob).not.toHaveBeenCalled()
+  })
+
+  it('recovers and cancels historical missing-stage upscale only', async () => {
+    const user = userEvent.setup()
+    vi.mocked(api.getPreprocessStatusTrain).mockResolvedValue({ job, log_tail: 'legacy upscale log', summary: { image_count: 2 } })
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: '取消' }))
+    expect(api.cancelJob).toHaveBeenCalledWith(job.id)
+    expect(screen.getByText('legacy upscale log')).toBeInTheDocument()
+  })
+
   it('does not offer downloading a missing custom model', async () => {
     vi.mocked(api.getModelsCatalog).mockResolvedValue(catalog([variant('Local', false, 'custom')]))
     renderPage()

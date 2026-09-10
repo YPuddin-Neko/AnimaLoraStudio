@@ -7,6 +7,15 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
+describe('preprocess stage status', () => {
+  it.each([undefined, 'upscale', 'crop', 'head_mask'] as const)('preserves optional stage %s in the request URL', async (stage) => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    await api.getPreprocessStatusTrain(2, 3, stage)
+    expect(fetchMock.mock.calls[0][0]).toBe(`/api/projects/2/versions/3/preprocess/status${stage ? `?stage=${stage}` : ''}`)
+  })
+})
+
 describe('request headers', () => {
   it('keeps JSON content type when a conditional mutation supplies If-Match', async () => {
     const fetchMock = vi.fn().mockResolvedValue(new Response('{}', {

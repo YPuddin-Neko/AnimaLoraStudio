@@ -1,3 +1,4 @@
+import { ownsPreprocessJob } from '../../../lib/preprocessJob'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useOutletContext } from 'react-router-dom'
@@ -77,10 +78,22 @@ type Device = 'auto' | 'cuda' | 'cpu'
 const DEFAULT_TARGET_EDGE = 1024
 
 export default function PreprocessPage() {
+  const { project, activeVersion } = useOutletContext<Ctx>()
+  return <StageWorkspace key={`${project.id}:${activeVersion?.id ?? 0}`} />
+}
+
+function StageWorkspace() {
   const { t } = useTranslation()
   const { project, activeVersion, reload } = useOutletContext<Ctx>()
   const { toast } = useToast()
   const vid = activeVersion?.id ?? 0
+  const mounted = useRef(true)
+  const statusRequest = useRef(0)
+  useEffect(() => {
+    mounted.current = true
+    statusRequest.current++
+    return () => { mounted.current = false }
+  }, [])
 
   const [files, setFiles] = useState<FilesView | null>(null)
   const [status, setStatus] = useState<Status | null>(null)
@@ -112,7 +125,7 @@ export default function PreprocessPage() {
     if (!vid) return
     try {
       const r = await api.listPreprocessFilesTrain(project.id, vid)
-      setFiles(r)
+      if (mounted.current) setFiles(r)
     } catch {
       /* ignore */
     }
@@ -121,7 +134,11 @@ export default function PreprocessPage() {
   const refreshStatus = useCallback(async () => {
     if (!vid) return
     try {
-      const r = await api.getPreprocessStatusTrain(project.id, vid)
+      const request = ++statusRequest.current
+      const response = await api.getPreprocessStatusTrain(project.id, vid, 'upscale')
+      if (!mounted.current || request !== statusRequest.current) return
+      const r = ownsPreprocessJob(response.job, project.id, vid, 'upscale')
+        ? response : { ...response, job: null, log_tail: '' }
       setStatus(r)
       // 回放（issue #251）：进页面 / SSE 重连时用 log_tail 恢复日志；
       // 同一 job 且本地已有 SSE 积累时不覆盖（tail 只有 50 行，比本地短）。
@@ -141,6 +158,7 @@ export default function PreprocessPage() {
   const refreshUpscaler = useCallback(async () => {
     try {
       const cat = await api.getModelsCatalog()
+      if (!mounted.current) return
       const variants = cat.upscalers?.variants ?? []
       setAllUpscalers(variants)
       const current = cat.upscalers?.current
@@ -155,7 +173,7 @@ export default function PreprocessPage() {
     try {
       await api.selectUpscaler(label)
     } catch (e) {
-      toast(String(e), 'error')
+      if (mounted.current) toast(String(e), 'error')
       void refreshUpscaler()
     }
   }, [refreshUpscaler, toast])
@@ -169,6 +187,7 @@ export default function PreprocessPage() {
   const jobIdRef = useRef<number | null>(null)
   jobIdRef.current = status?.job?.id ?? null
   useEventStream((evt) => {
+    if (!mounted.current) return
     const jid = jobIdRef.current
     if (evt.type === 'job_log_appended' && jid && evt.job_id === jid) {
       setLogs((prev) => [...prev, String(evt.text ?? '')])
@@ -300,12 +319,13 @@ export default function PreprocessPage() {
     setDownloadingModel(true)
     try {
       await api.startModelDownload({ model_id: 'upscaler', variant: selectedModel })
+      if (!mounted.current) return
       toast(t('preprocess.downloadingModel', { model: selectedModel }), 'success')
       setTimeout(() => void refreshUpscaler(), 1500)
     } catch (e) {
-      toast(String(e), 'error')
+      if (mounted.current) toast(String(e), 'error')
     } finally {
-      setDownloadingModel(false)
+      if (mounted.current) setDownloadingModel(false)
     }
   }
 
@@ -330,6 +350,7 @@ export default function PreprocessPage() {
     } else {
       target_area = targetEdge * targetEdge
     }
+    statusRequest.current++
     setBusy(true)
     try {
       const j = await api.startPreprocessTrain(project.id, vid, {
@@ -340,6 +361,9 @@ export default function PreprocessPage() {
         device,
         target_area,
       })
+      if (!mounted.current) return
+      statusRequest.current++
+      jobIdRef.current = j.id
       setLogs([])
       setStatus((prev) => ({
         job: j,
@@ -350,19 +374,20 @@ export default function PreprocessPage() {
       setSel(new Set())
       setSelAnchor(null)
     } catch (e) {
-      toast(String(e), 'error')
+      if (mounted.current) toast(String(e), 'error')
     } finally {
-      setBusy(false)
+      if (mounted.current) setBusy(false)
     }
   }
 
   const cancel = async () => {
-    if (!job) return
+    if (!ownsPreprocessJob(job, project.id, vid, 'upscale')) return
     try {
       await api.cancelJob(job.id)
+      if (!mounted.current) return
       toast(t('preprocess.canceled'), 'success')
     } catch (e) {
-      toast(String(e), 'error')
+      if (mounted.current) toast(String(e), 'error')
     }
   }
 

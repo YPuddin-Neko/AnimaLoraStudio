@@ -210,13 +210,17 @@ def latest_for(
     project_id: int,
     kind: str,
     version_id: Optional[int] = None,
+    stage: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
-    """取该项目（+ 可选 version）下最近一条指定 kind 的作业。"""
+    """Latest matching job; absent preprocess stage means historical upscale."""
     sql = "SELECT * FROM tasks WHERE project_id = ? AND task_type = ?"
     params: list[Any] = [project_id, kind]
     if version_id is not None:
         sql += " AND version_id = ?"
         params.append(version_id)
+    if stage is not None:
+        sql += " AND COALESCE(json_extract(params, '$.stage'), 'upscale') = ?"
+        params.append(stage)
     sql += " ORDER BY id DESC LIMIT 1"
     row = conn.execute(sql, params).fetchone()
     return as_job(db._row_to_dict(row))

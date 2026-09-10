@@ -1074,6 +1074,10 @@ export default function TrainPage() {
             projectId={project.id}
             activeVersion={activeVersion}
             config={config}
+            onEnableMaskedLoss={() => {
+              if (!config) return
+              setConfigSync({ ...config, masked_loss: true })
+            }}
             reg={reg}
             regError={regError}
             onRetryReg={refreshReg}

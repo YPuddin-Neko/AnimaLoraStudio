@@ -602,6 +602,8 @@ export interface ModelsConfig {
   /** 预处理默认放大器：预设 label（"4x-AnimeSharp" 等）或 custom 文件名
    * （"my-anime.pth"）。Preprocess 页和 worker 用它定权重路径。 */
   selected_upscaler: string
+  /** 自动遮罩默认识别模型：builtin、managed filename 或 registered local path。 */
+  selected_head_detector: string
 }
 
 export interface QueueConfig {
@@ -868,7 +870,7 @@ export interface EvalMetricsCatalog {
 
 export interface ModelDownloadStatus {
   key: string
-  status: 'pending' | 'running' | 'done' | 'failed'
+  status: 'pending' | 'running' | 'done' | 'failed' | 'canceled'
   started_at: number
   finished_at: number | null
   message: string
@@ -940,6 +942,22 @@ export interface UpscalersCatalog {
   variants: UpscalerVariant[]
 }
 
+export interface HeadDetectorCatalog extends ModelFileStatus {
+  id: 'head_detector'
+  name: string
+  description: string
+  repo: string
+  revision: string
+  target_path: string
+  target_dir: string
+  default: string
+  current: string
+  expected_size: number
+  expected_sha256: string
+  valid: boolean
+  sha256?: string
+}
+
 export interface FamilySwitchChange {
   field: string
   from: unknown
@@ -975,6 +993,7 @@ export interface ModelsCatalog {
   /** 评估指标 registry（Settings 复选框列表）。 */
   eval_metric_catalog?: EvalMetricCatalogItem[]
   upscalers?: UpscalersCatalog
+  head_detector?: HeadDetectorCatalog
   /** 统一来源候选行（泛化候选卡消费；键 = domain：wd14 / eval_clip / ...）。 */
   model_sources?: Record<string, ModelSourceRow[]>
   /** 按类型的下载源选项：current = 当前选中，available = 可选源（长度 1 = 固定单源）。 */
@@ -1152,6 +1171,58 @@ export interface InpaintSaveResult {
   size: number
   w: number
   h: number
+}
+
+export interface HeadMaskRegion {
+  id: string
+  score: number
+  /** Source-image pixel coordinates: x1, y1, x2, y2. */
+  box: [number, number, number, number]
+  mask_region: {
+    x1: number; y1: number; x2: number; y2: number
+    feather_x: number; feather_y: number
+  }
+}
+
+export interface HeadMaskProposalImage {
+  name: string
+  /** Absent only on legacy v1 proposal JSON. */
+  status?: 'done' | 'failed' | 'skipped'
+  error?: { code: string; message: string } | null
+  size: [number, number] | null
+  source_mtime_ns: number | null
+  source_file_size: number | null
+  regions: HeadMaskRegion[]
+  stale: boolean
+  stale_reason: string | null
+}
+
+export interface HeadMaskProposals {
+  schema_version: number
+  status?: 'complete' | 'partial'
+  succeeded?: number
+  failed?: number
+  skipped?: number
+  job_id: number
+  model: {
+    /** Catalog identity used for this job (absent on legacy v1 results). */
+    identity?: string
+    revision: string
+    path: string
+    input_size: [number, number]
+    provider: string
+    builtin?: boolean
+  }
+  parameters: {
+    confidence: number
+    iou_threshold: number
+    padding_ratio: number
+    feather_ratio: number
+  }
+  created_at: number
+  images: HeadMaskProposalImage[]
+  stale_count: number
+  undo_available: boolean
 }
 
 /** 总览页「已删除」tab 一项：被去重审核标记的 entry。物理图仍在 download/{source}。 */
@@ -2459,6 +2530,11 @@ export const api = {
       method: 'DELETE',
       body: JSON.stringify(cand),
     }),
+  selectHeadDetector: (identity: string) =>
+    req<{ selected: string }>('/api/head-detectors/select', {
+      method: 'POST',
+      body: JSON.stringify({ identity }),
+    }),
   selectUpscaler: (label: string) =>
     req<{ selected: string }>('/api/upscalers/select', {
       method: 'POST',
@@ -2674,12 +2750,12 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(body),
     }),
-  getPreprocessStatusTrain: (pid: number, vid: number) =>
+  getPreprocessStatusTrain: (pid: number, vid: number, stage?: 'upscale' | 'crop' | 'head_mask') =>
     req<{
       job: Job | null
       log_tail: string
       summary: { image_count: number }
-    }>(`/api/projects/${pid}/versions/${vid}/preprocess/status`),
+    }>(`/api/projects/${pid}/versions/${vid}/preprocess/status${stage ? `?stage=${stage}` : ''}`),
   listPreprocessFilesTrain: (pid: number, vid: number) =>
     req<{
       images: TrainImage[]
@@ -2764,6 +2840,37 @@ export const api = {
     req<{ deleted: boolean }>(
       `/api/projects/${pid}/versions/${vid}/preprocess/mask?name=${encodeURIComponent(name)}`,
       { method: 'DELETE' },
+    ),
+  startHeadMaskDetection: (
+    pid: number,
+    vid: number,
+    body: {
+      scope: 'all' | 'selected'
+      filenames?: string[]
+      model?: string
+      confidence: number
+      iou_threshold: number
+      padding_ratio: number
+      feather_ratio: number
+    },
+  ) => req<Job>(
+    `/api/projects/${pid}/versions/${vid}/preprocess/head-mask/detect`,
+    { method: 'POST', body: JSON.stringify(body) },
+  ),
+  getHeadMaskProposals: (pid: number, vid: number, jobId: number) =>
+    req<HeadMaskProposals>(
+      `/api/projects/${pid}/versions/${vid}/preprocess/head-mask/proposals/${jobId}`,
+    ),
+  applyHeadMaskProposals: (
+    pid: number, vid: number, jobId: number, selections: Record<string, string[]>,
+  ) => req<{ job_id: number; applied: number; images: string[]; undo_available: boolean }>(
+    `/api/projects/${pid}/versions/${vid}/preprocess/head-mask/apply`,
+    { method: 'POST', body: JSON.stringify({ job_id: jobId, selections }) },
+  ),
+  undoHeadMaskApply: (pid: number, vid: number, jobId: number) =>
+    req<{ job_id: number; undone: number; images: string[] }>(
+      `/api/projects/${pid}/versions/${vid}/preprocess/head-mask/undo`,
+      { method: 'POST', body: JSON.stringify({ job_id: jobId }) },
     ),
 
   // R-5 台账合并：/api/jobs* 已删，作业与任务同源 /api/queue（单一 ID 空间）。

@@ -287,12 +287,13 @@ def test_wd14_cannot_drop_current_model_id(secrets_file: Path) -> None:
 
 
 def test_download_sources_default_seeds_huggingface(secrets_file: Path) -> None:
-    """默认（无旧全局源）→ 三个双源类型都种子为 huggingface。"""
+    """默认（无旧全局源）→ 所有双源类型都种子为 huggingface。"""
     s = secrets.load()
     assert s.download_sources == {
         "training": "huggingface",
         "wd14": "huggingface",
         "upscaler": "huggingface",
+        "head_detector": "huggingface",
     }
 
 
@@ -306,6 +307,7 @@ def test_download_sources_migrate_from_legacy_global(secrets_file: Path) -> None
     assert s.download_sources["training"] == "modelscope"
     assert s.download_sources["wd14"] == "modelscope"
     assert s.download_sources["upscaler"] == "modelscope"
+    assert s.download_sources["head_detector"] == "modelscope"
 
 
 def test_download_sources_explicit_override_not_clobbered_by_legacy(secrets_file: Path) -> None:
@@ -320,6 +322,7 @@ def test_download_sources_explicit_override_not_clobbered_by_legacy(secrets_file
     s = secrets.load()
     assert s.download_sources["training"] == "huggingface"  # 显式保留
     assert s.download_sources["wd14"] == "modelscope"        # 未设 → 继承旧全局
+    assert s.download_sources["head_detector"] == "modelscope"
 
 
 def test_download_sources_persist_and_normalize(secrets_file: Path) -> None:

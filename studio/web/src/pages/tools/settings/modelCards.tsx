@@ -3,17 +3,16 @@ import type { TFunction } from 'i18next'
 import { useTranslation } from 'react-i18next'
 import {
   api,
-  type ModelDownloadStatus,
   type ModelsCatalog,
   type ModelSourceCandidate,
   type ModelSourceRow,
 } from '../../../api/client'
-import { InfoButton } from '../../../components/InfoButton'
 import PathPicker from '../../../components/PathPicker'
 import { useToast } from '../../../components/Toast'
 import { useSettingsData } from '../../../lib/SettingsData'
 import { fmtBytes, textInputClass } from './constants'
 import { SettingsField, SettingsInput } from './fields'
+import { ModelGroupCard, ModelStatusBadge, DownloadButton } from '../../../components/models/ModelDownload'
 
 // ── HFEndpointSelect ────────────────────────────────────────────────────────
 //
@@ -92,6 +91,7 @@ export function SourceSelect({ opt, onChange }: {
       helpTooltip={single ? <p>{t('settings.singleSourceFixed')}</p> : undefined}
     >
       <select
+        aria-label={t('settings.downloadSource')}
         value={opt.current}
         disabled={single}
         onChange={(e) => onChange(e.target.value)}
@@ -211,6 +211,7 @@ export function ModelSourceCard({
               isSel ? 'bg-selected-soft border border-selected' : 'bg-transparent border border-transparent'
             }`}>
               <input type="radio" name={`source_${domain}`} checked={isSel} disabled={!canSelect}
+                aria-label={row.label}
                 onChange={() => onSelect(row.value, row)}
                 className="shrink-0"
                 style={{ accentColor: 'var(--accent)' }}
@@ -353,79 +354,4 @@ export function ModelSourceCard({
   )
 }
 
-export function ModelGroupCard({
-  title, helpTooltip, children,
-}: {
-  title: string
-  helpTooltip?: React.ReactNode
-  children: React.ReactNode
-}) {
-  return (
-    <div className="rounded-sm border border-subtle bg-sunken p-2.5">
-      <h4 className="text-xs font-semibold text-fg-primary mb-1.5 flex items-center gap-2">
-        <span>{title}</span>
-        {helpTooltip && <InfoButton>{helpTooltip}</InfoButton>}
-      </h4>
-      {children}
-    </div>
-  )
-}
-
-export function ModelStatusBadge({ exists, size, status, fileCount, existsCount }: {
-  exists: boolean; size: number; status?: ModelDownloadStatus['status']; fileCount?: number; existsCount?: number
-}) {
-  const { t } = useTranslation()
-  if (status === 'running') {
-    return <StatusLabel bg="bg-warn-soft" fg="text-warn" text={t('settings.downloadInProgress')} pulse />
-  }
-  if (status === 'failed') {
-    return <StatusLabel bg="bg-err-soft" fg="text-err" text={t('status.failed')} />
-  }
-  if (exists) {
-    return <StatusLabel bg="bg-ok-soft" fg="text-ok" text={`✓ ${fmtBytes(size)}${fileCount !== undefined ? ` (${existsCount}/${fileCount})` : ''}`} />
-  }
-  if (fileCount !== undefined && existsCount! > 0) {
-    return <StatusLabel bg="bg-warn-soft" fg="text-warn" text={t('settings.partialFiles', { exists: existsCount, total: fileCount })} />
-  }
-  return <StatusLabel bg="bg-overlay" fg="text-fg-tertiary" text={t('settings.notDownloaded')} />
-}
-
-export function StatusLabel({ bg, fg, text, pulse }: { bg: string; fg: string; text: string; pulse?: boolean }) {
-  return (
-    <span className={`text-xs px-1.5 py-0.5 rounded-sm font-mono ${bg} ${fg}`}
-      style={pulse ? { animation: 'pulse 1.5s infinite' } : undefined}
-    >{text}</span>
-  )
-}
-
-/** 已下载资产的「删除」按钮（下载的逆操作：用户先删再下载）。 */
-export function DeleteAssetButton({ onClick }: { onClick: () => void }) {
-  const { t } = useTranslation()
-  return (
-    <button onClick={onClick} className="btn btn-ghost btn-sm min-w-[5rem] justify-center"
-      title={t('settings.deleteAssetTitle')}>
-      🗑 {t('settings.deleteAsset')}
-    </button>
-  )
-}
-
-export function DownloadButton({ exists, status, busy, onClick, onDelete }: {
-  exists: boolean; status?: ModelDownloadStatus['status']; busy: boolean; onClick: () => void
-  /** 已下载状态的 action：删除（用户先删再下载）。 */
-  onDelete: () => void
-}) {
-  const { t } = useTranslation()
-  const running = status === 'running' || busy
-  if (running) {
-    return <button disabled className="btn btn-secondary btn-sm min-w-[5rem] justify-center" style={{ opacity: 0.5 }}>...</button>
-  }
-  if (exists) {
-    return <DeleteAssetButton onClick={onDelete} />
-  }
-  return (
-    <button onClick={onClick} className="btn btn-secondary btn-sm min-w-[5rem] justify-center"
-      title={t('common.download')}>
-      {t('settings.downloadAction')}
-    </button>
-  )
-}
+export { ModelGroupCard, ModelStatusBadge, DownloadButton, DeleteAssetButton, StatusLabel } from '../../../components/models/ModelDownload'

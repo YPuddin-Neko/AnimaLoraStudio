@@ -245,6 +245,45 @@ describe('Train workbench', () => {
     expect(within(screen.getByRole('group', { name: '训练摘要' })).getByText('≈ 15')).toBeInTheDocument()
   })
 
+  it('enables masked loss from the dataset warning when masks are present', async () => {
+    vi.mocked(api.getVersionConfig).mockResolvedValue({
+      has_config: true, config: { ...config, masked_loss: false },
+    } as never)
+    vi.mocked(api.listCropWorkspaceTrain).mockResolvedValue({
+      images: [{ name: '1_data/a.png', mask_mtime: 123 }],
+    } as never)
+    const user = userEvent.setup()
+    renderPage()
+
+    expect(await screen.findByText(/训练集有 1 张图带 mask/)).toBeInTheDocument()
+    const enable = screen.getByRole('button', { name: '一键启用' })
+    expect(enable).toBeEnabled()
+    await user.click(enable)
+
+    await waitFor(() => {
+      expect(api.putVersionConfig).toHaveBeenCalledWith(
+        7,
+        11,
+        expect.objectContaining({ masked_loss: true }),
+      )
+    }, { timeout: 2000 })
+  })
+
+  it('disables masked-loss enablement while NaViT packing is active', async () => {
+    vi.mocked(api.getVersionConfig).mockResolvedValue({
+      has_config: true,
+      config: { ...config, masked_loss: false, navit_packing: true },
+    } as never)
+    vi.mocked(api.listCropWorkspaceTrain).mockResolvedValue({
+      images: [{ name: '1_data/a.png', mask_mtime: 123 }],
+    } as never)
+    renderPage()
+
+    expect(await screen.findByText(/请先关闭 Leap 或 NaViT Packing/)).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '一键启用' })).toBeDisabled()
+    expect(api.putVersionConfig).not.toHaveBeenCalled()
+  })
+
   it('uses pack estimates instead of ordinary batch size for NaViT', async () => {
     vi.mocked(api.getVersionConfig).mockResolvedValue({
       has_config: true, config: { ...config, navit_packing: true, batch_size: 99, grad_accum: 2 },

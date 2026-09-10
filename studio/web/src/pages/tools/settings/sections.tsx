@@ -441,6 +441,85 @@ export function UpscalerSection({
   )
 }
 
+export function HeadDetectorSection({
+  catalog, setSource, reloadCatalog, t,
+}: {
+  catalog: ModelsCatalog | null
+  setSource: (type: string, source: string) => Promise<void>
+  reloadCatalog: () => Promise<ModelsCatalog | null>
+  t: TFunction
+}) {
+  const { toast } = useToast()
+  const { runSave } = useSettingsData()
+
+  const pickDetector = async (identity: string) => {
+    try {
+      await runSave(() => api.selectHeadDetector(identity))
+      toast(t('settings.defaultHeadDetector', { name: identity }), 'success')
+      await reloadCatalog()
+    } catch (e) {
+      toast(String(e), 'error')
+    }
+  }
+
+  return (
+    <SettingsSection id="head-detector" title={t('settings.headDetectorTitle')}>
+      <SourceSelect
+        opt={catalog?.download_source_options?.head_detector}
+        onChange={(source) => void setSource('head_detector', source)}
+      />
+      {!catalog ? (
+        <p className="text-fg-tertiary text-xs">{t('common.loading')}</p>
+      ) : (
+        <div className="flex flex-col gap-2">
+          <ModelSourceCard
+            domain="head_detector"
+            title={t('settings.availableHeadDetectors')}
+            helpTooltip={(
+              <>
+                <p><Trans i18nKey="settings.headDetectorsHelpPath" values={{ path: catalog.head_detector?.target_dir }} components={{ code: <code /> }} /></p>
+                <p>{t('settings.headDetectorsHelpDefault')}</p>
+                <p><Trans i18nKey="settings.customHeadDetectorHelpTypes" components={{ code: <code /> }} /></p>
+              </>
+            )}
+            catalog={catalog}
+            currentValue={catalog.head_detector?.current ?? ''}
+            onSelect={(value) => void pickDetector(value)}
+            addDownload={{
+              filenameField: true,
+              repoPlaceholder: 'owner/anime-head-detector',
+              filenamePlaceholder: 'anime-head-v2.onnx',
+            }}
+            addLocal={{}}
+            selectRequiresExists
+            t={t}
+          />
+
+          {Object.values(catalog.downloads).filter((download) => download.key.startsWith('head_detector') && (download.status === 'running' || download.status === 'failed')).length > 0 && (
+            <details className="text-xs">
+              <summary className="cursor-pointer text-fg-tertiary">{t('settings.headDetectorDownloadLogs')}</summary>
+              <div className="mt-1 flex flex-col gap-2">
+                {Object.values(catalog.downloads).filter((download) => download.key.startsWith('head_detector')).map((download) => (
+                  <div key={download.key} className="rounded-sm border border-subtle bg-sunken p-2">
+                    <div className="flex items-center gap-2 mb-1">
+                      <code className="font-mono text-fg-secondary">{download.key}</code>
+                      <ModelStatusBadge exists={download.status === 'done'} size={0} status={download.status} />
+                      {download.message && <span className="text-err overflow-hidden text-ellipsis whitespace-nowrap">{download.message}</span>}
+                    </div>
+                    <pre className="text-xs font-mono text-fg-tertiary max-h-32 overflow-auto whitespace-pre-wrap m-0">
+                      {download.log_tail.join('\n') || t('settings.emptyLog')}
+                    </pre>
+                  </div>
+                ))}
+              </div>
+            </details>
+          )}
+        </div>
+      )}
+    </SettingsSection>
+  )
+}
+
 // ── Tag 翻译词典：上传 / 恢复默认 / 全局 chip toggle ──────────────────────
 
 export function TagDictionarySection() {

@@ -1,3 +1,4 @@
+import { ownsPreprocessJob } from '../../../lib/preprocessJob'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Link, useOutletContext } from 'react-router-dom'
@@ -66,10 +67,22 @@ function genRectId(): string {
 }
 
 export default function PreprocessCropPage() {
+  const { project, activeVersion } = useOutletContext<Ctx>()
+  return <StageWorkspace key={`${project.id}:${activeVersion?.id ?? 0}`} />
+}
+
+function StageWorkspace() {
   const { t } = useTranslation()
   const { project, activeVersion, reload } = useOutletContext<Ctx>()
   const { toast } = useToast()
   const vid = activeVersion?.id ?? 0
+  const mounted = useRef(true)
+  const statusRequest = useRef(0)
+  useEffect(() => {
+    mounted.current = true
+    statusRequest.current++
+    return () => { mounted.current = false }
+  }, [])
 
   // ────── Workspace data ──────
   const [images, setImages] = useState<CropWorkspaceItem[]>([])
@@ -79,11 +92,12 @@ export default function PreprocessCropPage() {
     if (!vid) return
     try {
       const r = await api.listCropWorkspaceTrain(project.id, vid)
+      if (!mounted.current) return
       setImages([...r.images].sort((a, b) => compareImagePath(a.name, b.name)))
     } catch {
       /* ignore */
     } finally {
-      setLoading(false)
+      if (mounted.current) setLoading(false)
     }
   }, [project.id, vid])
 
@@ -131,7 +145,11 @@ export default function PreprocessCropPage() {
   const refreshJobStatus = useCallback(async () => {
     if (!vid) return
     try {
-      const r = await api.getPreprocessStatusTrain(project.id, vid)
+      const request = ++statusRequest.current
+      const response = await api.getPreprocessStatusTrain(project.id, vid, 'crop')
+      if (!mounted.current || request !== statusRequest.current) return
+      const r = ownsPreprocessJob(response.job, project.id, vid, 'crop')
+        ? response : { ...response, job: null, log_tail: '' }
       const rid = r.job?.id ?? null
       setJob(r.job)
       setLogs((prev) =>
@@ -149,6 +167,7 @@ export default function PreprocessCropPage() {
   useEffect(() => { void refreshJobStatus() }, [refreshJobStatus])
 
   useEventStream((evt) => {
+    if (!mounted.current) return
     const jid = jobIdRef.current
     if (evt.type === 'job_log_appended' && jid && evt.job_id === jid) {
       setLogs((prev) => [...prev, String(evt.text ?? '')])
@@ -170,13 +189,14 @@ export default function PreprocessCropPage() {
   }, { onOpen: () => void refreshJobStatus() })
 
   const cancelJob = useCallback(async () => {
-    if (!job) return
+    if (!ownsPreprocessJob(job, project.id, vid, 'crop')) return
     try {
       await api.cancelJob(job.id)
+      if (!mounted.current) return
     } catch (e) {
-      toast(String(e), 'error')
+      if (mounted.current) toast(String(e), 'error')
     }
-  }, [job, toast])
+  }, [job, toast, project.id, vid])
 
   // ────── Derived ──────
   const arLock = useMemo<{ w: number; h: number } | null>(() => {
@@ -331,16 +351,20 @@ export default function PreprocessCropPage() {
       toast(t('preprocessCrop.toastNoCrops'), 'error')
       return
     }
+    statusRequest.current++
     setBusy(true)
     try {
       const j = await api.startPreprocessCropTrain(project.id, vid, payload)
+      if (!mounted.current) return
+      statusRequest.current++
+      jobIdRef.current = j.id
       setJob(j)
       setLogs([])
       toast(t('preprocessCrop.toastStarted', { id: j.id }), 'success')
     } catch (e) {
-      toast(String(e), 'error')
+      if (mounted.current) toast(String(e), 'error')
     } finally {
-      setBusy(false)
+      if (mounted.current) setBusy(false)
     }
   }, [cropsByImage, activeName, project.id, vid, toast, t])
 

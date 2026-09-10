@@ -20,6 +20,7 @@ from fastapi import APIRouter
 
 from ..schemas.models import (
     FamilySwitchRequest,
+    HeadDetectorSelectRequest,
     ModelDownloadRequest,
     ModelSourceCandidateRequest,
 )
@@ -35,6 +36,29 @@ router = APIRouter()
 def get_models_catalog() -> dict[str, Any]:
     """前端设置页 Models 区块用：列已知模型 + 各自磁盘状态 + 当前下载状态。"""
     return model_downloader.build_catalog()
+
+
+@router.post("/api/head-detectors/select")
+def select_head_detector(body: HeadDetectorSelectRequest) -> dict[str, Any]:
+    """Persist a validated installed detector identity as the global default."""
+    identity = body.identity.strip()
+    try:
+        resolved, _path, builtin = model_downloader.resolve_head_detector(identity)
+        if builtin and not model_downloader.head_detector_status().get("valid"):
+            raise ValueError(
+                "built-in head detector is not installed or failed integrity validation"
+            )
+    except ValueError as exc:
+        raise ValidationError(
+            f"Invalid head detector: {exc}",
+            code="head_detector.invalid",
+            details={"identity": identity},
+            http_status=400,
+        ) from exc
+    current = secrets.load()
+    models = current.models.model_copy(update={"selected_head_detector": resolved})
+    secrets.save(current.model_copy(update={"models": models}))
+    return {"selected": resolved}
 
 
 @router.get("/api/models/path-defaults")
@@ -143,7 +167,7 @@ def _source_domains() -> set[str]:
 
     return (
         set(secrets.MODEL_SOURCE_REPO_DOMAINS)
-        | {"upscaler"}
+        | {"upscaler", "head_detector"}
         | set(FAMILY_ASSETS.keys())
     )
 
@@ -185,7 +209,11 @@ def _require_dir_with(p: Path, required: tuple[str, ...]) -> None:
 def _validate_candidate(domain: str, cand: "secrets.SourceCandidate") -> None:
     """简单校验（D3）：格式 / 存在性 / 域结构；运行时报错兜底。"""
     from ...services.models.families import FAMILY_ASSETS
-    from ...services.models.paths import UPSCALER_EXTS, WD14_FILES
+    from ...services.models.paths import (
+        UPSCALER_EXTS,
+        WD14_FILES,
+        head_detector_custom_target,
+    )
 
     if cand.kind == "download":
         if not _REPO_ID_RE.match(cand.repo):
@@ -195,8 +223,13 @@ def _validate_candidate(domain: str, cand: "secrets.SourceCandidate") -> None:
                 details={"repo": cand.repo}, http_status=400,
             )
         # 单文件资产必须带 filename + 后缀白名单；目录型资产不接受 filename
-        if domain == "upscaler" or domain in FAMILY_ASSETS:
-            exts = UPSCALER_EXTS if domain == "upscaler" else (".safetensors",)
+        if domain in {"upscaler", "head_detector"} or domain in FAMILY_ASSETS:
+            if domain == "upscaler":
+                exts = UPSCALER_EXTS
+            elif domain == "head_detector":
+                exts = (".onnx",)
+            else:
+                exts = (".safetensors",)
             name = Path(cand.filename).name
             if not name or not name.lower().endswith(exts):
                 raise ValidationError(
@@ -204,6 +237,14 @@ def _validate_candidate(domain: str, cand: "secrets.SourceCandidate") -> None:
                     code="file.ext_invalid",
                     details={"types": " / ".join(exts)}, http_status=400,
                 )
+            if domain == "head_detector":
+                try:
+                    head_detector_custom_target(name)
+                except ValueError as exc:
+                    raise ValidationError(
+                        str(exc), code="model_source.filename_reserved",
+                        details={"filename": name}, http_status=400,
+                    ) from exc
         elif cand.filename:
             raise ValidationError(
                 "This model type downloads a whole repository (no file name)",
@@ -228,6 +269,8 @@ def _validate_candidate(domain: str, cand: "secrets.SourceCandidate") -> None:
             p, ("model_feat.onnx", "model_metrics.onnx", "metrics.json"))
     elif domain == "upscaler":
         _require_file(p, UPSCALER_EXTS)
+    elif domain == "head_detector":
+        _require_file(p, (".onnx",))
     elif domain == "cltagger":
         _require_file(p, (".onnx",))
         mapping = cand.extra.get("tag_mapping_path", "")
@@ -288,6 +331,10 @@ def _selected_value_reset(domain: str, removed: "secrets.SourceCandidate") -> di
         if getattr(s.eval_metrics, field) == removed_value:
             default = secrets.EvalMetricModelsConfig.model_fields[field].default
             return {"eval_metrics": {field: default}}
+    if domain == "head_detector":
+        sel = s.models.selected_head_detector
+        if sel and sel in (removed_value, removed.filename):
+            return {"models": {"selected_head_detector": "builtin"}}
     if domain == "upscaler":
         sel = s.models.selected_upscaler
         if sel and sel in (removed_value, removed.filename):

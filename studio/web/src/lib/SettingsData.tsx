@@ -61,6 +61,7 @@ interface SettingsData {
   catalogError: string | null
   reloadCatalog: () => Promise<ModelsCatalog | null>
   downloadBusy: Set<string>
+  downloadErrors: Record<string, string>
   startDownload: (model_id: string, variant?: string) => Promise<void>
   /** 下载的逆操作（confirm → DELETE → 刷 catalog），下载中心各区共用。 */
   deleteAsset: (model_id: string, variant: string | undefined, name: string) => Promise<void>
@@ -78,6 +79,16 @@ export function SettingsDataProvider({ children }: { children: ReactNode }) {
   const [catalog, setCatalog] = useState<ModelsCatalog | null>(null)
   const [catalogError, setCatalogError] = useState<string | null>(null)
   const [downloadBusy, setDownloadBusy] = useState<Set<string>>(new Set())
+  const [downloadErrors, setDownloadErrors] = useState<Record<string, string>>({})
+  const [headRequested, setHeadRequested] = useState(false)
+  const mounted = useRef(true)
+  const catalogRequest = useRef(0)
+  const starting = useRef(new Set<string>())
+  useEffect(() => {
+    mounted.current = true
+    catalogRequest.current++
+    return () => { mounted.current = false }
+  }, [])
   const [saveStatus, setSaveStatus] = useState<SaveStatus>({ state: 'idle' })
   // 串行 PUT 队列 + in-flight 计数：保证顺序避免后端读改写竞态。
   const saveQueueRef = useRef<Promise<unknown>>(Promise.resolve())
@@ -98,13 +109,17 @@ export function SettingsDataProvider({ children }: { children: ReactNode }) {
   useEffect(() => { void reloadSecrets() }, [reloadSecrets])
 
   const reloadCatalog = useCallback(async (): Promise<ModelsCatalog | null> => {
+    const request = ++catalogRequest.current
     try {
       const c = await api.getModelsCatalog()
+      if (!mounted.current || request !== catalogRequest.current) return null
       setCatalog(c)
       setCatalogError(null)
+      const headStatus = c.downloads.head_detector?.status
+      if (headStatus && !['pending', 'running'].includes(headStatus)) setHeadRequested(false)
       return c
     } catch (e) {
-      setCatalogError(String(e))
+      if (mounted.current && request === catalogRequest.current) setCatalogError(String(e))
       return null
     }
   }, [])
@@ -116,27 +131,73 @@ export function SettingsDataProvider({ children }: { children: ReactNode }) {
   // 不会让 startDownload 的 await 抛错。这里在 failed 时弹一个 error toast，
   // 把后端汇总的可操作 message 顶到用户面前——否则用户只看到卡片上一个红 badge，
   // 原因埋在另一个 tab 的折叠「下载日志」里（甚至只在终端）。
+  // Only the head-detector adoption needs recovery polling. SSE remains primary;
+  // a stalled/disconnected transfer gets six retreating checks, then manual retry.
+  const headStatus = catalog?.downloads.head_detector?.status
+  const headActive = headRequested || headStatus === 'pending' || headStatus === 'running'
+  useEffect(() => {
+    if (!headActive) return
+    let active = true
+    let timer: ReturnType<typeof setTimeout>
+    let attempt = 0
+    const delays = [1500, 3000, 6000, 10000, 15000, 30000]
+    const schedule = () => {
+      if (!active || attempt >= delays.length) return
+      timer = setTimeout(async () => {
+        const c = await reloadCatalog()
+        const status = c?.downloads.head_detector?.status
+        if (status && !['pending', 'running'].includes(status)) return
+        schedule()
+      }, delays[attempt++])
+    }
+    schedule()
+    return () => { active = false; clearTimeout(timer) }
+  }, [headActive, reloadCatalog])
+
   useEventStream((evt) => {
     if (evt.type !== 'model_download_changed') return
+    if (evt.key === 'head_detector' && ['done', 'failed', 'canceled'].includes(String(evt.status))) {
+      // Terminal SSE stops recovery even when the subsequent catalog read fails.
+      setHeadRequested(false)
+      setCatalog((previous) => {
+        const download = previous?.downloads.head_detector
+        if (!previous || !download) return previous
+        return { ...previous, downloads: { ...previous.downloads, head_detector: {
+          ...download, status: evt.status as typeof download.status,
+        } } }
+      })
+    }
     void reloadCatalog().then((c) => {
-      if (evt.status !== 'failed' || !c) return
+      if (!mounted.current || evt.status !== 'failed' || !c) return
       const key = String(evt.key ?? '')
+      // Head detector reports errors next to the shared retry action, not twice.
+      if (key === 'head_detector') return
       const dl = c.downloads[key]
       toast(dl?.message || t('settings.downloadFailed', { error: key }), 'error')
     })
-  })
+  }, { onOpen: () => { void reloadCatalog() } })
 
   const startDownload = useCallback(async (model_id: string, variant?: string) => {
     const key = variant ? `${model_id}:${variant}` : model_id
+    if (starting.current.has(key)) return
+    starting.current.add(key)
+    setDownloadErrors((s) => ({ ...s, [key]: '' }))
     setDownloadBusy((s) => new Set(s).add(key))
     try {
       await api.startModelDownload({ model_id, variant })
-      toast(t('settings.downloadStarted', { name: key }), 'success')
+      if (!mounted.current) return
+      if (key === 'head_detector') setHeadRequested(true)
+      else toast(t('settings.downloadStarted', { name: key }), 'success')
       await reloadCatalog()
     } catch (e) {
-      toast(String(e), 'error')
+      if (!mounted.current) return
+      if (key === 'head_detector') {
+        setHeadRequested(false)
+        setDownloadErrors((s) => ({ ...s, [key]: String(e) }))
+      } else toast(String(e), 'error')
     } finally {
-      setDownloadBusy((s) => { const n = new Set(s); n.delete(key); return n })
+      starting.current.delete(key)
+      if (mounted.current) setDownloadBusy((s) => { const n = new Set(s); n.delete(key); return n })
     }
   }, [reloadCatalog, t, toast])
 
@@ -209,7 +270,7 @@ export function SettingsDataProvider({ children }: { children: ReactNode }) {
     <Ctx.Provider value={{
       secrets, secretsError, setSecrets, reloadSecrets, commitSecrets, runSave, saveStatus,
       catalog, catalogError, reloadCatalog,
-      downloadBusy, startDownload, deleteAsset, setDownloadSource,
+      downloadBusy, downloadErrors, startDownload, deleteAsset, setDownloadSource,
     }}>
       {children}
     </Ctx.Provider>

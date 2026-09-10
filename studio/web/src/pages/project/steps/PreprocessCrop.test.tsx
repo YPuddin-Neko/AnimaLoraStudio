@@ -36,7 +36,7 @@ const image: CropWorkspaceItem = {
   mtime: 1, size: 100, processed: false, mask_mtime: null,
 }
 const job: Job = {
-  id: 7, project_id: 1, version_id: 2, kind: 'preprocess', params: '{}',
+  id: 7, project_id: 1, version_id: 2, kind: 'preprocess', params: '{}', params_decoded: { stage: 'crop' },
   status: 'running', started_at: null, finished_at: null, pid: null,
   log_path: null, error_msg: null,
 }
@@ -90,6 +90,24 @@ describe('Preprocess crop contracts', () => {
     expect(api.startPreprocessCropTrain).toHaveBeenCalledWith(1, 2, {
       '1_data/a.png': [{ x: 0.1, y: 0.2, w: 0.5, h: 0.6, label: '裁剪 1' }],
     })
+  })
+
+  it.each(['upscale', 'head_mask', undefined])('filters foreign or legacy stage %s before displaying logs/cancel', async (stage) => {
+    vi.mocked(api.getPreprocessStatusTrain).mockResolvedValue({ job: { ...job, params_decoded: stage ? { stage } : {} }, log_tail: 'foreign stage log', summary: { image_count: 1 } })
+    renderPage()
+    await screen.findByRole('group', { name: '裁剪工作集图片' })
+    expect(api.getPreprocessStatusTrain).toHaveBeenCalledWith(1, 2, 'crop')
+    expect(screen.queryByText('foreign stage log')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '取消' })).not.toBeInTheDocument()
+    expect(api.cancelJob).not.toHaveBeenCalled()
+  })
+
+  it('cancels only the matching crop job', async () => {
+    const user = userEvent.setup()
+    vi.mocked(api.getPreprocessStatusTrain).mockResolvedValue({ job, log_tail: 'crop log', summary: { image_count: 1 } })
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: '取消' }))
+    expect(api.cancelJob).toHaveBeenCalledWith(job.id)
   })
 
   it('keeps cluster cancel non-submitting and submits the modal with Enter', async () => {

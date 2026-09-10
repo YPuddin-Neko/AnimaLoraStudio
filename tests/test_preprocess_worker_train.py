@@ -6,10 +6,13 @@
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 from PIL import Image
+
+from studio import secrets
 
 from studio.infrastructure.task_log import NULL_LOG
 from studio.services.projects import projects
@@ -42,6 +45,180 @@ def _silence(*_args, **_kwargs) -> None:
 
 def _make_image(path: Path, size: tuple[int, int] = (200, 100), color=(255, 0, 0)) -> None:
     Image.new("RGB", size, color).save(path, format="PNG")
+
+
+# ---------------------------------------------------------------------------
+# _run_head_mask_train: proposal-only behavior and failure paths
+# ---------------------------------------------------------------------------
+
+
+def test_head_mask_train_preserves_corrupt_image_in_partial_result(
+    env, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    good = env["sub"] / "A.png"
+    bad = env["sub"] / "B.png"
+    _make_image(good)
+    bad.write_bytes(b"not an image")
+    monkeypatch.setattr(worker.model_downloader, "head_detector_status", lambda: {"valid": True})
+    monkeypatch.setattr(worker.model_downloader, "head_detector_target", lambda: tmp_path / "model.onnx")
+    monkeypatch.setattr(worker.head_mask, "result_path", lambda _jid: tmp_path / "result.json")
+    monkeypatch.setattr(worker.head_mask, "write_result", lambda _jid, value: (tmp_path / "result.json").write_text(__import__("json").dumps(value), encoding="utf-8"))
+
+    class Detector:
+        provider = "CPUExecutionProvider"
+
+        def __init__(self, _path):
+            pass
+
+        def detect(self, path, **_kwargs):
+            with Image.open(path) as image:
+                return image.size, [{"score": 0.9, "box": [10, 10, 50, 50]}]
+
+    monkeypatch.setattr(worker.head_mask, "HeadDetector", Detector)
+    events: list[tuple[str, dict]] = []
+    rc = worker._run_head_mask_train(
+        44, env["project"], env["version"], {"scope": "all"}, NULL_LOG,
+        lambda event, **payload: events.append((event, payload)),
+    )
+    assert rc == 0
+    result = __import__("json").loads((tmp_path / "result.json").read_text(encoding="utf-8"))
+    assert [item["name"] for item in result["images"]] == ["1_data/A.png", "1_data/B.png"]
+    assert [item["status"] for item in result["images"]] == ["done", "failed"]
+    assert result["images"][1]["regions"] == []
+    assert result["images"][1]["error"] == {
+        "code": "detection_failed", "message": "Head detection failed for this image.",
+    }
+    assert result["status"] == "partial"
+    assert (result["succeeded"], result["failed"], result["skipped"]) == (1, 1, 0)
+    assert [payload["status"] for event, payload in events if event == "head_mask_progress"] == ["done", "fail"]
+    assert not (env["sub"] / "A.mask").exists()
+
+
+def test_head_mask_train_custom_identity_resolves_into_result_metadata(
+    env, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _make_image(env["sub"] / "A.png")
+    models_root = tmp_path / "models"
+    custom = models_root / "preprocess" / "head_detector" / "custom.onnx"
+    custom.parent.mkdir(parents=True)
+    custom.write_bytes(b"onnx")
+    secrets_file = tmp_path / "secrets.json"
+    secrets_file.write_text(json.dumps({
+        "models": {"root": str(models_root)},
+        "model_sources": {"head_detector": [{
+            "kind": "download", "repo": "owner/detector", "filename": "custom.onnx",
+        }]},
+    }), encoding="utf-8")
+    monkeypatch.setattr(secrets, "SECRETS_FILE", secrets_file)
+
+    loaded_paths: list[Path] = []
+
+    class Detector:
+        provider = "CPUExecutionProvider"
+
+        def __init__(self, path):
+            loaded_paths.append(path)
+
+        def detect(self, path, **_kwargs):
+            with Image.open(path) as image:
+                return image.size, []
+
+    result: dict = {}
+    monkeypatch.setattr(worker.head_mask, "HeadDetector", Detector)
+    monkeypatch.setattr(
+        worker.head_mask, "write_result",
+        lambda _job_id, value: result.update(value),
+    )
+
+    assert worker._run_head_mask_train(
+        48, env["project"], env["version"], {"model": "custom.onnx"},
+        NULL_LOG, _silence,
+    ) == 0
+    assert loaded_paths == [custom]
+    assert result["model"] == {
+        "identity": "custom.onnx",
+        "path": str(custom),
+        "input_size": [640, 640],
+        "provider": "CPUExecutionProvider",
+        "built_in": False,
+    }
+
+
+@pytest.mark.parametrize(
+    "outcomes, expected_status, counts",
+    [
+        (["failed", "failed"], "partial", (0, 2, 0)),
+        (["done", "skipped"], "partial", (1, 0, 1)),
+        (["skipped"], "partial", (0, 0, 1)),
+        (["done"], "complete", (1, 0, 0)),
+    ],
+)
+def test_head_mask_train_outcomes(env, monkeypatch, tmp_path, outcomes, expected_status, counts):
+    names = [f"1_data/{idx}.png" for idx in range(len(outcomes))]
+    for name, outcome in zip(names, outcomes):
+        if outcome != "skipped":
+            _make_image(env["sub"] / Path(name).name)
+    monkeypatch.setattr(worker.preprocess, "resolve_targets_train", lambda *_a, **_k: names)
+    monkeypatch.setattr(worker.model_downloader, "head_detector_status", lambda: {"valid": True})
+    monkeypatch.setattr(worker.model_downloader, "head_detector_target", lambda: tmp_path / "model.onnx")
+    monkeypatch.setattr(worker.head_mask, "result_path", lambda _jid: tmp_path / "result.json")
+
+    class Detector:
+        provider = "CPUExecutionProvider"
+
+        def __init__(self, _path):
+            pass
+
+        def detect(self, path, **_kwargs):
+            if outcomes[int(path.stem)] == "failed":
+                raise RuntimeError("secret-token at C:/private/image.png\nunsafe")
+            return (200, 100), []
+
+    monkeypatch.setattr(worker.head_mask, "HeadDetector", Detector)
+    events = []
+    assert worker._run_head_mask_train(
+        47, env["project"], env["version"], {}, NULL_LOG,
+        lambda event, **payload: events.append(payload),
+    ) == 0
+    result = worker.head_mask.load_result(47)
+    assert [item["name"] for item in result["images"]] == names
+    assert [item["status"] for item in result["images"]] == outcomes
+    assert all(item["regions"] == [] for item in result["images"])
+    assert result["status"] == expected_status
+    assert (result["succeeded"], result["failed"], result["skipped"]) == counts
+    assert "secret-token" not in str(result) + str(events)
+    assert not list(env["sub"].glob("*.mask"))
+
+
+def test_head_mask_train_cancel_saves_no_partial_result(
+    env, monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    _make_image(env["sub"] / "A.png")
+    monkeypatch.setattr(worker.model_downloader, "head_detector_status", lambda: {"valid": True})
+    monkeypatch.setattr(worker.model_downloader, "head_detector_target", lambda: tmp_path / "model.onnx")
+    monkeypatch.setattr(worker.head_mask, "HeadDetector", lambda _path: type("Detector", (), {"provider": "CPUExecutionProvider"})())
+    monkeypatch.setattr(worker, "_stop_requested", True)
+    wrote = False
+
+    def capture_write(*_args):
+        nonlocal wrote
+        wrote = True
+
+    monkeypatch.setattr(worker.head_mask, "write_result", capture_write)
+    rc = worker._run_head_mask_train(
+        45, env["project"], env["version"], {"scope": "all"}, NULL_LOG, _silence,
+    )
+    assert rc == 130
+    assert wrote is False
+
+
+def test_head_mask_train_rejects_missing_model(env, monkeypatch: pytest.MonkeyPatch) -> None:
+    _make_image(env["sub"] / "A.png")
+    monkeypatch.setattr(worker.model_downloader, "head_detector_status", lambda: {"valid": False})
+    rc = worker._run_head_mask_train(
+        46, env["project"], env["version"], {"scope": "all"}, NULL_LOG, _silence,
+    )
+    assert rc == 1
 
 
 # ---------------------------------------------------------------------------

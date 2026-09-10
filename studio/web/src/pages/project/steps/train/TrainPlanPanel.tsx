@@ -112,6 +112,7 @@ export default function TrainPlanPanel({
   projectId,
   activeVersion,
   config,
+  onEnableMaskedLoss,
   reg,
   regError,
   onRetryReg,
@@ -126,6 +127,7 @@ export default function TrainPlanPanel({
   projectId: number
   activeVersion: Version | null
   config: ConfigData | null
+  onEnableMaskedLoss: () => void
   reg: RegStatus | null
   regError: string | null
   onRetryReg: () => void | Promise<void>
@@ -177,6 +179,7 @@ export default function TrainPlanPanel({
               reg={reg}
               config={config}
               plan={plan}
+              onEnableMaskedLoss={onEnableMaskedLoss}
             />
           </div>
         ) : <p className="m-0 text-sm text-fg-secondary">{t('train.noConfigHint')}</p>}
@@ -362,12 +365,20 @@ export function useTrainDatasetPlan({
 
 export type TrainDatasetPlan = ReturnType<typeof useTrainDatasetPlan>
 
-function DatasetStatsPanel({ projectId, activeVersion, reg, config, plan }: {
+function DatasetStatsPanel({
+  projectId,
+  activeVersion,
+  reg,
+  config,
+  plan,
+  onEnableMaskedLoss,
+}: {
   projectId: number
   activeVersion: Version | null
   reg: RegStatus | null
   config: ConfigData | null
   plan: TrainDatasetPlan
+  onEnableMaskedLoss: () => void
 }) {
   const { t } = useTranslation()
   const {
@@ -463,18 +474,22 @@ function DatasetStatsPanel({ projectId, activeVersion, reg, config, plan }: {
         projectId={projectId}
         vid={activeVersion?.id ?? 0}
         maskedLoss={config?.masked_loss === true}
+        blocked={config?.leap_enabled === true || config?.navit_packing === true}
+        onEnable={onEnableMaskedLoss}
       />
     </div>
   )
 }
 
-/** 训练集有 mask 但 masked_loss 关闭时的提示（决策 D7：只提示不代开）。 */
+/** 训练集有 mask 但 masked_loss 关闭时的提示；允许在互斥规则许可时一键启用。 */
 function MaskedLossHint({
-  projectId, vid, maskedLoss,
+  projectId, vid, maskedLoss, blocked, onEnable,
 }: {
   projectId: number
   vid: number
   maskedLoss: boolean
+  blocked: boolean
+  onEnable: () => void
 }) {
   const { t } = useTranslation()
   const [maskCount, setMaskCount] = useState(0)
@@ -511,9 +526,18 @@ function MaskedLossHint({
 
   if (maskCount === 0 || maskedLoss) return null
   return (
-    <div className="rounded-md border border-subtle bg-surface px-3 py-2.5 text-xs text-fg-secondary leading-relaxed">
+    <Alert
+      tone="warning"
+      size="sm"
+      action={(
+        <Button variant="primary" size="sm" disabled={blocked} onClick={onEnable}>
+          {t('train.enableMaskedLoss')}
+        </Button>
+      )}
+    >
       {t('train.maskedLossHint', { n: maskCount })}
-    </div>
+      {blocked && ` ${t('train.maskedLossEnableBlocked')}`}
+    </Alert>
   )
 }
 

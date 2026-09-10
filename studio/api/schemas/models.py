@@ -30,5 +30,9 @@ class ModelSourceCandidateRequest(BaseModel):
     extra: dict[str, str] = Field(default_factory=dict)
 
 
+class HeadDetectorSelectRequest(BaseModel):
+    identity: str  # builtin、managed .onnx filename、registered local absolute path
+
+
 class UpscalerSelectRequest(BaseModel):
     label: str   # 预设 key、custom 文件名或本地绝对路径

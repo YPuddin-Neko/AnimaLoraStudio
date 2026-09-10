@@ -147,7 +147,7 @@ const initialServerState = {
     blacklist_tags: [],
     batch_size: 8,
   },
-  models: { root: null, selected: { anima: '1.0', krea2: 'raw' }, selected_anima: '1.0', custom_anima_paths: [], selected_upscaler: '4x-AnimeSharp', auto_sync_paths: true },
+  models: { root: null, selected: { anima: '1.0', krea2: 'raw' }, selected_anima: '1.0', custom_anima_paths: [], selected_upscaler: '4x-AnimeSharp', selected_head_detector: 'builtin', auto_sync_paths: true },
   queue: { light_tasks_during_train: true },
   download_source: 'huggingface',
   modelscope: { token: '' },
@@ -286,10 +286,19 @@ const emptyModelsCatalog = {
       },
     ],
   },
+  head_detector: {
+    id: 'head_detector', name: 'Anime Head Detector', description: 'test',
+    repo: 'deepghs/anime_head_detection', revision: '06604f',
+    target_path: '/tmp/anima/preprocess/head_detector/model.onnx',
+    target_dir: '/tmp/anima/preprocess/head_detector', default: 'builtin', current: 'builtin',
+    expected_size: 1024, expected_sha256: 'sha', valid: true,
+    exists: true, size: 1024, mtime: 1,
+  },
   download_source_options: {
     training: { current: 'huggingface', available: ['huggingface', 'modelscope'] },
     wd14: { current: 'huggingface', available: ['huggingface', 'modelscope'] },
     upscaler: { current: 'huggingface', available: ['huggingface', 'modelscope'] },
+    head_detector: { current: 'modelscope', available: ['huggingface', 'modelscope'] },
     cltagger: { current: 'huggingface', available: ['huggingface'] },
     taeflux: { current: 'huggingface', available: ['huggingface'] },
   },
@@ -330,6 +339,21 @@ const emptyModelsCatalog = {
     eval_dino: [],
     eval_ccip: [],
     upscaler: [],
+    head_detector: [
+      {
+        kind: 'preset', candidate: null, value: 'builtin', label: 'Anime Head Detector',
+        description: 'pinned', download_id: 'head_detector', download_variant: null,
+        status_key: 'head_detector', exists: true, size: 1024, files: null,
+        size_estimate: 1024, is_current: true, removable: false, deletable: true, extra: {},
+      },
+      {
+        kind: 'local', candidate: { kind: 'local', path: '/tmp/custom.onnx' },
+        value: '/tmp/custom.onnx', label: 'custom.onnx', description: '',
+        download_id: null, download_variant: null, status_key: null, exists: true,
+        size: 512, files: null, size_estimate: 0, is_current: false,
+        removable: true, deletable: false, extra: {},
+      },
+    ],
     anima: [],
     krea2: [
       {
@@ -489,6 +513,29 @@ function renderPage({ withDrawerControls = false } = {}) {
 }
 
 describe('SettingsPage (PP0)', () => {
+  it('gives head detectors the same source, candidate, selection, and add actions as upscalers', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: '预处理' }))
+
+    const heading = await screen.findByRole('heading', { name: '头部检测器（自动遮罩）' })
+    const section = heading.closest('section')!
+    expect(within(section).getByLabelText('下载源')).toHaveValue('modelscope')
+    expect(within(section).getByText('Anime Head Detector')).toBeInTheDocument()
+    expect(within(section).getByText('custom.onnx')).toBeInTheDocument()
+    const addDownload = within(section).getByRole('button', { name: /添加下载/ })
+    expect(addDownload).toBeInTheDocument()
+    expect(within(section).getByRole('button', { name: /添加本地文件/ })).toBeInTheDocument()
+    await user.click(addDownload)
+    expect(within(section).getByPlaceholderText('anime-head-v2.onnx')).toBeInTheDocument()
+
+    await user.click(within(section).getAllByRole('radio')[1])
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) =>
+      String(url).includes('/api/head-detectors/select')
+      && init?.method === 'POST'
+      && JSON.parse(String(init.body)).identity === '/tmp/custom.onnx')).toBe(true))
+  })
+
   it('waits for drawer readiness before positioning a deep-linked section', async () => {
     const user = userEvent.setup()
     renderPage({ withDrawerControls: true })
@@ -728,9 +775,9 @@ describe('SettingsPage (PP0)', () => {
     // 统一候选卡（D2）：local 行带「本地」徽标 + 状态 badge + × 移除（不删文件），
     // 永远没有删除文件按钮
     expect(within(customRow!).getByText('本地')).toBeInTheDocument()
-    expect(customRow!.querySelector('.bg-ok-soft')).not.toBeNull()
+    expect(customRow!.querySelector('.badge-ok')).not.toBeNull()
     expect(within(customRow!).getByTitle('从列表移除（不删除文件）')).toBeInTheDocument()
-    expect(within(customRow!).queryByText(/🗑/)).not.toBeInTheDocument()
+    expect(within(customRow!).queryByRole('button', { name: '删除' })).not.toBeInTheDocument()
     // 主模型 3（raw/turbo/custom）+ TE variant 卡 2（bf16/fp8）
     expect(screen.getAllByRole('radio')).toHaveLength(5)
     expect(screen.queryByText(/推荐工作流/)).not.toBeInTheDocument()

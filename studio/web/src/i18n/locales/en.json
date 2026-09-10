@@ -1180,6 +1180,16 @@
     "notDownloaded": "Not downloaded",
     "downloadAction": "⤓ Download",
     "upscalersPreprocess": "Upscalers (preprocess)",
+    "headDetectorTitle": "Head detector (automatic masks)",
+    "headDetectorHelp": "Creates cartoon-head masks on the preprocess inpaint page. The built-in weight is pinned and SHA-256 verified; compatible custom ONNX models are validated at runtime.",
+    "headDetectorRevision": "Pinned revision {{revision}}",
+    "headDetectorCorrupt": "The local file failed size or SHA-256 verification. Downloading again replaces the damaged file first.",
+    "availableHeadDetectors": "Available head detectors",
+    "headDetectorsHelpPath": "Detector files are stored in <code>{{path}}</code>.",
+    "headDetectorsHelpDefault": "The selected radio item is the default recognition model used by Auto mask.",
+    "customHeadDetectorHelpTypes": "Download or register a compatible <code>.onnx</code> detector using the current YOLO tensor contract.",
+    "defaultHeadDetector": "Default head detector: {{name}}",
+    "headDetectorDownloadLogs": "Head detector download logs",
     "availableUpscalers": "Available upscalers",
     "upscalersHelpPath": "Preprocess uses upscaling for small images. Files are stored in <code>{{path}}</code>.",
     "upscalersHelpDefault": "The selected radio item is the default model used by the preprocess page. custom comes from the form below or previous custom downloads.",
@@ -2265,8 +2275,8 @@
   "preprocessInpaint": {
     "subtitle": "Cover text and clutter, or draw a mask used only during training",
     "actionsLabel": "Inpaint save actions",
-    "saveActive": "Save current edits",
-    "saveAll": "Save all edits ({{n}})",
+    "saveActive": "Save current",
+    "saveAll": "Save all ({{n}})",
     "panelTitle": "Inpaint settings",
     "modeLabel": "Mode",
     "mode": {
@@ -2281,7 +2291,7 @@
     "clearActive": "Discard current edits",
     "filter": {
       "all": "All",
-      "pending": "Unchanged",
+      "pending": "Clean",
       "edited": "Unsaved"
     },
     "filterLabel": "Filter by unsaved state",
@@ -2290,7 +2300,8 @@
     "filmstripEmpty": {
       "all": "Workspace is empty.",
       "pending": "Every image has unsaved changes.",
-      "edited": "No unsaved changes."
+      "edited": "No unsaved changes.",
+      "undetected": "Every detected image has at least one head."
     },
     "loading": "Loading workspace...",
     "emptyWorkspace": "Workspace is empty,",
@@ -2314,7 +2325,39 @@
     "toastNotReady": "Image is still loading",
     "toastSaved": "Saved {{name}}",
     "toastSavedAll": "Saved {{n}} images",
-    "toastSavedAllPartial": "Done: {{ok}} saved, {{failed}} failed"
+    "toastSavedAllPartial": "Done: {{ok}} saved, {{failed}} failed",
+    "headMask": {
+      "title": "Automatic head mask",
+      "openSetup": "Auto mask",
+      "runningAction": "Auto masking…",
+      "unavailableSaving": "Saving is in progress. Start Auto mask when it finishes.",
+      "unavailableRunning": "Auto mask is already running.",
+      "unavailableEmpty": "There are no images to process.",
+      "recognitionModel": "Recognition model",
+      "modelRecovery": "No compatible detector is installed. Add or download one in Settings → Preprocess.",
+      "scope": "Detection scope",
+      "scopeAll": "All images",
+      "scopeCurrent": "Current image",
+      "start": "Start",
+      "confidence": "Confidence",
+      "padding_ratio": "Padding",
+      "feather_ratio": "Feather",
+      "invalidRange": "Enter a valid number between {{min}} and {{max}}.",
+      "parameterHelp": "About {{name}}",
+      "confidenceHelp": "Higher confidence reduces false positives but can miss small heads. Default: 0.413.",
+      "padding_ratioHelp": "Expand each box relative to its width and height. Default: 0.10 (10%).",
+      "feather_ratioHelp": "Transition around mask edges. Default: 0.03 (3%).",
+      "saveFirst": "{{n}} image(s) have unsaved edits. Save them before starting Auto mask.",
+      "detectFailed": "Auto mask failed. Check the task details and try again.",
+      "detectCanceled": "Auto mask was canceled; no mask edits were added.",
+      "completed": "Auto mask complete — images changed: {{images}}; masks added: {{heads}}.",
+      "completedNone": "No head masks were added.",
+      "completedWithIssues": "{{summary}} Not applied: {{issues}}.",
+      "issueFailed": "detection failed: {{n}}",
+      "issueSkipped": "skipped: {{n}}",
+      "issueStale": "source changed: {{n}}",
+      "issueSeparator": ", "
+    }
   },
   "steps": {
     "download": {
@@ -2701,7 +2744,9 @@
     "navitDistDownscaled": "{{n}} imgs exceeded the token budget and were downscaled.",
     "navitDistMore": "… {{kinds}} more sizes, {{n}} imgs total",
     "navitBucketHint": "NaViT packing: buckets only quantize sizes; batching packs across buckets by token budget — batch_size is not involved.",
-    "maskedLossHint": "{{n}} training image(s) have masks (Inpaint · Mask) but masked_loss is off — this run will not use them. Enable masked_loss in the loss group to apply.",
+    "maskedLossHint": "{{n}} training image(s) have masks (Inpaint · Mask) but masked_loss is off — this run will not use them.",
+    "enableMaskedLoss": "Enable now",
+    "maskedLossEnableBlocked": "Turn off Leap or NaViT Packing first; both are incompatible with spatial masks.",
     "confirmReset": "Reset config to preset {{name}}? All customizations on the current version will be lost.",
     "resetOkText": "Reset",
     "resetSuccess": "Reset to preset {{name}} config",
