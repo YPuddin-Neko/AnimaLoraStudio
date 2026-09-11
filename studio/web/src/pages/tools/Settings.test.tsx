@@ -6,7 +6,7 @@ import { DialogProvider } from '../../components/Dialog'
 import { ToastProvider } from '../../components/Toast'
 import { AnnouncementsProvider } from '../../lib/Announcements'
 import { SettingsDataProvider } from '../../lib/SettingsData'
-import { SettingsDrawerProvider } from '../../lib/SettingsDrawer'
+import { SettingsDrawerProvider, useSettingsDrawer } from '../../lib/SettingsDrawer'
 import SettingsPage from './Settings'
 
 const initialServerState = {
@@ -57,6 +57,10 @@ const initialServerState = {
         id: 'style_json',
         label: '画风 LoRA JSON',
         builtin: true,
+        etag: 'sha256:style',
+        origin: 'builtin',
+        credential_ref: '',
+        credential_configured: false,
         base_url: '',
         api_key: '',
         model: '',
@@ -87,6 +91,10 @@ const initialServerState = {
         id: 'joycaption',
         label: 'JoyCaption（vLLM 本地）',
         builtin: true,
+        etag: 'sha256:joy',
+        origin: 'builtin',
+        credential_ref: '',
+        credential_configured: false,
         base_url: 'http://localhost:8000/v1',
         api_key: '',
         model: 'fancyfeast/llama-joycaption-beta-one-hf-llava',
@@ -139,7 +147,7 @@ const initialServerState = {
     blacklist_tags: [],
     batch_size: 8,
   },
-  models: { root: null, selected: { anima: '1.0', krea2: 'raw' }, selected_anima: '1.0', custom_anima_paths: [], selected_upscaler: '4x-AnimeSharp', auto_sync_paths: true },
+  models: { root: null, selected: { anima: '1.0', krea2: 'raw' }, selected_anima: '1.0', custom_anima_paths: [], selected_upscaler: '4x-AnimeSharp', selected_head_detector: 'builtin', auto_sync_paths: true },
   queue: { light_tasks_during_train: true },
   download_source: 'huggingface',
   modelscope: { token: '' },
@@ -278,10 +286,19 @@ const emptyModelsCatalog = {
       },
     ],
   },
+  head_detector: {
+    id: 'head_detector', name: 'Anime Head Detector', description: 'test',
+    repo: 'deepghs/anime_head_detection', revision: '06604f',
+    target_path: '/tmp/anima/preprocess/head_detector/model.onnx',
+    target_dir: '/tmp/anima/preprocess/head_detector', default: 'builtin', current: 'builtin',
+    expected_size: 1024, expected_sha256: 'sha', valid: true,
+    exists: true, size: 1024, mtime: 1,
+  },
   download_source_options: {
     training: { current: 'huggingface', available: ['huggingface', 'modelscope'] },
     wd14: { current: 'huggingface', available: ['huggingface', 'modelscope'] },
     upscaler: { current: 'huggingface', available: ['huggingface', 'modelscope'] },
+    head_detector: { current: 'modelscope', available: ['huggingface', 'modelscope'] },
     cltagger: { current: 'huggingface', available: ['huggingface'] },
     taeflux: { current: 'huggingface', available: ['huggingface'] },
   },
@@ -322,6 +339,21 @@ const emptyModelsCatalog = {
     eval_dino: [],
     eval_ccip: [],
     upscaler: [],
+    head_detector: [
+      {
+        kind: 'preset', candidate: null, value: 'builtin', label: 'Anime Head Detector',
+        description: 'pinned', download_id: 'head_detector', download_variant: null,
+        status_key: 'head_detector', exists: true, size: 1024, files: null,
+        size_estimate: 1024, is_current: true, removable: false, deletable: true, extra: {},
+      },
+      {
+        kind: 'local', candidate: { kind: 'local', path: '/tmp/custom.onnx' },
+        value: '/tmp/custom.onnx', label: 'custom.onnx', description: '',
+        download_id: null, download_variant: null, status_key: null, exists: true,
+        size: 512, files: null, size_estimate: 0, is_current: false,
+        removable: true, deletable: false, extra: {},
+      },
+    ],
     anima: [],
     krea2: [
       {
@@ -358,7 +390,17 @@ beforeEach(() => {
   vi.stubGlobal('fetch', fetchMock)
   fetchMock.mockReset()
   fetchMock.mockImplementation((url: string, init?: RequestInit) => {
-    if (init?.method === 'PUT') {
+    if (init?.method === 'POST' && String(url).includes('/models/refresh')) {
+      return Promise.resolve(new Response(JSON.stringify({
+        items: ['model-a'], preset_id: 'joycaption', preset_etag: 'sha256:joy',
+      }), { status: 200 }))
+    }
+    if (init?.method === 'PUT' && String(url).includes('/api/llm-tagger/presets/default')) {
+      return Promise.resolve(
+        new Response(JSON.stringify({ default_preset_id: JSON.parse(String(init.body)).id }), { status: 200 })
+      )
+    }
+    if (init?.method === 'PATCH') {
       const body = JSON.parse(String(init.body)) as Record<
         string,
         Record<string, unknown>
@@ -441,7 +483,17 @@ afterEach(() => {
   vi.unstubAllGlobals()
 })
 
-function renderPage() {
+function DrawerTestControls() {
+  const drawer = useSettingsDrawer()
+  return (
+    <>
+      <button type="button" onClick={() => drawer.open({ section: 'models' })}>Open model settings</button>
+      <button type="button" onClick={() => drawer.setReady(true)}>Finish drawer motion</button>
+    </>
+  )
+}
+
+function renderPage({ withDrawerControls = false } = {}) {
   return render(
     <MemoryRouter>
       <ToastProvider>
@@ -449,6 +501,7 @@ function renderPage() {
           <AnnouncementsProvider>
             <SettingsDataProvider>
               <SettingsDrawerProvider>
+                {withDrawerControls && <DrawerTestControls />}
                 <SettingsPage />
               </SettingsDrawerProvider>
             </SettingsDataProvider>
@@ -460,6 +513,48 @@ function renderPage() {
 }
 
 describe('SettingsPage (PP0)', () => {
+  it('gives head detectors the same source, candidate, selection, and add actions as upscalers', async () => {
+    const user = userEvent.setup()
+    renderPage()
+    await user.click(await screen.findByRole('button', { name: '预处理' }))
+
+    const heading = await screen.findByRole('heading', { name: '头部检测器（自动遮罩）' })
+    const section = heading.closest('section')!
+    expect(within(section).getByLabelText('下载源')).toHaveValue('modelscope')
+    expect(within(section).getByText('Anime Head Detector')).toBeInTheDocument()
+    expect(within(section).getByText('custom.onnx')).toBeInTheDocument()
+    const addDownload = within(section).getByRole('button', { name: /添加下载/ })
+    expect(addDownload).toBeInTheDocument()
+    expect(within(section).getByRole('button', { name: /添加本地文件/ })).toBeInTheDocument()
+    await user.click(addDownload)
+    expect(within(section).getByPlaceholderText('anime-head-v2.onnx')).toBeInTheDocument()
+
+    await user.click(within(section).getAllByRole('radio')[1])
+    await waitFor(() => expect(fetchMock.mock.calls.some(([url, init]) =>
+      String(url).includes('/api/head-detectors/select')
+      && init?.method === 'POST'
+      && JSON.parse(String(init.body)).identity === '/tmp/custom.onnx')).toBe(true))
+  })
+
+  it('waits for drawer readiness before positioning a deep-linked section', async () => {
+    const user = userEvent.setup()
+    renderPage({ withDrawerControls: true })
+    const scrollContainer = screen.getByTestId('settings-scroll-container')
+    const scrollTo = vi.fn()
+    scrollContainer.scrollTo = scrollTo
+
+    await user.click(screen.getByRole('button', { name: 'Open model settings' }))
+    expect(scrollTo).not.toHaveBeenCalled()
+
+    await user.click(screen.getByRole('button', { name: 'Finish drawer motion' }))
+    await waitFor(() => expect(scrollTo).toHaveBeenCalledWith({ top: expect.any(Number), behavior: 'auto' }))
+    expect(screen.getByRole('button', { name: '训练' })).toHaveClass('border-accent')
+
+    await user.click(screen.getByRole('button', { name: '测试' }))
+    expect(screen.getByRole('button', { name: '测试' })).toHaveClass('border-accent')
+    expect(screen.getByRole('button', { name: '训练' })).not.toHaveClass('border-accent')
+  })
+
   it('测试页底部管理非项目 LoRA 来源：默认目录无移除按钮，额外目录即时保存', async () => {
     const user = userEvent.setup()
     renderPage()
@@ -475,7 +570,7 @@ describe('SettingsPage (PP0)', () => {
 
     await waitFor(() => {
       const putCall = fetchMock.mock.calls.find(([url, init]) => {
-        if (init?.method !== 'PUT' || !String(url).includes('/api/secrets')) return false
+        if (init?.method !== 'PATCH' || !String(url).includes('/api/settings')) return false
         try {
           return JSON.stringify(JSON.parse(String(init.body)).generate?.lora_catalog_dirs) === '[]'
         } catch { return false }
@@ -484,7 +579,7 @@ describe('SettingsPage (PP0)', () => {
     })
   })
 
-  it('hydrates from /api/secrets and shows masked sensitive fields as placeholder', async () => {
+  it('hydrates from /api/settings and shows masked sensitive fields as placeholder', async () => {
     const user = userEvent.setup()
     renderPage()
     // gelbooru 凭证已挪到「密钥」tab
@@ -498,7 +593,7 @@ describe('SettingsPage (PP0)', () => {
     expect((placeholder as HTMLInputElement).value).toBe('')
   })
 
-  it('PUT /api/secrets only sends the changed leaves', async () => {
+  it('PATCH /api/settings only sends the changed leaves', async () => {
     const user = userEvent.setup()
     renderPage()
     await user.click(await screen.findByRole('button', { name: '密钥' }))
@@ -510,7 +605,7 @@ describe('SettingsPage (PP0)', () => {
 
     await waitFor(() => {
       const putCall = fetchMock.mock.calls.find(
-        ([, init]) => init?.method === 'PUT'
+        ([, init]) => init?.method === 'PATCH'
       )
       expect(putCall).toBeDefined()
       const body = JSON.parse(String(putCall![1].body))
@@ -549,7 +644,7 @@ describe('SettingsPage (PP0)', () => {
     await user.selectOptions(select, '0')
     await waitFor(() => {
       const putCall = fetchMock.mock.calls.find(([u, i]) => {
-        if (i?.method !== 'PUT' || !String(u).includes('/api/secrets')) return false
+        if (i?.method !== 'PATCH' || !String(u).includes('/api/settings')) return false
         try {
           return JSON.parse(String(i.body)).system?.gpu_index === 0
         } catch {
@@ -608,7 +703,7 @@ describe('SettingsPage (PP0)', () => {
 
     await waitFor(() => {
       const putCall = fetchMock.mock.calls.find(([url, init]) => {
-        if (init?.method !== 'PUT' || !String(url).includes('/api/secrets')) return false
+        if (init?.method !== 'PATCH' || !String(url).includes('/api/settings')) return false
         try {
           return JSON.parse(String(init.body)).generate?.lora_merge_precision === 'bf16'
         } catch {
@@ -651,7 +746,7 @@ describe('SettingsPage (PP0)', () => {
 
     await waitFor(() => {
       const putCall = fetchMock.mock.calls.find(([url, init]) => {
-        if (init?.method !== 'PUT' || !String(url).includes('/api/secrets')) return false
+        if (init?.method !== 'PATCH' || !String(url).includes('/api/settings')) return false
         try { return 'download_sources' in JSON.parse(String(init.body)) } catch { return false }
       })
       expect(putCall).toBeDefined()
@@ -680,9 +775,9 @@ describe('SettingsPage (PP0)', () => {
     // 统一候选卡（D2）：local 行带「本地」徽标 + 状态 badge + × 移除（不删文件），
     // 永远没有删除文件按钮
     expect(within(customRow!).getByText('本地')).toBeInTheDocument()
-    expect(customRow!.querySelector('.bg-ok-soft')).not.toBeNull()
+    expect(customRow!.querySelector('.badge-ok')).not.toBeNull()
     expect(within(customRow!).getByTitle('从列表移除（不删除文件）')).toBeInTheDocument()
-    expect(within(customRow!).queryByText(/🗑/)).not.toBeInTheDocument()
+    expect(within(customRow!).queryByRole('button', { name: '删除' })).not.toBeInTheDocument()
     // 主模型 3（raw/turbo/custom）+ TE variant 卡 2（bf16/fp8）
     expect(screen.getAllByRole('radio')).toHaveLength(5)
     expect(screen.queryByText(/推荐工作流/)).not.toBeInTheDocument()
@@ -704,7 +799,7 @@ describe('SettingsPage (PP0)', () => {
 
     await waitFor(() => {
       const putCall = fetchMock.mock.calls.find(
-        ([url, init]) => String(url).includes('/api/secrets') && init?.method === 'PUT'
+        ([url, init]) => String(url).includes('/api/settings') && init?.method === 'PATCH'
       )
       expect(putCall).toBeDefined()
       const body = JSON.parse(String(putCall![1].body))
@@ -734,7 +829,27 @@ describe('SettingsPage (PP0)', () => {
     expect(within(modal).getByText('每分钟最大请求数（0 = 不限）')).toBeInTheDocument()
   })
 
-  it('selecting another LLM preset as global default PUTs current_preset', async () => {
+  it('refreshes models through the read-only per-preset endpoint', async () => {
+    const user = userEvent.setup()
+    renderPage()
+
+    await user.click(await screen.findByRole('button', { name: '打标' }))
+    const joyRow = screen.getByText('JoyCaption（vLLM 本地）').closest('li')!
+    await user.click(within(joyRow).getByRole('button', { name: /编辑/ }))
+    const modal = await screen.findByTestId('llm-preset-editor-modal')
+    await user.click(within(modal).getByRole('button', { name: /从服务器拉取/ }))
+
+    await waitFor(() => {
+      const call = fetchMock.mock.calls.find(([url, init]) =>
+        init?.method === 'POST'
+        && String(url).includes('/api/llm-tagger/presets/joycaption/models/refresh'))
+      expect(call).toBeDefined()
+      expect(fetchMock.mock.calls.some(([url]) =>
+        String(url).endsWith('/api/llm-tagger/models/refresh'))).toBe(false)
+    })
+  })
+
+  it('selecting another LLM preset as global default uses the preset resource API', async () => {
     const user = userEvent.setup()
     renderPage()
 
@@ -744,8 +859,8 @@ describe('SettingsPage (PP0)', () => {
 
     await waitFor(() => {
       const putCall = fetchMock.mock.calls.find(([url, init]) => {
-        if (init?.method !== 'PUT' || !String(url).includes('/api/secrets')) return false
-        try { return JSON.parse(String(init.body)).llm_tagger?.current_preset === 'joycaption' } catch { return false }
+        if (init?.method !== 'PUT' || !String(url).includes('/api/llm-tagger/presets/default')) return false
+        try { return JSON.parse(String(init.body)).id === 'joycaption' } catch { return false }
       })
       expect(putCall).toBeDefined()
     })
@@ -764,7 +879,7 @@ describe('SettingsPage (PP0)', () => {
 
     await waitFor(() => {
       const putCall = fetchMock.mock.calls.find(
-        ([, init]) => init?.method === 'PUT'
+        ([, init]) => init?.method === 'PATCH'
       )
       expect(putCall).toBeDefined()
       const body = JSON.parse(String(putCall![1].body))

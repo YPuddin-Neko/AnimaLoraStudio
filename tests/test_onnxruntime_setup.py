@@ -21,7 +21,7 @@ from studio.services.runtime import onnxruntime as ors
 def test_detect_cuda_no_nvidia_smi(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(ors.shutil, "which", lambda _: None)
     res = ors.detect_cuda()
-    # 逐 key 断言而非 `==` 全等：ADR 0016 起返回值多一个 `backend` 字段（加法），
+    # 逐 key 断言而非 `==` 全等：ADR 0019 起返回值多一个 `backend` 字段（加法），
     # 全等会把后续任何加字段都变成假失败。三个原有 key 的语义才是契约
     # （torch.py / cli.py / tools/bench_wd14.py 在消费）。
     assert res["available"] is False

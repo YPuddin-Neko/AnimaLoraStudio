@@ -434,3 +434,111 @@ def test_legacy_cltagger_fork_model_id_migrates_to_candidate(
     dl = [r for r in rows if r["kind"] == "download"]
     assert [r["extra"]["model_id"] for r in dl] == ["old/mirror_fork"]
     assert dl[0]["is_current"] is True
+
+
+def test_head_detector_candidates_select_remove_and_validate(
+    client: TestClient, tmp_path: Path,
+) -> None:
+    bad = tmp_path / "detector.bin"
+    bad.write_bytes(b"bad")
+    response = client.post(
+        "/api/model-sources/head_detector",
+        json={"kind": "local", "path": str(bad)},
+    )
+    assert response.status_code == 400
+
+    local = tmp_path / "model.onnx"
+    local.write_bytes(b"onnx")
+    response = client.post(
+        "/api/model-sources/head_detector",
+        json={"kind": "local", "path": str(local)},
+    )
+    assert response.status_code == 200
+    rows = _rows(response.json(), "head_detector")
+    assert rows[0]["value"] == "builtin"
+    assert rows[0]["kind"] == "preset"
+    assert rows[0]["label"] == "Anime Head Detector"
+    local_row = next(row for row in rows if row["kind"] == "local")
+    assert local_row["value"] == str(local)
+    assert local_row["deletable"] is False
+
+    selected = client.post(
+        "/api/head-detectors/select", json={"identity": str(local)}
+    )
+    assert selected.status_code == 200
+    assert secrets.load().models.selected_head_detector == str(local)
+
+    removed = client.request(
+        "DELETE", "/api/model-sources/head_detector",
+        json={"kind": "local", "path": str(local)},
+    )
+    assert removed.status_code == 200
+    assert local.exists()
+    assert secrets.load().models.selected_head_detector == "builtin"
+
+
+def test_head_detector_download_candidate_and_managed_delete_fallback(
+    client: TestClient, tmp_path: Path,
+) -> None:
+    builtin = tmp_path / "models" / "preprocess" / "head_detector" / "model.onnx"
+    builtin.parent.mkdir(parents=True, exist_ok=True)
+    builtin.write_bytes(b"pinned")
+    reserved = client.post(
+        "/api/model-sources/head_detector",
+        json={"kind": "download", "repo": "owner/detector", "filename": "model.onnx"},
+    )
+    assert reserved.status_code == 400
+    assert builtin.read_bytes() == b"pinned"
+    refused_delete = client.delete(
+        "/api/models/asset",
+        params={"model_id": "head_detector_custom", "variant": "model.onnx"},
+    )
+    assert refused_delete.status_code == 400
+    assert builtin.read_bytes() == b"pinned"
+
+    bad = client.post(
+        "/api/model-sources/head_detector",
+        json={"kind": "download", "repo": "owner/detector", "filename": "bad.bin"},
+    )
+    assert bad.status_code == 400
+    added = client.post(
+        "/api/model-sources/head_detector",
+        json={"kind": "download", "repo": "owner/detector", "filename": "custom.onnx"},
+    )
+    assert added.status_code == 200
+    row = next(
+        row for row in _rows(added.json(), "head_detector")
+        if row["kind"] == "download"
+    )
+    assert row["download_id"] == "head_detector_custom"
+    assert row["status_key"] == "head_detector:custom:custom.onnx"
+
+    managed = tmp_path / "models" / "preprocess" / "head_detector" / "custom.onnx"
+    managed.parent.mkdir(parents=True, exist_ok=True)
+    managed.write_bytes(b"onnx")
+    selected = client.post(
+        "/api/head-detectors/select", json={"identity": "custom.onnx"}
+    )
+    assert selected.status_code == 200
+    assert secrets.load().models.selected_head_detector == "custom.onnx"
+
+    deleted = client.delete(
+        "/api/models/asset",
+        params={"model_id": "head_detector_custom", "variant": "custom.onnx"},
+    )
+    assert deleted.status_code == 200
+    assert not managed.exists()
+    assert secrets.load().models.selected_head_detector == "builtin"
+
+
+def test_head_detector_rejects_unregistered_absolute_and_traversal(
+    client: TestClient, tmp_path: Path,
+) -> None:
+    unregistered = tmp_path / "outside.onnx"
+    unregistered.write_bytes(b"onnx")
+    assert client.post(
+        "/api/head-detectors/select", json={"identity": str(unregistered)}
+    ).status_code == 400
+    assert client.post(
+        "/api/head-detectors/select", json={"identity": "../outside.onnx"}
+    ).status_code == 400

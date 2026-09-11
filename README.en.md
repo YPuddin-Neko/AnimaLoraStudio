@@ -1,16 +1,19 @@
 # AnimaLoraStudio
 
-[![中文](https://img.shields.io/badge/lang-%E4%B8%AD%E6%96%87-lightgrey)](README.md) [![English](https://img.shields.io/badge/lang-English-blue)](README.en.md) [![Version](https://img.shields.io/badge/version-0.26.0-blue)](CHANGELOG.md) [![License](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
+[![中文](https://img.shields.io/badge/lang-%E4%B8%AD%E6%96%87-lightgrey)](README.md) [![English](https://img.shields.io/badge/lang-English-blue)](README.en.md) [![Version](https://img.shields.io/badge/version-0.27.0-blue)](CHANGELOG.md) [![License](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
 
 **End-to-end pipeline**: Booru scraping → curation → tagging → regularization set → training → image-gen testing, all in one browser panel. Trains LoRAs for two model families: [Anima](https://huggingface.co/circlestone-labs/Anima) (Cosmos DiT, anime-specialized, lightweight) and [Krea 2](https://huggingface.co/krea/Krea-2-Raw) (12.9B single-stream MMDiT; train on Raw, test fast on Turbo).
 
-![Studio training page](docs/images/studio-train-en.png)
+![Studio training page (older layout illustration)](docs/images/studio-train-en.png)
+
+> This screenshot shows an older layout; see the [Getting Started guide](docs/user-guide/getting-started.en.md) for the current training workflow.
 
 ## Features
 
-- **One-stop pipeline**: Booru scraping / curation / preprocessing (dedup · upscale · crop · retouch) / tagging / regularization set / training / image-gen testing — all in one browser panel, guided by a stepper.
+- **One-stop pipeline**: Booru scraping / curation / preprocessing (dedup · upscale · crop · retouch · [automatic head masks](docs/user-guide/auto-head-mask.en.md)) / tagging / regularization set / training / image-gen testing — all in one browser panel, guided by a stepper.
 - **Two model families**: Anima and Krea 2 share the same workflow; switch families right in the training config (weight paths and family defaults are recomputed with an itemized confirmation), options are filtered per family, and one project can hold versions of both families.
 - **Three taggers**: WD14, CLTagger (local ONNX), LLM (OpenAI-compatible, long captions); a trigger word entered once is auto-injected into every caption.
+- **Separate LLM configuration stores**: presets, ordinary settings, and credentials are stored independently, with built-in template overrides, atomic writes, and backup protection; queued LLM tagging jobs freeze their preset recipe.
 - **Booru scraping**: native Gelbooru / Danbooru (Cloudflare-compatible UA, rate limiting, account auth).
 - **Automatic regularization sets**: reverse-search by your training set's tag distribution + aspect-ratio clustering, or AI priors from the base model (no LoRA needed).
 - **Project / Version two-tier management**: one project holds multiple versions sharing downloaded data, with independent config / output; presets fork both ways with the global pool.
@@ -38,6 +41,8 @@ studio.bat          # Windows
 First run automatically creates `venv/` → installs GPU-matched CUDA torch → builds the frontend → starts the backend → opens <http://127.0.0.1:8765/>, with an onboarding modal to one-click install the Anima starter set. Once open, go to the model download center under **Settings → Training** and download the weights for your model family (defaults to `./models/`).
 
 → Full walkthrough (launch options / model download / mirrors / pipeline steps): see the **[Getting Started guide](docs/user-guide/getting-started.en.md)**.
+
+→ Updating an existing installation? Read **[Upgrading to v0.27](docs/user-guide/upgrading-v0.27.en.md)** first (configuration migration, backups, and LyCORIS dependencies).
 
 ## Hardware requirements
 
@@ -83,7 +88,7 @@ python tools/probe_accelerator.py    # backend, devices, measured fp8 / SDPA / b
 bash tools/find_flash_attn.sh        # locate any flash-attn package / .so already on disk
 ```
 
-See [ADR 0016](docs/adr/0016-dual-accelerator-backend-hygon-dcu.md).
+See [ADR 0019](docs/adr/0019-dual-accelerator-backend-hygon-dcu.md).
 
 ## Documentation
 

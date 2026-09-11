@@ -35,6 +35,15 @@ const wrap = (run: (api: ReturnType<typeof useDialog>) => Promise<unknown>) =>
   )
 
 describe('Dialog (useDialog API)', () => {
+  it('uses the shared section-title hierarchy', async () => {
+    const user = userEvent.setup()
+    wrap((api) => api.confirm('删除？', { title: '删除任务' }))
+    await user.click(screen.getByText('trigger'))
+
+    expect(screen.getByRole('heading', { level: 2, name: '删除任务' }))
+      .toHaveClass('type-section-title')
+  })
+
   it('confirm 点确认返回 true', async () => {
     const user = userEvent.setup()
     wrap((api) => api.confirm('删除？'))
@@ -67,10 +76,11 @@ describe('Dialog (useDialog API)', () => {
     expect(screen.getByText('算了')).toBeInTheDocument()
   })
 
-  it('confirm 确认键恒为 btn-primary（tone 不换按钮底色）', async () => {
+  it('confirm 保持单一 primary 视觉，并用 tone 暴露紧迫语义', async () => {
     const user = userEvent.setup()
     wrap((api) => api.confirm('删除？', { tone: 'danger' }))
     await user.click(screen.getByText('trigger'))
+    expect(screen.getByRole('alertdialog')).toBeInTheDocument()
     expect(screen.getByText('确认')).toHaveClass('btn-primary')
     expect(screen.getByText('确认')).not.toHaveClass('btn-danger')
   })
@@ -80,6 +90,7 @@ describe('Dialog (useDialog API)', () => {
     wrap((api) => api.prompt('名称'))
     await user.click(screen.getByText('trigger'))
     const input = screen.getByRole('textbox')
+    expect(input).toHaveClass('form-control', 'form-control-mono')
     // 先 click 聚焦再 type：避免 modal 刚开 / autofocus 未 settle 时 userEvent
     // 丢首字符（CI 慢机偶发 "y-preset"）。
     await user.click(input)
@@ -112,6 +123,8 @@ describe('Dialog (useDialog API)', () => {
     await user.type(screen.getByRole('textbox'), 'ab')
     await user.click(screen.getByText('确定'))
     expect(screen.getByText('至少 3 字符')).toBeInTheDocument()
+    expect(screen.getByRole('textbox')).toHaveAttribute('aria-invalid', 'true')
+    expect(screen.getByRole('textbox')).toHaveAccessibleDescription('至少 3 字符')
     // 错误显示后 dialog 未关闭 — result 仍空
     expect(screen.getByTestId('result')).toHaveTextContent('')
   })

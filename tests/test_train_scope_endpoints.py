@@ -13,8 +13,10 @@ from fastapi.testclient import TestClient
 
 from studio import db, secrets, server
 from studio.services.preprocess import manifest as preprocess_manifest
+from studio.services.preprocess import head_mask, masks as train_masks
 from studio.services.projects import jobs as project_jobs, projects, versions
 from studio.services import models as model_downloader
+from studio.infrastructure import paths as studio_paths
 
 
 @pytest.fixture
@@ -26,6 +28,7 @@ def isolated(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(db, "STUDIO_DB", dbfile)
     monkeypatch.setattr(server.db, "STUDIO_DB", dbfile)
     monkeypatch.setattr(secrets, "SECRETS_FILE", tmp_path / "secrets.json")
+    monkeypatch.setattr(studio_paths, "TASKS_DIR", tmp_path / "tasks")
 
     from studio.services.models import paths as _paths
     models_root = tmp_path / "models"
@@ -125,6 +128,49 @@ def test_files_endpoint_returns_train_images_and_summary(client: TestClient) -> 
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("legacy", [False, True])
+def test_status_stage_filters_before_latest_and_isolates_logs(client, legacy):
+    p, v = _make_pv(client)
+    url = f"/api/projects/{p['id']}/versions/{v['id']}/preprocess/status"
+    jobs = {}
+    with db.connection_for() as conn:
+        for stage in ("upscale", "crop", "head_mask"):
+            job = project_jobs.create_job(
+                conn, project_id=p["id"], version_id=v["id"], kind="preprocess",
+                params={} if legacy and stage == "upscale" else {"stage": stage},
+            )
+            log_path = Path(job["log_path"])
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            log_path.write_text(f"only {stage}", encoding="utf-8")
+            jobs[stage] = job
+        # A newer foreign-version job must not hide this version's matches.
+        project_jobs.create_job(
+            conn, project_id=p["id"], kind="preprocess", params={"stage": "crop"},
+        )
+    for stage, job in jobs.items():
+        response = client.get(url, params={"stage": stage})
+        assert response.status_code == 200
+        body = response.json()
+        assert body["job"]["id"] == job["id"]
+        assert body["log_tail"] == f"only {stage}"
+    assert client.get(url).json()["job"]["id"] == jobs["head_mask"]["id"]
+    assert client.get(url, params={"stage": "invalid"}).status_code == 422
+
+
+def test_status_stage_without_match_returns_null_and_empty_log(client):
+    p, v = _make_pv(client)
+    with db.connection_for() as conn:
+        project_jobs.create_job(
+            conn, project_id=p["id"], version_id=v["id"], kind="preprocess",
+            params={"stage": "crop"},
+        )
+    body = client.get(
+        f"/api/projects/{p['id']}/versions/{v['id']}/preprocess/status?stage=head_mask",
+    ).json()
+    assert body["job"] is None
+    assert body["log_tail"] == ""
+
+
 def test_status_endpoint_returns_null_job_when_none(client: TestClient) -> None:
     p, v = _make_pv(client)
     resp = client.get(
@@ -217,6 +263,108 @@ def test_crop_start_endpoint_creates_job(client: TestClient) -> None:
     assert resp.status_code == 200
     job = resp.json()
     assert job["version_id"] == v["id"]
+
+
+# ---------------------------------------------------------------------------
+# automatic head-mask proposal / apply / undo
+# ---------------------------------------------------------------------------
+
+
+def test_head_mask_detect_defaults_and_missing_model(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    p, v = _make_pv(client)
+    url = f"/api/projects/{p['id']}/versions/{v['id']}/preprocess/head-mask/detect"
+    monkeypatch.setattr(
+        model_downloader, "head_detector_status",
+        lambda: {"exists": False, "valid": False, "size": 0},
+    )
+    missing = client.post(url, json={})
+    assert missing.status_code == 409
+    assert missing.json()["error"]["code"] == "preprocess.head_mask_model_missing"
+
+    monkeypatch.setattr(
+        model_downloader, "head_detector_status",
+        lambda: {"exists": True, "valid": True},
+    )
+    created = client.post(url, json={})
+    assert created.status_code == 200
+    params = created.json()["params_decoded"]
+    assert params == {
+        "stage": "head_mask",
+        "scope": "all",
+        "model": "builtin",
+        "confidence": 0.413,
+        "iou_threshold": 0.7,
+        "padding_ratio": 0.1,
+        "feather_ratio": 0.03,
+    }
+
+
+def test_head_mask_proposal_apply_and_undo_endpoints(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    p, v = _make_pv(client)
+    sub = _train_sub(p)
+    image_path = sub / "A.png"
+    _write_png(image_path, (100, 80))
+    monkeypatch.setattr(
+        model_downloader, "head_detector_status",
+        lambda: {"exists": True, "valid": True},
+    )
+    base = f"/api/projects/{p['id']}/versions/{v['id']}/preprocess/head-mask"
+    job = client.post(base + "/detect", json={"scope": "selected", "filenames": ["1_data/A.png"]}).json()
+    proposal = head_mask.make_image_proposal(
+        "1_data/A.png", image_path, (100, 80),
+        [{"score": 0.9, "box": [20, 10, 50, 40]}],
+        padding_ratio=0.1, feather_ratio=0.03,
+    )
+    head_mask.write_result(job["id"], head_mask.new_result(
+        job["id"], confidence=0.413, iou_threshold=0.7,
+        padding_ratio=0.1, feather_ratio=0.03,
+        provider="CPUExecutionProvider", images=[proposal],
+    ))
+
+    proposals = client.get(base + f"/proposals/{job['id']}")
+    assert proposals.status_code == 200
+    assert proposals.json()["stale_count"] == 0
+    assert proposals.json()["undo_available"] is False
+
+    region_id = proposal["regions"][0]["id"]
+    applied = client.post(base + "/apply", json={
+        "job_id": job["id"],
+        "selections": {"1_data/A.png": [region_id]},
+    })
+    assert applied.status_code == 200
+    assert applied.json()["applied"] == 1
+    mask_path = train_masks.mask_path_for(sub.parent, "1_data/A.png")
+    assert mask_path.is_file()
+
+    after = client.get(base + f"/proposals/{job['id']}").json()
+    assert after["undo_available"] is True
+    undone = client.post(base + "/undo", json={"job_id": job["id"]})
+    assert undone.status_code == 200
+    assert undone.json()["undone"] == 1
+    assert not mask_path.exists()
+
+
+def test_head_mask_rejects_invalid_parameters_and_foreign_job(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    p1, v1 = _make_pv(client)
+    p2, _v2 = _make_pv(client)
+    monkeypatch.setattr(
+        model_downloader, "head_detector_status",
+        lambda: {"exists": True, "valid": True},
+    )
+    base1 = f"/api/projects/{p1['id']}/versions/{v1['id']}/preprocess/head-mask"
+    bad = client.post(base1 + "/detect", json={"confidence": 2})
+    assert bad.status_code == 422
+    job = client.post(base1 + "/detect", json={}).json()
+    foreign = client.get(
+        f"/api/projects/{p2['id']}/versions/{v1['id']}/preprocess/head-mask/proposals/{job['id']}"
+    )
+    assert foreign.status_code == 404
 
 
 # ---------------------------------------------------------------------------

@@ -1,12 +1,203 @@
-/* 单点窄屏优化 —— 项目当前不做系统级响应式（见
- * docs/architecture/studio-pipeline.md §11），需要时再单独加 className + 媒体查询。
- * 断点取 viewport 1280px（< laptop "中屏" 阈值），不用 container query。
+/* Shared responsive policy. AppShell defines the supported desktop frame;
+ * route-specific exceptions keep a dedicated class and stay in this file.
  */
 
 .banner-shell { padding: 16px 18px; }
 .banner-shell-icon { width: 32px; height: 32px; font-size: 16px; }
 
+/* Ordinary route chrome may reflow at compact desktop, but its title, helper
+ * navigation, and primary actions all remain visible and keep DOM order. */
+.ui-page-header { position: relative; }
+.ui-page-header-layout {
+  display: flex;
+  min-width: 0;
+  align-items: flex-end;
+  flex-wrap: wrap;
+  gap: var(--space-section);
+}
+.ui-page-header-copy { min-width: 0; flex: 1 1 24rem; }
+.ui-page-header-actions {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: var(--space-related);
+}
+.ui-page-header-top-right {
+  position: absolute;
+  z-index: 1;
+  inset-block-start: var(--space-field);
+  inset-inline-end: var(--space-page);
+}
+
+/* Container-safe cards never force the AppShell main track wider than its
+ * available inline size. */
+.ui-project-grid {
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr));
+}
+.ui-project-card-skeleton {
+  min-height: calc(var(--space-page-loose) * 4);
+}
+
+/* Queue is a viewport-contained list page: its chrome and persistent pager stay
+ * fixed while this named region owns the only route-local vertical scrolling. */
+.ui-queue-scroll-region {
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+.ui-queue-scroll-region:focus-visible {
+  outline: none;
+  box-shadow: inset 0 0 0 2px var(--accent-soft);
+}
+
+/* Dense queue rows preserve identity, kind, state, progress, and actions. The
+ * auxiliary timestamp yields first at compact desktop. */
+.ui-queue-task-grid {
+  grid-template-columns: 48px minmax(0, 1fr) 88px 96px 150px 128px 176px;
+}
+.ui-queue-job-grid {
+  grid-template-columns: 48px minmax(0, 1fr) 96px 150px 120px;
+}
+.ui-queue-detail-stats { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.ui-queue-detail-title {
+  min-width: 0;
+  max-width: min(24rem, 32vw);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ui-queue-output-actions { flex-wrap: wrap; }
+.ui-queue-output-path { flex: 1 1 20rem; }
+.ui-queue-output-table {
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+.ui-queue-output-table:focus-visible {
+  outline: none;
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 2px var(--accent-soft);
+}
+.ui-queue-output-grid {
+  min-width: 34rem;
+  grid-template-columns: minmax(0, 1fr) 100px 160px 80px;
+}
+
+/* Side-by-side preview follows the dev geometry: data 3:1, YAML 3:2.
+ * The collapse rail stays reachable when the preview gives its space to the draft. */
+.train-workbench {
+  display: grid;
+  grid-template-columns: minmax(0, 3fr) var(--s-6) minmax(18rem, 1fr);
+  gap: var(--space-field);
+  overflow: hidden;
+}
+.train-workbench[data-preview-tab="config"] {
+  grid-template-columns: minmax(0, 3fr) var(--s-6) minmax(20rem, 2fr);
+}
+.train-workbench[data-preview-open="false"] {
+  grid-template-columns: minmax(0, 1fr) var(--s-6);
+}
+.train-preset-trigger { flex: 0 1 auto; max-width: min(24rem, 100%); }
+.train-config-toolbar {
+  --train-section-index-width: 10.5rem;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) var(--train-section-index-width);
+  column-gap: var(--space-field);
+  align-items: center;
+}
+.train-config-toolbar-main {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-related);
+}
+.train-config-toolbar-mode {
+  grid-column: 2;
+  justify-self: end;
+}
+.train-section-index { width: var(--train-section-index-width); }
+.train-preview-rail { position: relative; display: flex; justify-content: center; }
+.train-preview-rail::before {
+  content: '';
+  position: absolute;
+  inset-block: 0;
+  width: 1px;
+  background: var(--border-subtle);
+}
+.train-preview-toggle {
+  position: relative;
+  align-self: start;
+  flex: none;
+  width: 24px;
+  min-height: 24px;
+  padding: 0;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-pill);
+  background: var(--bg-surface);
+}
+.train-run-summary {
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--r-md);
+  background: var(--bg-surface);
+  padding: var(--space-field);
+}
+.train-section-select { display: none; }
+.train-section-index { display: block; }
+
 @media (max-width: 1280px) {
+  .train-workbench[data-preview-open][data-preview-tab] {
+    grid-template-columns: minmax(0, 1fr);
+    align-content: start;
+    overflow-y: auto;
+  }
+  .train-preview-rail { min-height: 24px; justify-content: flex-end; }
+  .train-preview-rail::before { inset-inline: 0; inset-block: 50% auto; width: auto; height: 1px; }
+  .train-preview-toggle { transform: rotate(90deg); }
+  .train-workbench > .train-draft { min-height: auto; }
+  .train-workbench .train-form-layout { display: block; flex: none; }
+  .train-workbench .train-stats-tab { flex: none; overflow-y: visible; }
+  .train-workbench .train-yaml-tab { flex: none; height: min(70vh, 36rem); }
+  .train-workbench .train-config-scroll {
+    width: 100%;
+    min-height: auto;
+    overflow-y: visible;
+  }
+  .train-section-select { display: block; }
+  .train-section-index { display: none; }
+  .train-config-toolbar { grid-template-columns: minmax(0, 1fr) auto; }
+
+  /* AppShell keeps primary navigation and actions visible while auxiliary
+     resource meters yield at the compact-desktop breakpoint. */
+  .ui-app-shell-topbar {
+    gap: var(--space-related);
+    padding-inline: var(--space-section);
+  }
+  .ui-app-shell-topbar-stats { display: none; }
+  .ui-app-shell-running-task { max-width: min(14rem, 30vw); }
+
+  .ui-page-header-layout { align-items: flex-start; }
+  .ui-page-header-actions { flex: 1 1 100%; }
+  .ui-page-header-top-right {
+    position: static;
+    display: flex;
+    justify-content: flex-end;
+    margin-block-end: var(--space-related);
+  }
+
+  .ui-queue-task-grid {
+    grid-template-columns: 48px minmax(9rem, 1fr) 80px 88px minmax(7rem, 0.75fr) minmax(9rem, auto);
+  }
+  .ui-queue-job-grid {
+    grid-template-columns: 48px minmax(9rem, 1fr) 88px minmax(7rem, auto);
+  }
+  .ui-queue-task-timing,
+  .ui-queue-job-timing { display: none; }
+  .ui-queue-detail-stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .ui-queue-detail-title { max-width: min(18rem, 40vw); }
+
   .banner-shell { padding: 10px 14px; }
   .banner-shell-icon { width: 26px; height: 26px; font-size: 13px; }
   .phase-timeline-label { display: none; }
@@ -30,7 +221,7 @@
   }
 }
 
-@media (max-width: 1279px) {
+@media (max-width: 1280px) {
   /* 双类选择器确保覆盖组件上的 Tailwind `absolute` / `z-20` 工具类。 */
   .generate-attached-drawer.generate-attached-drawer {
     position: fixed;
@@ -57,6 +248,7 @@
 }
 
 @media (prefers-reduced-motion: reduce) {
+  .ui-app-shell-skip,
   .xy-axis-sortable-row,
   .lora-sortable-card { transition: none !important; }
 }

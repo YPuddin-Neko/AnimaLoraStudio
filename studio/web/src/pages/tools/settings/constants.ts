@@ -1,4 +1,5 @@
 import type { TFunction } from 'i18next'
+import { controlClassName } from '../../../components/FormControl'
 import {
   DEFAULT_WD14_MODELS,
   type LLMPreset,
@@ -82,6 +83,7 @@ export const TAB_SECTIONS: Record<Tab, { id: string; labelKey: string }[]> = {
   ],
   preprocess: [
     { id: 'upscalers', labelKey: 'settings.upscalers' },
+    { id: 'head-detector', labelKey: 'settings.headDetectorTitle' },
   ],
   tagging: [
     { id: 'llm-tagger', labelKey: 'settings.llmTagger' },
@@ -240,7 +242,7 @@ export const EMPTY: Secrets = {
     blacklist_tags: [],
     batch_size: 8,
   },
-  models: { root: null, selected: { anima: '1.0', krea2: 'raw' }, selected_anima: '1.0', custom_anima_paths: [], selected_upscaler: '4x-AnimeSharp', auto_sync_paths: true },
+  models: { root: null, selected: { anima: '1.0', krea2: 'raw' }, selected_anima: '1.0', custom_anima_paths: [], selected_upscaler: '4x-AnimeSharp', selected_head_detector: 'builtin', auto_sync_paths: true },
   queue: { light_tasks_during_train: true },
   generate: { preview_every_n_steps: 3, attention_backend: 'auto', vae_precision: 'bf16', lora_merge_precision: 'fp32', idle_timeout_minutes: 10, save_test_images: false, vram_policy: 'auto', ram_guard: false, blocks_to_swap: 0, task_timeout_minutes: 0, lora_catalog_dirs: [] },
   training: { ram_guard: false },
@@ -254,7 +256,8 @@ export const EMPTY: Secrets = {
   tag_dictionary: { show_translation: null, autocomplete: null },
 }
 
-export const textInputClass = 'w-full px-2 py-1 outline-none rounded-sm bg-sunken border border-subtle text-sm text-fg-primary focus:border-accent'
+/** 兼容设置页尚未逐项迁移的原生控件；视觉契约由 FormControl 统一提供。 */
+export const textInputClass = controlClassName({ size: 'sm', surface: 'sunken' })
 
 export const MODEL_DESCRIPTION_KEYS: Record<string, string> = {
   anima_main: 'settings.modelDescriptions.animaMain',
@@ -282,9 +285,4 @@ export function translatedCatalogText(keys: Record<string, string>, id: string, 
 
 // ── Models Section ─────────────────────────────────────────────────────────
 
-export function fmtBytes(n: number): string {
-  if (n < 1024) return `${n} B`
-  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`
-  if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(1)} MB`
-  return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`
-}
+export { fmtBytes } from '../../../lib/formatBytes'

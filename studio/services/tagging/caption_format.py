@@ -75,6 +75,32 @@ def normalize_caption_json(raw: dict[str, Any] | None) -> dict[str, Any]:
             },
         }
 
+    # TagEdit writes an explicit flat list into a documented full payload while
+    # retaining structured LLM fields for provenance. Only that combination marks
+    # the list as an authoritative editor result. A raw LLM simplified payload can
+    # also contain a flat ``tags`` list alongside ``count`` / ``appearance`` /
+    # ``environment`` and must continue through the simplified-shape normalizer.
+    if isinstance(tags_obj, list) and any(
+        key in data for key in ("ai_output", "fixed", "from_path")
+    ):
+        ai = data.get("ai_output") if isinstance(data.get("ai_output"), dict) else {}
+        return {
+            "meta": data.get("meta") if isinstance(data.get("meta"), dict) else {},
+            "tags": {
+                "quality": [],
+                "count": "",
+                "character": "",
+                "series": "",
+                "artist": "",
+                "appearance": [],
+                "tags": split_tags(tags_obj),
+                "environment": [],
+                # Natural-language prose is not editable in TagEdit, so retain it
+                # while the visible flat tag list replaces every structured tag.
+                "nl": _as_text(ai.get("nl") if ai else data.get("nl")),
+            },
+        }
+
     if "ai_output" in data or "fixed" in data or "from_path" in data:
         fixed = data.get("fixed") if isinstance(data.get("fixed"), dict) else {}
         character = data.get("character") if isinstance(data.get("character"), dict) else data.get("character")

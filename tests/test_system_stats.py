@@ -1,6 +1,6 @@
 """services/system_stats.py — 采集 + 加速器探测优雅降级 + SSE sampler 线程。
 
-ADR 0016 起 GPU 采集委托 `utils.accelerator.device_stats()`（按后端选 NVML / torch），
+ADR 0019 起 GPU 采集委托 `utils.accelerator.device_stats()`（按后端选 NVML / torch），
 所以本文件不再 mock pynvml —— 那层的字段映射由 `tests/test_accelerator.py` 覆盖。
 这里只测本模块自己的职责：三态映射（None / [] / 非空）与「探测失败不重试」闩锁。
 """

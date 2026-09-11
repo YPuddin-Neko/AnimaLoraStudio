@@ -5,11 +5,15 @@
 // 正文用 react-markdown + remark-gfm 渲染；元素经 components 映射到现有 Tailwind
 // token（标题/列表/链接/代码），不另起 CSS、不猜 CSS 变量名。
 import type { ComponentPropsWithoutRef } from 'react'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import ReactMarkdown, { defaultUrlTransform } from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import type { AnnouncementPost } from '../api/client'
+import Badge, { type BadgeTone } from './Badge'
+import Button from './Button'
+import Modal from './Modal'
+import { SegmentedControl } from './SelectionGroup'
 import { useAnnouncements } from '../lib/Announcements'
 import { useSettingsDrawer } from '../lib/SettingsDrawer'
 import { SECTION_TO_TAB } from '../pages/tools/settings/constants'
@@ -42,8 +46,8 @@ export function announcementUrlTransform(url: string): string {
 type MdProps<T extends keyof React.JSX.IntrinsicElements> = ComponentPropsWithoutRef<T>
 const MD_COMPONENTS = {
   // # / ## 罕见（正文最高用 ###）；都按版块标题处理
-  h1: (p: MdProps<'h1'>) => <h3 className="mt-5 mb-2 pb-1 text-[15px] font-bold text-fg-primary border-b border-dim" {...p} />,
-  h2: (p: MdProps<'h2'>) => <h3 className="mt-5 mb-2 pb-1 text-[15px] font-bold text-fg-primary border-b border-dim" {...p} />,
+  h1: (p: MdProps<'h1'>) => <h3 className="mt-5 mb-2 pb-1 text-base font-bold text-fg-primary border-b border-dim" {...p} />,
+  h2: (p: MdProps<'h2'>) => <h3 className="mt-5 mb-2 pb-1 text-base font-bold text-fg-primary border-b border-dim" {...p} />,
   // ### = 分组标题（新增/变更/改进/修复…）：加粗 + 下划线，清晰分段
   h3: (p: MdProps<'h3'>) => <h4 className="mt-5 mb-2 pb-1 text-sm font-bold text-fg-primary border-b border-dim first:mt-1" {...p} />,
   h4: (p: MdProps<'h4'>) => <h4 className="mt-4 mb-1.5 text-sm font-semibold text-fg-primary" {...p} />,
@@ -60,11 +64,11 @@ const MD_COMPONENTS = {
   blockquote: (p: MdProps<'blockquote'>) => <blockquote className="my-2 pl-3 border-l-2 border-dim text-fg-tertiary" {...p} />,
 } as const
 
-function tagChipClass(tag: AnnouncementPost['tag']): string {
+function tagChipTone(tag: AnnouncementPost['tag']): BadgeTone {
   switch (tag) {
-    case 'release': return 'text-accent bg-accent-soft'
-    case 'migration': return 'text-warn bg-warn-soft'
-    default: return 'text-info bg-info-soft' // notice
+    case 'release': return 'accent'
+    case 'migration': return 'warning'
+    default: return 'info'
   }
 }
 
@@ -72,6 +76,7 @@ export function AnnouncementCenter() {
   const { t, i18n } = useTranslation()
   const { posts, readIds, open, closeCenter, markRead, updateInfo } = useAnnouncements()
   const settingsDrawer = useSettingsDrawer()
+  const postListRef = useRef<HTMLUListElement>(null)
   const [activeTag, setActiveTag] = useState<'all' | AnnouncementPost['tag']>('all')
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const lang: 'zh' | 'en' = i18n.language.toLowerCase().startsWith('zh') ? 'zh' : 'en'
@@ -133,104 +138,133 @@ export function AnnouncementCenter() {
   const selected = posts.find((p) => p.id === selectedId) ?? null
   const select = (p: AnnouncementPost) => setSelectedId(p.id)
   const tagLabel = (tg: 'all' | AnnouncementPost['tag']) => t(`announcements.tags.${tg}`)
+  const tagOptions = (['all', ...tagsPresent] as Array<'all' | AnnouncementPost['tag']>)
+    .map((tag) => ({ value: tag, label: tagLabel(tag) }))
+  const selectAtIndex = (index: number) => {
+    const post = filtered[index]
+    if (!post) return
+    setSelectedId(post.id)
+    requestAnimationFrame(() => {
+      postListRef.current
+        ?.querySelector<HTMLElement>(`[data-announcement-index="${index}"]`)
+        ?.focus()
+    })
+  }
+  const handlePostKeyDown = (event: KeyboardEvent, index: number) => {
+    if (filtered.length === 0) return
+    if (event.key === 'ArrowDown') {
+      event.preventDefault()
+      selectAtIndex((index + 1) % filtered.length)
+    } else if (event.key === 'ArrowUp') {
+      event.preventDefault()
+      selectAtIndex((index - 1 + filtered.length) % filtered.length)
+    } else if (event.key === 'Home') {
+      event.preventDefault()
+      selectAtIndex(0)
+    } else if (event.key === 'End') {
+      event.preventDefault()
+      selectAtIndex(filtered.length - 1)
+    }
+  }
 
   return (
-    <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/35 p-4"
-      onClick={closeCenter}
-      data-testid="announcement-center"
-    >
-      {/* 点蒙版退出（公告栏不是 onboarding 那种不可打断）；点面板内部不冒泡 */}
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="announcement-center-title"
-        onClick={(e) => e.stopPropagation()}
-        /* 宽度：居中弹窗，大屏最宽 1440px、小屏 80vw 自适应（左 list 256px 固定，
-           其余给正文）。借鉴 SettingsDrawer 的响应式思路但居中、不占满。 */
-        className="w-[min(1440px,80vw)] h-[78vh] flex flex-col bg-elevated border border-dim rounded-lg shadow-xl overflow-hidden"
-      >
-        {/* header */}
-        <div className="flex items-center gap-3 px-5 py-3 border-b border-dim shrink-0">
-          <h1 id="announcement-center-title" className="m-0 text-lg font-semibold text-fg-primary flex-1">
-            {t('announcements.title')}
-          </h1>
+    <Modal
+      title={t('announcements.title')}
+      onClose={closeCenter}
+      size="wide"
+      panelClassName="h-[78vh]"
+      bodyClassName="!overflow-hidden !p-0 flex flex-1 flex-col"
+      testId="announcement-center"
+      headerActions={(
+        <>
           {updateInfo?.has_update && (
-            <button
-              type="button"
+            <Button
+              variant="secondary"
+              size="sm"
               onClick={() => { settingsDrawer.open({ section: 'version' }); closeCenter() }}
               title={t('announcements.updateAvailable', { tag: updateInfo.latest_tag ?? updateInfo.latest_commit.slice(0, 8) })}
-              className="flex items-center gap-1.5 px-2 py-[5px] rounded-md text-xs font-mono text-accent bg-accent-soft border border-accent cursor-pointer hover:bg-accent/10 transition-colors shrink-0"
+              className="font-mono shrink-0"
               data-testid="announcement-update-btn"
             >
-              <span className="w-1.5 h-1.5 rounded-full bg-accent" />
+              <span className="dot bg-accent" aria-hidden="true" />
               <span>{updateInfo.latest_tag ?? t('announcements.updateAvailable', { tag: '' }).trim()}</span>
-            </button>
+            </Button>
           )}
-          <button
-            type="button"
+          <Button
+            variant="ghost"
+            size="sm"
+            iconOnly
             onClick={closeCenter}
             aria-label={t('announcements.close')}
-            className="flex items-center justify-center w-7 h-7 rounded-md text-fg-tertiary hover:text-fg-primary hover:bg-surface bg-transparent border-none cursor-pointer shrink-0"
+            className="shrink-0"
             data-testid="announcement-close"
           >
-            ✕
-          </button>
-        </div>
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+              <path d="M6 6l12 12M18 6 6 18" />
+            </svg>
+          </Button>
+        </>
+      )}
+    >
+      <div className="mt-section flex min-h-0 flex-1 flex-col border-t border-dim">
 
         {/* tag filter */}
         {tagsPresent.length > 1 && (
-          <div className="flex gap-1.5 px-5 py-2 border-b border-dim shrink-0">
-            {(['all', ...tagsPresent] as const).map((tg) => (
-              <button
-                key={tg}
-                type="button"
-                onClick={() => setActiveTag(tg)}
-                className={`px-2.5 py-1 text-xs rounded transition-colors cursor-pointer border ${
-                  activeTag === tg
-                    ? 'border-accent bg-accent-soft text-fg-primary'
-                    : 'border-dim bg-surface text-fg-secondary hover:border-accent/50'
-                }`}
-                data-testid={`announcement-filter-${tg}`}
-              >
-                {tagLabel(tg)}
-              </button>
-            ))}
+          <div className="shrink-0 border-b border-dim px-page py-related">
+            <SegmentedControl
+              items={tagOptions}
+              value={activeTag}
+              onChange={setActiveTag}
+              ariaLabel={t('announcements.filterLabel')}
+              idPrefix="announcement-filter"
+              size="sm"
+            />
           </div>
         )}
 
         {/* master-detail */}
         <div className="flex-1 flex min-h-0">
-          <ul className="w-64 shrink-0 overflow-y-auto border-r border-dim m-0 p-0 list-none">
+          <ul
+            ref={postListRef}
+            role="listbox"
+            aria-label={t('announcements.postsLabel')}
+            className="w-64 shrink-0 overflow-y-auto border-r border-dim m-0 p-0 list-none"
+          >
             {filtered.length === 0 && (
-              <li className="px-4 py-6 text-sm text-fg-tertiary">{t('announcements.empty')}</li>
+              <li role="status" className="px-section py-page text-sm text-fg-tertiary">{t('announcements.empty')}</li>
             )}
-            {filtered.map((p) => {
+            {filtered.map((p, index) => {
               const unread = !readIds.has(p.id)
               const isSel = p.id === selectedId
               return (
-                <li key={p.id}>
+                <li key={p.id} role="presentation">
                   <button
                     type="button"
+                    role="option"
+                    aria-selected={isSel}
+                    tabIndex={isSel || selectedId === null && index === 0 ? 0 : -1}
+                    data-announcement-index={index}
                     onClick={() => select(p)}
-                    className={`w-full text-left px-4 py-3 bg-transparent border-none border-b border-subtle cursor-pointer hover:bg-surface transition-colors ${
+                    onKeyDown={(event) => handlePostKeyDown(event, index)}
+                    className={`w-full cursor-pointer border-none border-b border-subtle bg-transparent px-section py-field text-left transition-colors hover:bg-surface focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-accent motion-reduce:transition-none ${
                       isSel ? 'bg-surface' : ''
                     }`}
                     data-testid={`announcement-item-${p.id}`}
                   >
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-related">
                       {unread && (
                         <span
+                          aria-hidden="true"
                           className="w-2 h-2 rounded-full bg-err shrink-0"
                           data-testid={`announcement-dot-${p.id}`}
                         />
                       )}
-                      <span className="text-sm font-medium text-fg-primary truncate">{p.title[lang]}</span>
+                      <span className="text-sm font-medium text-fg-primary truncate" title={p.title[lang]}>{p.title[lang]}</span>
                     </div>
-                    <div className="flex items-center gap-2 mt-1">
-                      <span className={`px-1.5 py-0.5 text-[10px] rounded ${tagChipClass(p.tag)}`}>
+                    <div className="mt-related flex items-center gap-related">
+                      <Badge tone={tagChipTone(p.tag)} size="sm">
                         {tagLabel(p.tag)}
-                      </span>
+                      </Badge>
                       <span className="text-xs text-fg-tertiary">{p.date}</span>
                     </div>
                   </button>
@@ -239,14 +273,19 @@ export function AnnouncementCenter() {
             })}
           </ul>
 
-          <div className="flex-1 overflow-y-auto px-6 py-5">
+          <div
+            role="region"
+            aria-labelledby={selected ? 'announcement-post-title' : undefined}
+            tabIndex={0}
+            className="flex-1 overflow-y-auto px-page py-page"
+          >
             {selected ? (
               <>
-                <h2 className="m-0 text-xl font-semibold text-fg-primary">{selected.title[lang]}</h2>
-                <div className="mt-1 text-xs text-fg-tertiary">
+                <h3 id="announcement-post-title" className="type-section-title m-0">{selected.title[lang]}</h3>
+                <div className="mt-related text-xs text-fg-tertiary">
                   {selected.date}{selected.version ? ` · v${selected.version}` : ''}
                 </div>
-                <div className="mt-4 text-sm text-fg-secondary [&_ul_ul]:list-[circle] [&_li_p]:my-1">
+                <div className="mt-section text-sm text-fg-secondary [&_ul_ul]:list-[circle] [&_li_p]:my-related">
                   <ReactMarkdown
                     remarkPlugins={[remarkGfm]}
                     components={mdComponents}
@@ -262,6 +301,6 @@ export function AnnouncementCenter() {
           </div>
         </div>
       </div>
-    </div>
+    </Modal>
   )
 }

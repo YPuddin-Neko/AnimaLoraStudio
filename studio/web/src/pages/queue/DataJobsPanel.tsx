@@ -12,6 +12,9 @@ import { useNavigate } from 'react-router-dom'
 import {
   api, type QueueHistoryPage, type Task, type TaskType,
 } from '../../api/client'
+import Alert from '../../components/Alert'
+import Card from '../../components/Card'
+import EmptyState from '../../components/EmptyState'
 import { useDialog } from '../../components/Dialog'
 import { useToast } from '../../components/Toast'
 import { useEventStream } from '../../lib/useEventStream'
@@ -128,10 +131,7 @@ export default function DataJobsPanel({
         className={`card card-hover block overflow-hidden text-left p-0 cursor-pointer ${task.status === 'running' ? 'border border-accent bg-accent-soft' : 'border border-subtle bg-surface'}`}
         data-testid={`job-row-${task.id}`}
       >
-        <div
-          className="px-[22px] py-4 grid gap-3 items-center"
-          style={{ gridTemplateColumns: '48px minmax(0,1fr) 96px 150px 120px' }}
-        >
+        <div className="ui-queue-job-grid px-[22px] py-4 grid gap-3 items-center">
           <span className={`font-mono text-sm ${task.status === 'running' ? 'text-accent font-semibold' : 'text-fg-tertiary'}`}>
             #{task.id}
           </span>
@@ -147,7 +147,7 @@ export default function DataJobsPanel({
             {task.status === 'running' && <span className="dot dot-running" />}
             {STATUS_LABEL[task.status] ?? task.status}
           </span>
-          <span className="font-mono text-xs text-fg-tertiary text-right">
+          <span className="ui-queue-job-timing font-mono text-xs text-fg-tertiary text-right">
             {task.status === 'running' ? (
               fmtJobDuration(task.started_at, null)
             ) : task.finished_at ? (
@@ -193,43 +193,39 @@ export default function DataJobsPanel({
   }
 
   return (
-    <div className="flex flex-col gap-4" data-testid="data-jobs-panel">
+    <div className="flex flex-col gap-section" data-testid="data-jobs-panel">
       {error && (
-        <div className="px-3.5 py-2.5 rounded-md bg-err-soft border border-err text-err text-xs font-mono">
+        <Alert tone="danger" size="sm" role="alert" className="font-mono">
           {error}
-        </div>
+        </Alert>
       )}
 
       {!loaded ? (
-        <div className="rounded-lg border border-subtle bg-surface py-8 text-center text-sm text-fg-tertiary">
+        <Card className="py-8 text-center text-sm text-fg-tertiary">
           {t('common.loading')}
-        </div>
+        </Card>
       ) : isEmpty ? (
-        <div className="rounded-lg border border-subtle bg-surface py-12 text-center">
-          <div className="text-md font-semibold text-fg-secondary mb-1.5">
-            {t('queue.jobs.empty')}
-          </div>
-          <div className="text-sm text-fg-tertiary">{t('queue.jobs.emptyHint')}</div>
-        </div>
+        <EmptyState
+          title={t('queue.jobs.empty')}
+          description={t('queue.jobs.emptyHint')}
+        />
       ) : (
         <>
           {live.length > 0 && (
-            <section className="flex flex-col gap-2">
-              <h3 className="text-xs font-semibold text-fg-tertiary uppercase tracking-wide">
+            <section className="flex flex-col gap-related">
+              <h3 className="type-section-label">
                 {t('queue.sectionActive')} ({live.length})
               </h3>
               {live.map(renderRow)}
             </section>
           )}
 
-          <section className="flex flex-col gap-2">
-            <h3 className="text-xs font-semibold text-fg-tertiary uppercase tracking-wide">
+          <section className="flex flex-col gap-related">
+            <h3 className="type-section-label">
               {t('queue.sectionHistory')} ({history.total})
             </h3>
             {history.items.length === 0 ? (
-              <div className="rounded-lg border border-subtle bg-surface py-8 text-center text-sm text-fg-tertiary">
-                {t('queue.noMatch')}
-              </div>
+              <EmptyState size="sm" description={t('queue.noMatch')} />
             ) : (
               history.items.map(renderRow)
             )}

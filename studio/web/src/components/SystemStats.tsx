@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { useTranslation } from 'react-i18next'
 import { api, type SystemStats as SystemStatsData } from '../api/client'
 import { useEventStream } from '../lib/useEventStream'
 
@@ -14,9 +15,10 @@ function fmtGb(used: number, total: number): string {
 
 interface PillProps {
   label: string
+  accessibleLabel: string
   value: string
   pct: number
-  tooltip: string
+  description: string
 }
 
 /** 进度条胶囊 — 整个 pill 背景按占用百分比填色 (>=70% warn, >=90% err)，
@@ -26,17 +28,23 @@ interface PillProps {
  *  字符（"CPU 13%"），MEM/VRAM 占 11 字符（"MEM 35.6/63G"），auto-width 下
  *  宽度差近 1 倍。固定下界 96px (够 "VRAM 80.0/128G" 之类最长情况)，label 左
  *  value 右两端对齐，bg 填充自然居于中间。 */
-function Pill({ label, value, pct, tooltip }: PillProps) {
+function Pill({ label, accessibleLabel, value, pct, description }: PillProps) {
   const tone = toneClasses(pct)
   const clamped = Math.min(100, Math.max(0, pct))
   return (
     <div
+      role="meter"
+      aria-label={accessibleLabel}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      aria-valuenow={clamped}
+      aria-valuetext={description}
       className="relative flex items-center justify-between gap-1.5 h-8 min-w-[96px] px-2 rounded-md border border-dim bg-surface overflow-hidden shrink-0"
-      title={tooltip}
+      title={description}
     >
       <div
-        aria-hidden
-        className={`absolute inset-y-0 left-0 ${tone.bg} transition-[width] duration-500 ease-out`}
+        aria-hidden="true"
+        className={`absolute inset-y-0 left-0 ${tone.bg} transition-[width] duration-500 ease-out motion-reduce:transition-none`}
         style={{ width: `${clamped}%` }}
       />
       <span className="relative z-10 text-2xs uppercase tracking-wider text-fg-tertiary">{label}</span>
@@ -46,6 +54,7 @@ function Pill({ label, value, pct, tooltip }: PillProps) {
 }
 
 export default function SystemStats() {
+  const { t } = useTranslation()
   const [stats, setStats] = useState<SystemStatsData | null>(null)
 
   // mount 时拉一次冷启动 (避免空白等 2.5s 首个 SSE 事件)，之后纯靠后端
@@ -75,22 +84,18 @@ export default function SystemStats() {
 
   if (!stats) return null
 
-  // 上游在这里算过一个 gpu0（`gpu.find(g => g.active) ?? gpu[0]`），给「pill 只显示
-  // 一张卡」的旧 UI 用。本分支的 pill 是全卡汇总 + tooltip 逐卡明细，没有「选一张
-  // 显示」这回事，所以 gpu0 与 active 在这里都没有落脚点。
-  //
-  // 也刻意**不**在逐卡明细里标「在用」：topbar 是 server 进程报的，
-  // `torch.cuda.current_device()` 只反映 server 自己那张，与训练子进程用哪张无关；
-  // 多卡 DDP 下每个 rank 各占一张，「在用」根本不是单张。真机上标出来的效果是
-  // 「#0 0% ←在用 / #1 100%」，看着像读数矛盾，只会制造困惑。
-  const ramPct = stats.ram_total_gb > 0 ? (stats.ram_used_gb / stats.ram_total_gb) * 100 : 0
-
   // ── 多卡汇总 ────────────────────────────────────────────────────────
-  // pill 显示全卡合计，逐卡明细进 tooltip（原实现只显示 gpu[0] + "(+N more)"，
-  // 双卡机器上等于一半的显存看不见）。
+  //
+  // 与上游的差别：上游显示 `active` 那一张 + 「(+N more)」，本分支显示**全卡合计**、
+  // 逐卡明细进 description。双卡 DCU 上「只显示一张」等于一半显存看不见，而多卡
+  // 训练时两张卡的占用都要盯。
+  //
+  // 也因此不用上游的 gpu0/active 选择：DDP 下每个 rank 各占一张，"在用" 不是单张
+  // （topbar 由 server 进程报，current_device() 只反映 server 自己那张，与训练子
+  // 进程无关）。
   //
   // 汇总口径按量的性质分开，不能一律取和或一律取平均：
-  // - **显存**：物理量，可加 —— 合计已用 / 合计总量。
+  // - **显存 / 功率**：物理量，可加 —— 合计已用 / 合计总量。
   // - **利用率**：百分比，相加无意义（两卡满载会得到 200%）—— 取算术平均。
   //   刻意不按显存或 SM 数加权：topbar 是粗粒度概览，加权在同型号多卡上与
   //   平均等价，混插不同型号时反而更难解释。
@@ -98,20 +103,25 @@ export default function SystemStats() {
   const hasGpu = gpus.length > 0
   const multi = gpus.length > 1
 
+  const ramPct = stats.ram_total_gb > 0 ? (stats.ram_used_gb / stats.ram_total_gb) * 100 : 0
+
   const vramUsed = gpus.reduce((s, g) => s + g.vram_used_gb, 0)
   const vramTotal = gpus.reduce((s, g) => s + g.vram_total_gb, 0)
   const vramPct = vramTotal > 0 ? (vramUsed / vramTotal) * 100 : 0
 
   // 利用率可能整体缺失（DCU 上 smi 解析不到时为 null），只对有读数的卡求平均。
   // 一张都没有 → null，整个 GPU pill 隐藏（0% 是合法读数，不能拿来兜底缺失值）。
+  //
+  // 上游这版直接 `${gpu0.util_pct}%` / `pct={gpu0.util_pct}` 不判空 —— 在 DCU 上
+  // 会渲染出 "null%"、`pct` 变 NaN（宽度 `NaN%` 是无效 CSS）。判空必须保留。
   const utilValues = gpus.map((g) => g.util_pct).filter((u): u is number => u != null)
   const utilAvg = utilValues.length > 0
     ? utilValues.reduce((s, u) => s + u, 0) / utilValues.length
     : null
 
-  // 两个 pill 的 tooltip 各自只列**自己那项**指标的逐卡明细。
-  // 早期版本两边共用一份「显存 + 利用率 + 温度」的合并行，于是悬停 GPU 利用率时
-  // 满屏是显存数字，要找的利用率被夹在中间 —— tooltip 的意义就是「这个 pill 的
+  // 三个 pill 的 description 各自只列**自己那项**指标的逐卡明细。
+  // 早期版本共用一份「显存 + 利用率 + 温度」的合并行，于是悬停 GPU 利用率时
+  // 满屏是显存数字，要找的利用率被夹在中间 —— description 的意义就是「这个 pill 的
   // 数是怎么来的」，混进无关指标反而更难读。
   //
   // 温度跟着利用率而不是显存：它俩都是「卡当前忙不忙」的即时状态，且温度只有
@@ -125,9 +135,11 @@ export default function SystemStats() {
     return `#${g.index} ${g.name}  ${g.vram_used_gb.toFixed(1)}/${Math.round(g.vram_total_gb)}G${pct}`
   }).join('\n')
 
-  /** 逐卡利用率 + 温度：`#0 BW  90% · 70°C`。缺失项省略而非填 0 —— 0% 是合法读数。 */
+  /** 逐卡利用率 + 温度：`#0 BW  90% · 70°C`。缺失项写明不可用而非填 0。 */
   const perCardUtil = gpus.map((g) => {
-    const util = g.util_pct != null ? `${g.util_pct}%` : '利用率不可用'
+    const util = g.util_pct != null
+      ? `${g.util_pct}%`
+      : t('topbar.systemStats.utilUnavailable')
     const temp = g.temp_c != null ? ` · ${g.temp_c}°C` : ''
     return `#${g.index} ${g.name}  ${util}${temp}`
   }).join('\n')
@@ -138,7 +150,7 @@ export default function SystemStats() {
   // hy-smi 的 AvgPwr 列报 79W/95W，而 sysfs 同一时刻是 564W/563W（差 6-7 倍）。
   // 后端已改成读 sysfs，这里把真实值显示出来。
   //
-  // tooltip 里连频率一起给（当前 / 最高）：判断卡有没有被限制靠的是频率档位，
+  // description 里连频率一起给（当前 / 最高）：判断卡有没有被限制靠的是频率档位，
   // 撞功率墙或温度墙的卡会主动降档。只摆数据，不在 UI 里写结论。
   const powerValues = gpus.map((g) => g.power_w).filter((p): p is number => p != null)
   // 合计而非平均：功率是物理量，可加（与显存同口径，与利用率相反）。
@@ -156,7 +168,9 @@ export default function SystemStats() {
    *  只给数，不加「满频 / 降频」的判词：`当前/最高` 两个数并排本身就说明了状态，
    *  再补一个词是同义重复。 */
   const perCardPower = gpus.map((g) => {
-    const pw = g.power_w != null ? `${g.power_w}W` : '功率不可用'
+    const pw = g.power_w != null
+      ? `${g.power_w}W`
+      : t('topbar.systemStats.powerUnavailable')
     const cap = g.power_cap_w != null ? ` / ${g.power_cap_w}W` : ''
     let clk = ''
     if (g.sclk_mhz != null) {
@@ -168,69 +182,85 @@ export default function SystemStats() {
   }).join('\n')
 
   // 单卡时不重复显示汇总行（与逐卡行内容完全一样，纯噪音）
-  const vramTooltip = hasGpu
-    ? (multi
-        ? `显存合计 ${vramUsed.toFixed(1)} / ${Math.round(vramTotal)} GB (${vramPct.toFixed(0)}%) · ${gpus.length} 卡\n${perCardVram}`
-        : `显存 ${perCardVram}`)
-    : ''
-  const utilTooltip = hasGpu
-    ? (multi && utilAvg != null
-        ? `GPU 利用率均值 ${utilAvg.toFixed(0)}% · ${gpus.length} 卡\n${perCardUtil}`
-        : `GPU 利用率 · ${perCardUtil}`)
-    : ''
-  const powerTooltip = hasGpu && powerTotal != null
-    ? (multi
-        ? `功耗合计 ${powerTotal}W · ${gpus.length} 卡\n${perCardPower}`
-        : `功耗 ${perCardPower}`)
-    : ''
+  const vramDescription = multi
+    ? t('topbar.systemStats.vramMulti', {
+        used: vramUsed.toFixed(1),
+        total: Math.round(vramTotal),
+        percent: vramPct.toFixed(0),
+        count: gpus.length,
+        perCard: perCardVram,
+      })
+    : t('topbar.systemStats.vramSingle', { perCard: perCardVram })
+  const utilDescription = multi && utilAvg != null
+    ? t('topbar.systemStats.gpuMulti', {
+        percent: utilAvg.toFixed(0),
+        count: gpus.length,
+        perCard: perCardUtil,
+      })
+    : t('topbar.systemStats.gpuSingle', { perCard: perCardUtil })
+  const powerDescription = multi
+    ? t('topbar.systemStats.powerMulti', {
+        watts: powerTotal ?? 0,
+        count: gpus.length,
+        perCard: perCardPower,
+      })
+    : t('topbar.systemStats.powerSingle', { perCard: perCardPower })
 
   return (
-    <div className="hidden md:flex items-center gap-2 shrink-0">
+    <div className="ui-app-shell-topbar-stats">
       <Pill
         label="CPU"
+        accessibleLabel={t('topbar.systemStats.cpuLabel')}
         value={`${stats.cpu_pct.toFixed(0)}%`}
         pct={stats.cpu_pct}
-        tooltip={`CPU 占用 ${stats.cpu_pct.toFixed(1)}%`}
+        description={t('topbar.systemStats.cpu', { percent: stats.cpu_pct.toFixed(1) })}
       />
       <Pill
         label="MEM"
+        accessibleLabel={t('topbar.systemStats.memoryLabel')}
         value={fmtGb(stats.ram_used_gb, stats.ram_total_gb)}
         pct={ramPct}
-        tooltip={`内存 ${stats.ram_used_gb.toFixed(1)} / ${stats.ram_total_gb.toFixed(1)} GB (${ramPct.toFixed(0)}%)`}
+        description={t('topbar.systemStats.memory', {
+          used: stats.ram_used_gb.toFixed(1),
+          total: stats.ram_total_gb.toFixed(1),
+          percent: ramPct.toFixed(0),
+        })}
       />
       {hasGpu && (
         <>
-          {/* 利用率可能整体拿不到（DCU 上 smi 解析失败时为 null，见 GpuStats.util_pct）
-              —— 整个 pill 隐藏而不是显示 "null%" / "0%"。0% 是合法读数，不能拿来
-              兜底缺失值。VRAM pill 不受影响：显存在两个后端上都可靠。
+          {/* 利用率可能整体拿不到（DCU 上 smi 解析失败时为 null）—— 整个 pill 隐藏
+              而不是显示 "null%" / "0%"。0% 是合法读数，不能拿来兜底缺失值。
               多卡时 label 带卡数（"GPU×2"），让「这是均值不是单卡」一眼可见。 */}
           {utilAvg != null && (
             <Pill
               label={multi ? `GPU×${gpus.length}` : 'GPU'}
+              accessibleLabel={t('topbar.systemStats.gpuLabel')}
               value={`${utilAvg.toFixed(0)}%`}
               pct={utilAvg}
-              tooltip={utilTooltip}
+              description={utilDescription}
             />
           )}
           {/* 功耗 pill：只有 DCU 报得出（NVIDIA 侧后端未接 → 隐藏，不显示 "0W"）。
               pct = 合计功率 / 合计上限，语义与 toneClasses 的阈值正好对得上：
-              逼近上限（≥90%）的卡确实会降频，该警示；真机 580/1000 = 58% 走中性色。
+              逼近上限（≥90%）的卡确实会降频，该警示；真机 1127/2000 = 56% 走中性色。
               上限拿不到时传 0（不填色）—— 没有比例可算，不如不画。 */}
           {powerTotal != null && (
             <Pill
               label={multi ? `PWR×${gpus.length}` : 'PWR'}
+              accessibleLabel={t('topbar.systemStats.powerLabel')}
               value={`${powerTotal}W`}
               pct={powerCapTotal != null && powerCapTotal > 0
                 ? (powerTotal / powerCapTotal) * 100
                 : 0}
-              tooltip={powerTooltip}
+              description={powerDescription}
             />
           )}
           <Pill
             label={multi ? `VRAM×${gpus.length}` : 'VRAM'}
+            accessibleLabel={t('topbar.systemStats.vramLabel')}
             value={fmtGb(vramUsed, vramTotal)}
             pct={vramPct}
-            tooltip={vramTooltip}
+            description={vramDescription}
           />
         </>
       )}

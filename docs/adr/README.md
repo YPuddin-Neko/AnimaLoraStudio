@@ -21,7 +21,10 @@
 | 0013 | [Changelog 迁入公告系统（移除 release_notes.yaml + 旧端点）](0013-changelog-into-announcements.md) | Accepted | 2026-06-28 |
 | 0014 | [测试出图延迟加载 VAE，并分块合并 FP8 LoRA](0014-lazy-vae-and-chunked-fp8-lora-merge.md) | Accepted | 2026-07-20 |
 | 0015 | [用实测峰值协调测试出图的 TE / DiT 驻留](0015-calibrated-te-dit-vram-orchestration.md) | Accepted | 2026-07-20 |
-| 0016 | [双加速器后端：NVIDIA CUDA 与海光 DCU 并存](0016-dual-accelerator-backend-hygon-dcu.md) | Accepted | 2026-08-10 |
+| 0016 | [分阶段升级 LyCORIS v4 并隔离实验性 kernel backend](0016-adopt-lycoris-v4-with-safe-kernel-rollout.md) | Accepted（eager 基线已落地） | 2026-09-04 |
+| 0017 | [分离 LLM 预设、用户设置与服务凭证的持久化边界](0017-split-llm-preset-settings-credentials.md) | Proposed | 2026-09-06 |
+| 0018 | [用提案式 ONNX 检测生成可撤销的头部空间遮罩](0018-proposal-based-auto-head-mask.md) | Accepted | 2026-09-06 |
+| 0019 | [双加速器后端：NVIDIA CUDA 与海光 DCU 并存](0019-dual-accelerator-backend-hygon-dcu.md) | Accepted | 2026-08-10 |
 
 ## 状态值
 

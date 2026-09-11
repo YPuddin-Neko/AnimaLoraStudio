@@ -15,7 +15,7 @@
                                                         ↓ 可循环（新建 v2 重新筛选/打标）
 ```
 
-每个版本（version）独立维护 `train/` `reg/` `output/` `samples/` `monitor_state.json`；`download/` 在项目级共享，**永远不删**（永远是「全量来源」）。预处理（upscale + crop + dedupe）发生在版本级 `train/` 上，状态走 `versions/{label}/train/manifest.json`（ADR 0010，supersedes ADR 0004）。`projects/{id}/preprocess/` 仅作老项目的只读 fallback 给 `ensure_train_manifest` 迁移用。详见 §2 物理布局。
+每个版本（version）独立维护 `config.yaml`、`train/`、`reg/` 和默认 `output/`；训练任务的配置快照、监控与采样落在 `studio_data/tasks/{id}/`，不再共享 version 级监控现场。`download/` 在项目级共享，筛选不会移走原始素材（显式删除素材或项目除外）。预处理（upscale + crop + dedupe）发生在版本级 `train/` 上，状态走 `versions/{label}/train/manifest.json`（ADR 0010，supersedes ADR 0004）。`projects/{id}/preprocess/` 仅作老项目的只读 fallback 给 `ensure_train_manifest` 迁移用。详见 §2 物理布局。
 
 ---
 
@@ -23,13 +23,23 @@
 
 ```
 studio_data/
-├── secrets.json                          ★ 全局服务配置（gelbooru token 等）
-│                                         studio_data/ 已被 .gitignore，自然安全
-├── presets/                              ★ 全局预设池
+├── settings.json                         ★ 非敏感全局设置（ADR 0017）
+├── credentials.json                      ★ 本机明文凭证；API 只写不读 secret
+├── storage-layout.json                   文件存储迁移状态与源 hash
+├── llm_presets/                          ★ LLM preset：一实体一 JSON 文件
+├── cache/llm_models/                     可删除、可重建的模型发现缓存
+├── backups/                              原子文件历史与迁移前 legacy 备份
+├── secrets.json                          旧版兼容投影；新代码不得作为权威源
+├── presets/                              ★ 全局训练预设池
 │   ├── train_baseline.yaml
 │   └── proj_42_baseline.yaml             从某 version 推回的预设
+├── tasks/{id}/                           ★ 每次任务的独立现场
+│   ├── snapshot/config.yaml              训练入队时冻结的执行配置
+│   ├── monitor/state.json                该任务的训练指标
+│   ├── samples/                          该任务的训练采样图
+│   └── run.log                           该任务的日志
 ├── projects/{id}-{slug}/
-│   ├── project.json                      title / stage / active_version_id / ts
+│   ├── project.json                      title / active_version_id / 时间戳等
 │   ├── download/                         project 级共享，全量备份
 │   │   ├── 12345.png
 │   │   └── 12345.json                    Gelbooru 元数据，可选
@@ -37,7 +47,8 @@ studio_data/
 │   │   └── manifest.json                 v0.8 老 schema；新代码不再写
 │   └── versions/
 │       └── {label}/                      ★ label 用户填："baseline" / "high-lr"
-│           ├── version.json              config_name / stage / note
+│           ├── version.json              status / phase / note 等元数据
+│           ├── config.yaml               ★ 私有训练配置，不与全局 preset 共享
 │           ├── train/                    ★ 预处理产物 + 状态都在这（ADR 0010）
 │           │   ├── manifest.json         {images:{"folder/file":{origin,mtime,size,processed?}}}
 │           │   └── 5_concept/            Kohya 风格 N_xxx
@@ -51,13 +62,10 @@ studio_data/
 │           │   └── 1_general/
 │           │       ├── reg_001.png
 │           │       └── reg_001.txt
-│           ├── output/                   训练产物
-│           │   ├── lora_step500.safetensors
-│           │   ├── lora_final.safetensors
-│           │   └── state_step1000.pt
-│           ├── samples/
-│           │   └── step500_p0.png
-│           └── monitor_state.json        该 version 训练 loss/lr 曲线
+│           └── output/                   默认训练产物目录（用户可在 config 中更改）
+│               ├── lora_step500.safetensors
+│               ├── lora_final.safetensors
+│               └── state_step1000.pt
 ```
 
 > v0.8 起 项目 / 版本删除是直接 `rmtree`（无回收站）— 之前有过 `_trash/` 软删但无恢复 UI / 无定期清理，等同硬删却 silently 累积孤儿目录，故移除（详见 [CHANGELOG 0.8.0](../../CHANGELOG.md)）。
@@ -69,7 +77,7 @@ studio_data/
 
 ## 3. SQLite Schema
 
-DB 落在 `studio_data/studio.db`。Migrations 在 `studio/infrastructure/migrations/` 顺序应用（`PRAGMA user_version` 控制）。
+DB 落在 `studio_data/studio.db`。Migrations 在 `studio/infrastructure/migrations/` 顺序应用（`PRAGMA user_version` 控制）。下方为核心列与部分迁移的示意，不是可直接建库的完整 DDL。
 
 ```sql
 CREATE TABLE projects (
@@ -87,7 +95,7 @@ CREATE TABLE versions (
     id                   INTEGER PRIMARY KEY AUTOINCREMENT,
     project_id           INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
     label                TEXT NOT NULL,             -- baseline / high-lr / ...
-    config_name          TEXT,                       -- 引用 presets/{config_name}.yaml
+    config_name          TEXT,                       -- 遗留兼容字段；当前配置权威为 version/config.yaml
     -- ADR-0007: status + phase 双正交字段（v8 加；v9 删 stage）
     status               TEXT NOT NULL DEFAULT 'preparing',
                          -- preparing | training | completed | failed | canceled
@@ -139,53 +147,33 @@ CREATE INDEX idx_tasks_queue ON tasks(status, priority DESC, created_at ASC);
 | `phase` 跳过 | 用户按 "下一步"（`preprocessing` / `regularizing` 可跳） | 校验通过（preprocessing 无强制校验；regularizing 无 reg job running）→ cursor 直接跳到下一个 |
 | **不主动回退** | — | user 删数据后下次 next 校验失败时提示，由 user redo（§11.5-C） |
 
-**Project 无 stage**：ADR-0007 PR-5 删除。项目级数据集状态（download 文件数）由 UI 实时扫派生（§6.10）。
+**Project 无 stage**：ADR-0007 PR-5 删除。项目级数据集状态（download 文件数）由 UI 实时扫派生（见 §1 / §2）。
 
 ---
 
-## 4. 全局服务配置 `studio_data/secrets.json`
+## 4. 全局设置、凭证与 LLM preset（ADR 0017）
 
-```jsonc
-{
-  "gelbooru": {
-    "user_id": "",
-    "api_key": "",
-    "save_tags": false,                   // 是否同时保存 booru 自带标签
-    "convert_to_png": true,
-    "remove_alpha_channel": false
-  },
-  "huggingface": {
-    "token": "",                           // WD14 公开模型不强制；私有/限速时填
-    "endpoint": ""                         // 空 = HF 官方；可粘贴自建反代 URL。0.8.2 起 hf-mirror 暂时隐藏，见 docs/todo/hf-mirror-recheck.md
-  },
-  "joycaption": {
-    "base_url": "http://localhost:8000/v1",
-    "model": "fancyfeast/llama-joycaption-beta-one-hf-llava",
-    "prompt_template": "Descriptive Caption"
-  },
-  "wd14": {
-    "model_id": "SmilingWolf/wd-vit-tagger-v3",   // 当前选中值；候选列表统一在 model_sources
-    "threshold_general": 0.35,
-    "threshold_character": 0.85,
-    "blacklist_tags": []
-  },
-  "models": {
-    "selected": { "anima": "latest", "krea2": "raw_fp8" },   // 按族选中的主模型 variant / 自定义绝对路径
-    "selected_te": { "krea2": "fp8" },                       // Krea 2 文本编码器精度（bf16 / fp8）
-    "vram_policy": "auto"                                    // 出图显存策略：auto / save_vram / performance
-  },
-  "model_sources": {
-    // 模型来源统一（0.20）：每个 domain = 候选列表（内置 preset + 用户候选），
-    // kind=download|local；覆盖 wd14 / cltagger / eval 指标 / 放大器 / 两族主模型八个 domain。
-    // 当前选中值仍写各自旧字段（wd14.model_id / models.selected 等），运行时消费方零改动。
-    "wd14": [ { "kind": "download", "value": "SmilingWolf/wd-vit-tagger-v3", "builtin": true } ]
-  }
-}
-```
+自 ADR 0017 起，`studio_data/secrets.json` 不再是新版本的配置权威源。配置按生命周期和安全边界拆分：
 
-Pydantic 模型在 `studio/infrastructure/secrets.py`（`studio/secrets.py` 是兼容 shim）；GET / PUT `/api/secrets` 操作；敏感字段（`token` / `api_key`）GET 时显示 `"***"`，PUT 时客户端发 `"***"` 表示「保持不变」。老字段（`wd14.model_ids` / `models.custom` / `selected_anima` 等）由 validator 迁移进新结构并保留写盘（回滚版本可读），入站旧键继续生效。
+| 数据 | 权威存储 | API |
+|---|---|---|
+| 非敏感全局设置 | `studio_data/settings.json` | `GET/PATCH /api/settings` |
+| API key / token | `studio_data/credentials.json` | `/api/credentials`；secret 仅 write-only |
+| builtin LLM 模板 | `studio/llm_presets/*.json` | 只读；由代码发布 |
+| 用户 preset / builtin override | `studio_data/llm_presets/{id}.json` | `/api/llm-tagger/presets` CRUD |
+| 服务端模型候选 | `studio_data/cache/llm_models/` | 刷新接口，只改缓存 |
 
-前端 `/tools/settings` 表单分 7 个 tab（数据集 / 打标 / 训练 / 监控 / 测试 / 页面 / 系统），密码字段用 `<input type="password">`。系统 tab 含 webui 自更新版本卡片（详见 [ADR 0002](../adr/0002-webui-self-update.md)）和服务重启。
+`settings.json` 不保存 secret；LLM preset 只保存稳定的 `credential_ref`。凭证文件在本机为明文，这是“不使用 OS keyring、也不做同机伪加密”的明确威胁模型：本机文件读取权限仍等价于读取凭证。设置、凭证与 LLM preset 文件存储统一使用进程内 read-modify-write 锁、同目录临时文件、`fsync`、`os.replace`、有效版本备份和损坏恢复；存在但无法恢复的文件必须拒绝覆盖。
+
+前端 `/tools/settings` 继续使用聚合后的 `Secrets` TypeScript 视图展示设置，但普通变更提交到 `/api/settings`，LLM preset 和 credential 只能走独立资源 API。聚合响应永远把敏感字段显示为 `"***"`。`/api/secrets` 仅为兼容旧客户端保留；新代码不得通过它修改 LLM preset 列表。
+
+首次启动会严格读取旧 `secrets.json`，按 `storage-layout.json` 的 prepared/complete 状态进行可续跑迁移；迁移前原文件进入 `backups/legacy/`。只有 complete marker 落盘后新布局才成为权威源。此后 `secrets.json` 至多是供旧版本回滚的 best-effort 派生投影。
+
+排队的 LLM 打标任务在 job params 中冻结不含 secret 的 preset 快照（含 preset ID、ETag、完整 recipe 与 `credential_ref`）；worker 执行时只解析该凭证。preset 后续编辑/删除不改变已排队任务，凭证缺失则 fail-fast，禁止回退到其他 key。
+
+Pydantic 兼容模型仍在 `studio/infrastructure/secrets.py`（`studio/secrets.py` 是 shim），但持久化边界分别位于 `settings_store.py`、`credentials.py`、`llm_preset_store.py` 和 `config_store.py`。
+
+前端 `/tools/settings` 表单分 9 个 tab（密钥 / 数据集 / 预处理 / 打标 / 训练 / 监控 / 测试 / 页面 / 系统）。系统 tab 含 webui 自更新版本卡片（详见 [ADR 0002](../adr/0002-webui-self-update.md)）和服务重启。
 
 ---
 
@@ -194,7 +182,7 @@ Pydantic 模型在 `studio/infrastructure/secrets.py`（`studio/secrets.py` 是�
 ```
 ┌──────────────────────┐
 │  Anima                │
-│  lora studio · 0.26.0 │ ← 版本号从 /api/health 拉，single source of truth
+│  lora studio · 0.27.0 │ ← 版本号从 /api/health 拉，single source of truth
 ├──────────────────────┤
 │ ▶ 项目 (Projects)    │ /
 │   队列 (Queue)       │ /queue
@@ -224,7 +212,7 @@ Pydantic 模型在 `studio/infrastructure/secrets.py`（`studio/secrets.py` 是�
 └──────────────────────┘
 ```
 
-状态符号：✓ 完成 / ● 进行中 / ○ 未开始（按 stage + version.stats 派生）。
+状态符号：✓ 完成 / ● 进行中 / ○ 未开始（按 status / phase + version.stats 派生）。
 
 「③ 预处理」内部按 query param 切多个**工具**子页（无 stage 顺序）：
 
@@ -232,7 +220,7 @@ Pydantic 模型在 `studio/infrastructure/secrets.py`（`studio/secrets.py` 是�
 - `?tool=dedupe` — 去重 / 差分审核
 - `?tool=upscale` — 放大（ESRGAN 等 spandrel 模型）
 - `?tool=crop` — 裁剪（手动 / 自动聚类预填）
-- `?tool=inpaint` — 涂抹（取色笔刷覆盖文字水印 + Mask 笔刷）
+- `?tool=inpaint` — 涂抹（取色笔刷覆盖文字水印 + Mask 笔刷 + [自动头部遮罩](../user-guide/auto-head-mask.md)；自动结果先进入未保存编辑，既有保存操作才落盘）
 
 详见 [crop design](../design/preprocess-crop-design.md) §5 / §9、[inpaint / mask design](../design/preprocess-inpaint-mask-design.md)。
 
@@ -240,20 +228,20 @@ Pydantic 模型在 `studio/infrastructure/secrets.py`（`studio/secrets.py` 是�
 
 ## 6. SSE 事件目录
 
-复用 `studio.event_bus.bus`：
+复用 `studio.infrastructure.event_bus.bus`；下表列出主要跨页面事件（字段为摘要）：
 
 | type | 字段 | 触发 |
 |---|---|---|
 | `task_state_changed` | `task_id`, `status`, `project_id?`, `version_id?` | 训练任务状态变 |
-| `monitor_state_updated` | `task_id`, `state` | anima_train 写 monitor_state.json，全量 state 塞 payload |
-| `project_state_changed` | `project_id`, `stage` | 项目 stage 推进 |
-| `version_state_changed` | `project_id`, `version_id`, `stage` | 版本 stage 推进 |
+| `monitor_progress` | `task_id`, `delta` | monitor poller 推送新增 loss / lr / samples 与最新进度；首次快照走 GET `/api/state` |
+| `project_state_changed` | `project_id` | 项目元数据变化，通知客户端重新读取 |
+| `version_state_changed` | `project_id`, `version_id`, `status`, `phase` | 版本状态或元数据变化 |
 | `job_state_changed` | `job_id`, `project_id`, `version_id?`, `kind`, `status` | download / tag / reg_build / generate / preprocess job |
-| `job_log_appended` | `job_id`, `text`, `seq` | worker 写日志 → 推增量到前端 |
-| `generate_progress` | `job_id`, `step`, `total_steps` | 推理 daemon 出图进度 |
+| `job_log_appended` | `job_id`, `project_id`, `version_id?`, `kind`, `text`, `seq`, `end_offset` | worker 日志增量与续读偏移 |
 | `preprocess_progress` | `job_id`, `project_id`, `idx`, `total`, `name`, `status`, `action?`, `succeeded`, `failed`, `skipped` | preprocess_worker 放大每张图完成 → 前端实时刷 files / 进度 / 盘占 |
 | `crop_progress` | `job_id`, `project_id`, `idx`, `total`, `name`, `status`, `n_out?`, `outputs?`, `succeeded`, `failed`, `skipped` | preprocess_worker 裁剪每张图完成；worker 端节流 ≥1Hz（done 事件聚合，skip/fail/首末强发）|
-| `system_stats_updated` | `cpu`, `gpu`, `mem`, `vram` | `_StatsThread` 2.5s 周期推 Topbar 系统资源 pill（v0.6） |
+| `head_mask_progress` | `job_id`, `project_id`, `version_id`, `idx`, `total`, `name`, `status`, `detections?`, `succeeded`, `failed`, `skipped` | preprocess_worker 自动头部检测逐图进度；只生成提案，不写原图或 mask |
+| `system_stats_updated` | `payload`（CPU / GPU / 内存 / 显存指标） | `studio/api/lifespan.py` 资源采样线程周期推送 Topbar 指标 |
 
 前端 `useEventStream.ts` 共享一条 `EventSource`，多个组件订阅不会重复连。
 
@@ -271,7 +259,7 @@ __EVENT__:<event_type>:<json_payload>
 print('__EVENT__:preprocess_progress:{"idx":5,"total":73,"status":"done"}', flush=True)
 ```
 
-`studio/supervisor.py:_EVENT_MARKER` 识别该前缀后：
+`studio/supervisor/core.py` 的事件解析与日志回调识别该前缀后：
 
 1. 解析 `event_type` 和 JSON payload
 2. **自动注入** `job_id` / `project_id` / `version_id` / `kind`（worker 不用知道也不能伪造）
@@ -281,7 +269,7 @@ print('__EVENT__:preprocess_progress:{"idx":5,"total":73,"status":"done"}', flus
 设计取舍：
 - 比专门搭 IPC（队列 / socket / 状态文件）轻 — 复用现成的 stdout → log_tail 通道
 - 比让前端文本 grep 日志靠谱 — 显式 schema、字段稳定
-- 解析失败时 supervisor 写 `logger.exception` 但不会崩；标记行被丢弃，主流程不受影响
+- 解析失败时 supervisor 记录警告并发送 `event_malformed`；标记行被丢弃，主流程不受影响
 - 不要把敏感信息塞 payload — 任何看得到 SSE 流的客户端都能拿到
 
 谁可以用：任何在 `studio/workers/` 下的子进程 worker。当前只 `preprocess_worker` 用了；
@@ -293,22 +281,25 @@ download / tag / reg_build worker 暂时只走 `job_log_appended`，如果将来
 ## 7. Tagger 抽象
 
 ```python
-# studio/services/tagger.py
-class TagResult(TypedDict):
+# studio/services/tagging/base.py（节选）
+class TagResult(TypedDict, total=False):
     image: Path
-    tags: list[str]                       # 排序好的（按概率降）
-    raw_scores: dict[str, float]          # 可选：每 tag 的概率
+    tags: list[str]
+    caption: str                          # 渲染后的 caption
+    caption_json: dict                    # 结构化 JSON
+    raw_scores: dict[str, float]          # 每 tag 的概率
+    error: str                           # 失败信息
 
 class Tagger(Protocol):
-    name: str                              # "wd14" / "cltagger" / "joycaption"
-    requires_service: bool                 # 本地 ONNX False；JoyCaption True (vLLM)
+    name: str                            # wd14 / cltagger / joycaption / llm
+    requires_service: bool               # 本地 ONNX False；远程服务 True
 
     def is_available(self) -> tuple[bool, str]: ...
     def prepare(self) -> None: ...
     def tag(
         self,
         image_paths: list[Path],
-        on_progress: Callable[[int, int], None] = None,
+        on_progress: Callable[[int, int], None] = lambda d, t: None,
     ) -> Iterator[TagResult]: ...
 ```
 
@@ -331,19 +322,20 @@ ONNX 类 tagger（WD14 / CLTagger）继承 `OnnxTaggerBase`，自动获得线程
                          │               │
                   ┌──────┴───────────────┴────────┐
                   │  versions/baseline/           │
-                  │    config_name = "..."        │
+                  │    config.yaml（私有副本）    │
                   └──────────────────────────────┘
 ```
 
 | 操作 | 流程 |
 |---|---|
 | 创建版本 | 用户选「从预设 fork」或「从空白开始」 |
-| Fork preset | 复制 `presets/{name}.yaml` → 自动重命名为 `proj_{pid}_{label}.yaml` 写回 `presets/` → version.config_name 指向它 |
-| 编辑 config | 走 `/api/presets/{name}` PUT；version 共享所引用的 yaml |
-| 推回预设 | `save_as_preset {target_name}` → 复制 yaml，**清空项目特定字段**：`data_dir` `reg_data_dir` `output_dir` `output_name` `resume_lora` `resume_state` |
-| 切到另一预设 | `from_preset` 覆盖 version.config_name；旧的 `proj_*` 不删，可手动清理 |
+| Fork preset | 复制全局 preset 到 `versions/{label}/config.yaml`，初始化项目路径字段 |
+| 编辑 config | PUT `/api/projects/{pid}/versions/{vid}/config`；只写 version 私有配置，自动保存不回流预设池 |
+| 推回预设 | `config/save_as_preset` → 显式导出到全局预设池，并清空项目特定字段 |
+| 切到另一预设 | `config/from_preset` 替换私有配置，不修改源 preset |
+| 入队训练 | 将最新已保存配置冻结到 `tasks/{id}/snapshot/config.yaml`；后续草稿编辑不影响该任务 |
 
-「项目特定字段」清单在 `studio/services/version_config.py` 的 `PROJECT_SPECIFIC_FIELDS` 常量里。
+「项目特定字段」清单在 `studio/services/version_config.py` 的 `PROJECT_SPECIFIC_FIELDS` 常量里：`data_dir`、`reg_data_dir`、`output_dir`、`output_name`、`resume_lora`、`resume_state`。这些字段创建时填初值，之后由用户拥有，入队不隐式改写；详见 [版本配置所有权](../design/version-config-ownership.md)。
 
 ---
 
@@ -377,11 +369,22 @@ python -m studio test    # pytest + vitest
 
 ---
 
-## 11. 前端样式约定
+## 11. 前端布局与响应式约定
 
-**现阶段不做全局响应式**，布局以桌面端宽屏为主。单个页面 / 组件如有窄屏拥挤，可加简单单点适配，但必须遵守下述约定，方便未来做全局响应式时统一升级：
+Studio 仍以桌面工作台为目标，但全局 AppShell 已开始统一治理。当前支持两类
+桌面视口：宽桌面（`> 1280px`）与紧凑桌面（`<= 1280px`）。本阶段不承诺移动端
+信息架构；业务工作台的结构性适配按 Layout phase 分批实施。
 
-- 所有媒体查询集中在 `studio/web/src/styles/responsive.css`，不要散落到组件里
-- 断点统一 `max-width: 1280px`（< laptop 中屏阈值），不要自创新断点
-- 单点适配只动 padding / 尺寸 / 显隐 label，**不改布局结构**（结构性改造留给未来的全局响应式）
-- 给目标元素加专属 className（如 `.banner-shell` / `.phase-timeline-label`），CSS 用 className 命中，不写到全局选择器
+- AppShell 是唯一 viewport 外壳，负责 Sidebar、Topbar、主内容轨道与默认页面滚动；
+  路由页面不得再创建第二个 `100vh` 应用外壳。
+- `main` 是默认页面级 scroll owner；专业工作台只在自身外层完整落入 main 轨道时
+  建立明确的局部滚动区。所有 flex/grid 中间轨道必须保留 `min-width: 0` 与
+  `min-height: 0`。
+- 公共响应式媒体查询集中在 `studio/web/src/styles/responsive.css`，目标元素使用
+  专属 className。共享紧凑桌面断点为 `max-width: 1280px`，不要为普通页面自创新断点。
+- 紧凑桌面优先保留导航、当前任务与操作入口；辅助资源指标和低优先级说明先让位。
+  不允许通过遮挡、负 margin 或隐藏主操作解决拥挤。
+- Drawer/Modal/Toast 等全局 overlay 不参与 AppShell 网格尺寸计算，不得通过 body
+  scrollbar 的出现/消失改变页面宽度。
+- Generate 附着工作区、图片瀑布流等已有专用几何可保留局部阈值，但必须集中在
+  `responsive.css` 并在组件注释中说明，不能成为普通页面的默认模式。

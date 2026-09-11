@@ -8,7 +8,7 @@ NaViT / Patch-n-Pack 块对角打包（Phase 2 数据层）：
 
 抽自原 runtime/anima_train.py L1144-1675 + L1939-1962（ADR 0003 PR-A）。
 
-DDP（ADR 0016 多卡）：两个 batch sampler 都在**batch 粒度**分片（不是样本粒度，
+DDP（ADR 0019 多卡）：两个 batch sampler 都在**batch 粒度**分片（不是样本粒度，
 那会打散分桶 → 同 step 各 rank 形状不一致 → 梯度同步死锁）。规则单点收敛在
 ``_ddp_shard``。单进程（无 torchrun）路径逐字节保持原行为。
 

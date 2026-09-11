@@ -129,7 +129,7 @@ pytest tests/test_pause_marker.py          # 暂停标记文件逻辑
 ## 5. 文档更新
 
 - **README.md / README.en.md**：「海光 DCU」章节 4 处 / 「Hygon DCU」3 处，描述 DTK 环境 / flash-attn / xformers / NaViT 打包 / onnxruntime GPU EP 的注意事项
-- **ADR 0016**：`docs/adr/0016-dual-accelerator-backend-hygon-dcu.md`，accelerator 抽象层 + DCU 后端设计
+- **ADR 0019**：`docs/adr/0019-dual-accelerator-backend-hygon-dcu.md`，accelerator 抽象层 + DCU 后端设计
 
 ---
 

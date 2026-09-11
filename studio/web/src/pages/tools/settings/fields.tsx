@@ -1,7 +1,8 @@
 import { useEffect, useRef, useState, type RefObject } from 'react'
 import { useTranslation } from 'react-i18next'
 import { InfoButton } from '../../../components/InfoButton'
-import { MASK, textInputClass } from './constants'
+import { Input, Select } from '../../../components/FormControl'
+import { MASK } from './constants'
 
 // ── Section / Field ────────────────────────────────────────────────────────
 
@@ -13,11 +14,11 @@ export function SettingsSection({
   headerExtras?: React.ReactNode  // 可选 slot：渲染在 h2 右侧（紧贴），给 ⓘ tooltip 之类用
   children: React.ReactNode
 }) {
-  const titleEl = <h2 className="text-sm font-semibold text-fg-primary">{title}</h2>
+  const titleEl = <h2 className="type-panel-title">{title}</h2>
   return (
-    <section id={id} className="rounded-md border border-subtle bg-surface p-4 flex flex-col gap-3 scroll-mt-24">
+    <section id={id} className="rounded-md border border-subtle bg-surface p-section flex flex-col gap-field scroll-mt-24">
       {headerExtras ? (
-        <div className="flex items-center gap-2 mb-0.5">
+        <div className="flex items-center gap-related mb-0.5">
           {titleEl}
           {headerExtras}
         </div>
@@ -89,7 +90,7 @@ export function SectionIndex({
   return (
     <aside className="hidden lg:block">
       <nav className="sticky top-4 flex flex-col gap-0.5">
-        <div className="caption mb-2 px-2">{t('settings.pageIndex')}</div>
+        <div className="type-section-label mb-2 px-2">{t('settings.pageIndex')}</div>
         {sections.map((s) => (
           <button
             key={s.id}
@@ -117,9 +118,9 @@ export function SettingsField({ label, helpTooltip, children }: {
   children: React.ReactNode
 }) {
   return (
-    <div className="grid grid-cols-[240px_1fr] gap-3 items-start">
-      <div className="flex items-center gap-2 min-w-0 pt-1.5">
-        <label className="text-xs text-fg-secondary font-mono leading-none">{label}</label>
+    <div className="grid grid-cols-[240px_1fr] gap-field items-start">
+      <div className="flex items-center gap-related min-w-0 pt-1.5">
+        <label className="type-field-label">{label}</label>
         {helpTooltip && <InfoButton>{helpTooltip}</InfoButton>}
       </div>
       <div className="min-w-0">{children}</div>
@@ -127,23 +128,33 @@ export function SettingsField({ label, helpTooltip, children }: {
   )
 }
 
-export function Bool({ value, onChange, disabled }: { value: boolean; onChange: (v: boolean) => void; disabled?: boolean }) {
+export function Bool({ value, onChange, disabled, className = 'max-w-32' }: {
+  value: boolean
+  onChange: (v: boolean) => void
+  disabled?: boolean
+  className?: string
+}) {
   const { t } = useTranslation()
   return (
-    <select
+    <Select
       value={value ? 'on' : 'off'}
       onChange={(e) => onChange(e.target.value === 'on')}
       disabled={disabled}
-      className={`${textInputClass} max-w-32 disabled:opacity-60`}
+      controlSize="sm"
+      surface="sunken"
+      className={className}
     >
       <option value="on">{t('settings.boolEnabled')}</option>
       <option value="off">{t('settings.boolDisabled')}</option>
-    </select>
+    </Select>
   )
 }
 
-export function SensitiveInput({ value, serverValue, onChange }: {
-  value: string; serverValue: string; onChange: (v: string) => void
+export function SensitiveInput({ value, serverValue, onChange, className }: {
+  value: string
+  serverValue: string
+  onChange: (v: string) => void
+  className?: string
 }) {
   const { t } = useTranslation()
   const [localValue, setLocalValue] = useState(value)
@@ -167,7 +178,7 @@ export function SensitiveInput({ value, serverValue, onChange }: {
   }
 
   return (
-    <input
+    <Input
       type="password"
       value={masked ? '' : localValue}
       placeholder={serverValue === MASK ? t('settings.sensitiveSavedPlaceholder') : ''}
@@ -178,7 +189,9 @@ export function SensitiveInput({ value, serverValue, onChange }: {
       data-lpignore="true"
       data-1p-ignore
       data-form-type="other"
-      className={textInputClass}
+      controlSize="sm"
+      surface="sunken"
+      className={className}
     />
   )
 }

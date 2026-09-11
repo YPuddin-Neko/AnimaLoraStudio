@@ -391,6 +391,15 @@ export interface LLMPreset {
   builtin: boolean
   base_url: string
   api_key: string
+  /** Stable reference into the write-only credential store (ADR 0017). */
+  credential_ref?: string
+  credential_status?: 'unconfigured' | 'empty' | 'missing' | 'degraded' | 'configured'
+  credential_configured?: boolean
+  /** File-content ETag required by PATCH/DELETE/reset. */
+  etag?: string
+  origin?: 'builtin' | 'builtin_override' | 'custom'
+  is_default?: boolean
+  updated_at?: number | null
   model: string
   model_ids: string[]
   endpoint: 'chat_completions' | 'responses'
@@ -408,6 +417,15 @@ export interface LLMPreset {
   concurrency: number
   requests_per_second: number
   max_requests_per_minute: number
+}
+
+export interface LLMCredentialMetadata {
+  id: string
+  kind: 'api_key' | 'token'
+  label: string
+  configured: boolean
+  etag: string
+  referenced_by?: string[]
 }
 
 export interface LLMTaggerConfig {
@@ -695,6 +713,8 @@ export interface ModelsConfig {
   /** 预处理默认放大器：预设 label（"4x-AnimeSharp" 等）或 custom 文件名
    * （"my-anime.pth"）。Preprocess 页和 worker 用它定权重路径。 */
   selected_upscaler: string
+  /** 自动遮罩默认识别模型：builtin、managed filename 或 registered local path。 */
+  selected_head_detector: string
 }
 
 export interface QueueConfig {
@@ -961,7 +981,7 @@ export interface EvalMetricsCatalog {
 
 export interface ModelDownloadStatus {
   key: string
-  status: 'pending' | 'running' | 'done' | 'failed'
+  status: 'pending' | 'running' | 'done' | 'failed' | 'canceled'
   started_at: number
   finished_at: number | null
   message: string
@@ -1033,6 +1053,22 @@ export interface UpscalersCatalog {
   variants: UpscalerVariant[]
 }
 
+export interface HeadDetectorCatalog extends ModelFileStatus {
+  id: 'head_detector'
+  name: string
+  description: string
+  repo: string
+  revision: string
+  target_path: string
+  target_dir: string
+  default: string
+  current: string
+  expected_size: number
+  expected_sha256: string
+  valid: boolean
+  sha256?: string
+}
+
 export interface FamilySwitchChange {
   field: string
   from: unknown
@@ -1068,6 +1104,7 @@ export interface ModelsCatalog {
   /** 评估指标 registry（Settings 复选框列表）。 */
   eval_metric_catalog?: EvalMetricCatalogItem[]
   upscalers?: UpscalersCatalog
+  head_detector?: HeadDetectorCatalog
   /** 统一来源候选行（泛化候选卡消费；键 = domain：wd14 / eval_clip / ...）。 */
   model_sources?: Record<string, ModelSourceRow[]>
   /** 按类型的下载源选项：current = 当前选中，available = 可选源（长度 1 = 固定单源）。 */
@@ -1245,6 +1282,58 @@ export interface InpaintSaveResult {
   size: number
   w: number
   h: number
+}
+
+export interface HeadMaskRegion {
+  id: string
+  score: number
+  /** Source-image pixel coordinates: x1, y1, x2, y2. */
+  box: [number, number, number, number]
+  mask_region: {
+    x1: number; y1: number; x2: number; y2: number
+    feather_x: number; feather_y: number
+  }
+}
+
+export interface HeadMaskProposalImage {
+  name: string
+  /** Absent only on legacy v1 proposal JSON. */
+  status?: 'done' | 'failed' | 'skipped'
+  error?: { code: string; message: string } | null
+  size: [number, number] | null
+  source_mtime_ns: number | null
+  source_file_size: number | null
+  regions: HeadMaskRegion[]
+  stale: boolean
+  stale_reason: string | null
+}
+
+export interface HeadMaskProposals {
+  schema_version: number
+  status?: 'complete' | 'partial'
+  succeeded?: number
+  failed?: number
+  skipped?: number
+  job_id: number
+  model: {
+    /** Catalog identity used for this job (absent on legacy v1 results). */
+    identity?: string
+    revision: string
+    path: string
+    input_size: [number, number]
+    provider: string
+    builtin?: boolean
+  }
+  parameters: {
+    confidence: number
+    iou_threshold: number
+    padding_ratio: number
+    feather_ratio: number
+  }
+  created_at: number
+  images: HeadMaskProposalImage[]
+  stale_count: number
+  undo_available: boolean
 }
 
 /** 总览页「已删除」tab 一项：被去重审核标记的 entry。物理图仍在 download/{source}。 */
@@ -2139,12 +2228,14 @@ async function req<T>(
   path: string,
   init?: RequestInit
 ): Promise<T> {
+  const headers = new Headers(init?.headers)
+  if (!headers.has('Accept')) headers.set('Accept', 'application/json')
+  if (init?.body && !headers.has('Content-Type')) {
+    headers.set('Content-Type', 'application/json')
+  }
   const resp = await fetch(path, {
-    headers: {
-      Accept: 'application/json',
-      ...(init?.body ? { 'Content-Type': 'application/json' } : {}),
-    },
     ...init,
+    headers,
   })
   if (!resp.ok) {
     const body = await resp.json().catch(() => null)
@@ -2404,23 +2495,63 @@ export const api = {
     return (await resp.json()) as { id: string; label: string; secrets: Secrets }
   },
 
-  /** LLM preset json 下载直链（**不含 API 信息**：api_key/base_url/model_ids 置空）。
-   *  <a href={...} download> 触发即可，不发 fetch。 */
+  /** Portable LLM preset JSON download; credentials and local endpoint are excluded. */
   llmPresetExportUrl: (id: string) =>
-    `/api/secrets/llm/presets/${encodeURIComponent(id)}/export`,
-  /** 上传 json/yaml 导入 LLM preset；返回新 preset 标识 + 最新 masked secrets。 */
-  importLLMPreset: async (
-    file: File,
-  ): Promise<{ id: string; label: string; secrets: Secrets }> => {
+    `/api/llm-tagger/presets/${encodeURIComponent(id)}/export`,
+  importLLMPreset: async (file: File): Promise<LLMPreset> => {
     const fd = new FormData()
     fd.append('file', file, file.name)
-    const resp = await fetch('/api/secrets/llm/presets/import', { method: 'POST', body: fd })
+    const resp = await fetch('/api/llm-tagger/presets/import', { method: 'POST', body: fd })
     if (!resp.ok) {
       const body = await resp.json().catch(() => null)
       throw makeApiError(resp.status, resp.statusText, body, resp.headers.get('X-Trace-Id'))
     }
-    return (await resp.json()) as { id: string; label: string; secrets: Secrets }
+    const preset = (await resp.json()) as LLMPreset
+    return { ...preset, api_key: preset.credential_configured ? '***' : '' }
   },
+  createLLMPreset: (preset: LLMPreset) => {
+    const payload = { ...preset } as Record<string, unknown>
+    for (const key of [
+      'id', 'builtin', 'api_key', 'credential_ref', 'credential_status',
+      'credential_configured', 'etag', 'origin', 'is_default', 'updated_at', 'model_ids',
+    ]) delete payload[key]
+    return req<LLMPreset>('/api/llm-tagger/presets', {
+      method: 'POST',
+      body: JSON.stringify({ preset: payload, credential_ref: '' }),
+    })
+  },
+  patchLLMPreset: (id: string, patch: Partial<LLMPreset>, etag: string) =>
+    req<LLMPreset>(`/api/llm-tagger/presets/${encodeURIComponent(id)}`, {
+      method: 'PATCH',
+      headers: { 'If-Match': etag },
+      body: JSON.stringify(patch),
+    }),
+  duplicateLLMPreset: (id: string, label: string) =>
+    req<LLMPreset>(`/api/llm-tagger/presets/${encodeURIComponent(id)}/duplicate`, {
+      method: 'POST', body: JSON.stringify({ label }),
+    }),
+  deleteLLMPreset: (id: string, etag: string) =>
+    req<{ deleted: string }>(`/api/llm-tagger/presets/${encodeURIComponent(id)}`, {
+      method: 'DELETE', headers: { 'If-Match': etag },
+    }),
+  resetLLMPreset: (id: string, etag: string) =>
+    req<LLMPreset>(`/api/llm-tagger/presets/${encodeURIComponent(id)}/reset`, {
+      method: 'POST', headers: { 'If-Match': etag },
+    }),
+  setDefaultLLMPreset: (id: string) =>
+    req<{ default_preset_id: string }>('/api/llm-tagger/presets/default', {
+      method: 'PUT', body: JSON.stringify({ id }),
+    }),
+  listCredentials: () =>
+    req<{ items: LLMCredentialMetadata[] }>('/api/credentials').then((r) => r.items),
+  createCredential: (body: { label: string; secret: string }) =>
+    req<LLMCredentialMetadata>('/api/credentials', {
+      method: 'POST', body: JSON.stringify({ ...body, kind: 'api_key' }),
+    }),
+  replaceCredentialSecret: (id: string, secret: string, etag: string) =>
+    req<LLMCredentialMetadata>(`/api/credentials/${encodeURIComponent(id)}/secret`, {
+      method: 'PUT', headers: { 'If-Match': etag }, body: JSON.stringify({ secret }),
+    }),
 
   // 兼容别名：PP0 之前叫 listConfigs / getConfig / ...。保留一段时间。
   listConfigs: () =>
@@ -2439,8 +2570,8 @@ export const api = {
       body: JSON.stringify({ new_name: newName }),
     }),
 
-  // Secrets ------------------------------------------------------------
-  getSecrets: () => req<Secrets>('/api/secrets'),
+  // Settings (legacy method names retained for call-site compatibility) ----
+  getSecrets: () => req<Secrets>('/api/settings'),
 
   // Tag dictionary -----------------------------------------------------
   /** 当前词典 meta + 是否已加载。Settings UI 启动时 ping，决定显示"未初始化"还是详情。 */
@@ -2513,33 +2644,29 @@ export const api = {
       method: 'DELETE',
       body: JSON.stringify(cand),
     }),
+  selectHeadDetector: (identity: string) =>
+    req<{ selected: string }>('/api/head-detectors/select', {
+      method: 'POST',
+      body: JSON.stringify({ identity }),
+    }),
   selectUpscaler: (label: string) =>
     req<{ selected: string }>('/api/upscalers/select', {
       method: 'POST',
       body: JSON.stringify({ label }),
     }),
-  refreshLLMModels: (body: {
-    preset_id?: string
-    base_url?: string
-    api_key?: string
-    timeout?: number
-  }) =>
-    req<{ items: string[]; preset_id: string; secrets: Secrets }>('/api/llm-tagger/models/refresh', {
-      method: 'POST',
-      body: JSON.stringify(body),
-    }),
-  testLLMConnection: (
-    body:
-      & { preset_id?: string }
-      & Partial<Pick<LLMPreset, 'base_url' | 'api_key' | 'model' | 'endpoint' | 'timeout' | 'max_tokens' | 'temperature'>>,
-  ) =>
-    req<LLMConnectionTestResult>('/api/llm-tagger/test', {
-      method: 'POST',
-      body: JSON.stringify(body),
-    }),
+  refreshLLMModels: (presetId: string, timeout?: number) =>
+    req<{ items: string[]; preset_id: string; preset_etag: string }>(
+      `/api/llm-tagger/presets/${encodeURIComponent(presetId)}/models/refresh`,
+      { method: 'POST', body: JSON.stringify({ timeout }) },
+    ),
+  testLLMConnection: (presetId: string, timeout?: number) =>
+    req<LLMConnectionTestResult>(
+      `/api/llm-tagger/presets/${encodeURIComponent(presetId)}/connection/test`,
+      { method: 'POST', body: JSON.stringify({ timeout }) },
+    ),
   updateSecrets: (patch: SecretsPatch) =>
-    req<Secrets>('/api/secrets', {
-      method: 'PUT',
+    req<Secrets>('/api/settings', {
+      method: 'PATCH',
       body: JSON.stringify(patch),
     }),
 
@@ -2737,12 +2864,12 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(body),
     }),
-  getPreprocessStatusTrain: (pid: number, vid: number) =>
+  getPreprocessStatusTrain: (pid: number, vid: number, stage?: 'upscale' | 'crop' | 'head_mask') =>
     req<{
       job: Job | null
       log_tail: string
       summary: { image_count: number }
-    }>(`/api/projects/${pid}/versions/${vid}/preprocess/status`),
+    }>(`/api/projects/${pid}/versions/${vid}/preprocess/status${stage ? `?stage=${stage}` : ''}`),
   listPreprocessFilesTrain: (pid: number, vid: number) =>
     req<{
       images: TrainImage[]
@@ -2827,6 +2954,37 @@ export const api = {
     req<{ deleted: boolean }>(
       `/api/projects/${pid}/versions/${vid}/preprocess/mask?name=${encodeURIComponent(name)}`,
       { method: 'DELETE' },
+    ),
+  startHeadMaskDetection: (
+    pid: number,
+    vid: number,
+    body: {
+      scope: 'all' | 'selected'
+      filenames?: string[]
+      model?: string
+      confidence: number
+      iou_threshold: number
+      padding_ratio: number
+      feather_ratio: number
+    },
+  ) => req<Job>(
+    `/api/projects/${pid}/versions/${vid}/preprocess/head-mask/detect`,
+    { method: 'POST', body: JSON.stringify(body) },
+  ),
+  getHeadMaskProposals: (pid: number, vid: number, jobId: number) =>
+    req<HeadMaskProposals>(
+      `/api/projects/${pid}/versions/${vid}/preprocess/head-mask/proposals/${jobId}`,
+    ),
+  applyHeadMaskProposals: (
+    pid: number, vid: number, jobId: number, selections: Record<string, string[]>,
+  ) => req<{ job_id: number; applied: number; images: string[]; undo_available: boolean }>(
+    `/api/projects/${pid}/versions/${vid}/preprocess/head-mask/apply`,
+    { method: 'POST', body: JSON.stringify({ job_id: jobId, selections }) },
+  ),
+  undoHeadMaskApply: (pid: number, vid: number, jobId: number) =>
+    req<{ job_id: number; undone: number; images: string[] }>(
+      `/api/projects/${pid}/versions/${vid}/preprocess/head-mask/undo`,
+      { method: 'POST', body: JSON.stringify({ job_id: jobId }) },
     ),
 
   // R-5 台账合并：/api/jobs* 已删，作业与任务同源 /api/queue（单一 ID 空间）。

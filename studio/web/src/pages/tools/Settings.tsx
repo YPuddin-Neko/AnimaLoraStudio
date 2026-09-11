@@ -1,9 +1,8 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { Trans, useTranslation } from 'react-i18next'
 import {
   api,
   type ModelSourceRow,
-  type LLMPreset,
   type Secrets,
   type SecretsPatch,
   type WandBPreset,
@@ -37,6 +36,7 @@ import { HFEndpointSelect, ModelSourceCard, SourceSelect } from './settings/mode
 import LoraSourcesSection from './settings/LoraSourcesSection'
 import {
   DisplaySection,
+  HeadDetectorSection,
   IdleTimeoutSection,
   ModelsSection,
   SaveTestImagesSection,
@@ -55,13 +55,15 @@ import WandBWorkspace from './settings/WandBWorkspace'
 export default function SettingsPage() {
   const { t } = useTranslation()
   // 共享数据层（SettingsDataProvider）：secrets / catalog / SSE / downloadBusy 都在根级常驻，
-  // 本组件 mount/unmount（抽屉开关）不再触发重拉。`server` 别名保留是为了让下方
+  // UI 首次打开后可在 Drawer 内保活；权威数据不依赖其展示状态。`server` 别名保留是为了让下方
   // 大段表单代码改动最小。
   const {
     secrets: server,
     secretsError,
     setSecrets: setServer,
+    reloadSecrets,
     commitSecrets,
+    runSave,
     saveStatus,
     catalog,
     catalogError,
@@ -83,6 +85,7 @@ export default function SettingsPage() {
   const drawer = useSettingsDrawer()
   // 右侧 section index 用：sticky nav 的 IntersectionObserver root + 滚动平移容器
   const scrollContainerRef = useRef<HTMLDivElement>(null)
+  const consumedSectionNonceRef = useRef<number | null>(null)
 
   // 数据层 fetch secrets 失败时把错误透出到本组件 error 状态。
   useEffect(() => { if (secretsError) setError(secretsError) }, [secretsError])
@@ -102,20 +105,33 @@ export default function SettingsPage() {
     return () => drawer.registerDirtyGuard(null)
   }, [drawer])
 
-  // 抽屉以 open({ section }) 打开时跳到对应 section（取代旧的 ?section= URL 参数）。
-  // sectionRequest 带 nonce，相同 section 重复 open 也会触发 effect 重跑。
+  // 抽屉深链接：等 Drawer 完成开场后，再在它自己的滚动容器内定位。
+  // useLayoutEffect 让首次挂载和热打开都在内容显现前落到目标，避免页面先闪在顶部。
   const drawerSectionReq = drawer.sectionRequest
-  useEffect(() => {
-    if (!drawerSectionReq) return
+  useLayoutEffect(() => {
+    if (!drawerSectionReq || !drawer.isReady) return
+    if (consumedSectionNonceRef.current === drawerSectionReq.nonce) return
+
     const section = drawerSectionReq.section
     const targetTab = SECTION_TO_TAB[section]
-    if (targetTab) setTab(targetTab)
-    const t1 = setTimeout(() => {
-      const el = document.getElementById(section)
-      el?.scrollIntoView({ behavior: 'smooth', block: 'start' })
-    }, 50)
-    return () => clearTimeout(t1)
-  }, [drawerSectionReq])
+    if (targetTab && targetTab !== tab) {
+      setTab(targetTab)
+      return
+    }
+
+    consumedSectionNonceRef.current = drawerSectionReq.nonce
+    const container = scrollContainerRef.current
+    const target = container?.querySelector<HTMLElement>(`[id="${section}"]`)
+    if (!container || !target) return
+
+    const top = target.getBoundingClientRect().top -
+      container.getBoundingClientRect().top + container.scrollTop
+    if (typeof container.scrollTo === 'function') {
+      container.scrollTo({ top, behavior: 'auto' })
+    } else {
+      container.scrollTop = top
+    }
+  }, [drawer.isReady, drawerSectionReq, tab])
 
   const update = <S extends Section, K extends keyof Secrets[S]>(
     section: S,
@@ -141,18 +157,26 @@ export default function SettingsPage() {
   }
 
   // —— LLM 预设管理（列表 + 编辑 modal；字段编辑集中在 LLMPresetEditorModal）——
-  const addLlmPreset = () => {
-    const used = new Set(draft.llm_tagger.presets.map((p) => p.id))
-    let idx = 1
-    let id = `preset_${idx}`
-    while (used.has(id)) {
-      idx += 1
-      id = `preset_${idx}`
+  const addLlmPreset = async () => {
+    const index = draft.llm_tagger.presets.length + 1
+    const label = t('settings.newPresetLabel', { n: index })
+    const fallback = _makeFallbackPreset('temporary', label, 'text')
+    try {
+      const created = await runSave(() => api.createLLMPreset(fallback))
+      await reloadSecrets()
+      setEditingLlmPresetId(created.id)
+    } catch (e) {
+      toast(String(e), 'error')
     }
-    const next: LLMPreset = _makeFallbackPreset(id, t('settings.newPresetLabel', { n: idx }), 'text')
-    next.builtin = false
-    update('llm_tagger', 'presets', [...draft.llm_tagger.presets, next])
-    setEditingLlmPresetId(id)
+  }
+
+  const setDefaultLlmPreset = async (id: string) => {
+    try {
+      await runSave(() => api.setDefaultLLMPreset(id))
+      await reloadSecrets()
+    } catch (e) {
+      toast(String(e), 'error')
+    }
   }
 
   // 删除/恢复内置/另存为/导出都住在 LLMPresetEditorModal footer 里，
@@ -163,10 +187,10 @@ export default function SettingsPage() {
   // 导入成功直接打开编辑 modal 让用户补全连接信息。
   const importLlmPreset = async (file: File) => {
     try {
-      const r = await api.importLLMPreset(file)
-      setServer(r.secrets)
-      toast(t('settings.llmPresetImported', { label: r.label }), 'success')
-      setEditingLlmPresetId(r.id)
+      const preset = await runSave(() => api.importLLMPreset(file))
+      await reloadSecrets()
+      toast(t('settings.llmPresetImported', { label: preset.label }), 'success')
+      setEditingLlmPresetId(preset.id)
     } catch (e) {
       toast(`${t('settings.llmPresetImportInvalid')}: ${e}`, 'error')
     }
@@ -267,7 +291,7 @@ export default function SettingsPage() {
 
   // Tab nav 抽出来传给 PageHeader 的 tabs prop（取代旧的 subtitle 位置）。
   const tabNav = (
-    <nav className="flex gap-1 -mb-4">
+    <nav className="flex gap-1 -mb-section">
       {TAB_LIST.map((item) => (
         <button
           key={item.id}
@@ -302,12 +326,12 @@ export default function SettingsPage() {
             </svg>
           </button>
         ) : undefined}
-        actions={<SaveIndicator status={saveStatus} />}
+        actions={<SaveIndicator status={saveStatus} announceError={false} />}
       />
 
-      <div ref={scrollContainerRef} className="p-6 pb-12 flex-1 overflow-y-auto">
+      <div ref={scrollContainerRef} data-testid="settings-scroll-container" className="p-page pb-12 flex-1 overflow-y-auto">
       <div className="grid gap-10 max-w-[1920px]" style={{ gridTemplateColumns: 'minmax(0,1fr) 200px' }}>
-      <div className="flex flex-col gap-8 min-w-0">
+      <div className="flex flex-col gap-page-loose min-w-0">
 
       {error && (
         <div className="p-3 rounded-md bg-err-soft border border-err text-err text-sm font-mono">
@@ -478,13 +502,13 @@ export default function SettingsPage() {
             <button type="button" onClick={() => llmImportRef.current?.click()} className="btn btn-secondary btn-sm">
               {t('settings.llmPresetImport')}
             </button>
-            <button type="button" onClick={addLlmPreset} className="btn btn-secondary btn-sm">
+            <button type="button" onClick={() => void addLlmPreset()} className="btn btn-secondary btn-sm">
               {t('settings.llmPresetNew')}
             </button>
             <input
               ref={llmImportRef}
               type="file"
-              accept=".json,.yaml,.yml"
+              accept=".json"
               style={{ display: 'none' }}
               onChange={(e) => {
                 const f = e.target.files?.[0]
@@ -505,7 +529,7 @@ export default function SettingsPage() {
                   isDefault ? 'bg-selected-soft border border-selected' : 'bg-transparent border border-transparent'
                 }`}>
                   <input type="radio" name="llm_preset_default" checked={isDefault}
-                    onChange={() => update('llm_tagger', 'current_preset', p.id)}
+                    onChange={() => void setDefaultLlmPreset(p.id)}
                     className="shrink-0"
                     style={{ accentColor: 'var(--accent)' }}
                     title={t('settings.llmPresetSetDefault')}
@@ -791,14 +815,20 @@ export default function SettingsPage() {
       </div>
       </>)}
 
-      {tab === 'preprocess' && (
+      {tab === 'preprocess' && (<>
         <UpscalerSection
           catalog={catalog}
           setSource={setDownloadSource}
           reloadCatalog={reloadCatalog}
           t={t}
         />
-      )}
+        <HeadDetectorSection
+          catalog={catalog}
+          setSource={setDownloadSource}
+          reloadCatalog={reloadCatalog}
+          t={t}
+        />
+      </>)}
 
       {tab === 'testing' && (<>
         {/* Test generation uses the server Comfy-style runtime. Attention backend

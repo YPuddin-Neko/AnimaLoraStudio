@@ -1,16 +1,19 @@
 # AnimaLoraStudio
 
-[![中文](https://img.shields.io/badge/lang-%E4%B8%AD%E6%96%87-blue)](README.md) [![English](https://img.shields.io/badge/lang-English-lightgrey)](README.en.md) [![Version](https://img.shields.io/badge/version-0.26.0-blue)](CHANGELOG.md) [![License](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
+[![中文](https://img.shields.io/badge/lang-%E4%B8%AD%E6%96%87-blue)](README.md) [![English](https://img.shields.io/badge/lang-English-lightgrey)](README.en.md) [![Version](https://img.shields.io/badge/version-0.27.0-blue)](CHANGELOG.md) [![License](https://img.shields.io/badge/license-GPL--3.0-blue)](LICENSE)
 
 **端到端流水线**：从 Booru 抓图 → 筛选 → 打标 → 正则集 → 训练 → 出图测试，全流程在一个浏览器面板里推进。支持两个模型族的 LoRA 训练：[Anima](https://huggingface.co/circlestone-labs/Anima)（Cosmos DiT 二次元特调，轻量入门）与 [Krea 2](https://huggingface.co/krea/Krea-2-Raw)（12.9B 单流 MMDiT，Raw 训练 / Turbo 快速出图）。
 
-![Studio 训练页](docs/images/studio-train.png)
+![Studio 训练页（旧版布局示意）](docs/images/studio-train.png)
+
+> 截图展示旧版布局；当前训练工作台的操作方式见[上手教程](docs/user-guide/getting-started.md)。
 
 ## 特性
 
-- **一站式流水线**：Booru 抓图 / 筛选 / 预处理（去重·放大·裁剪·涂抹）/ 打标 / 正则集 / 训练 / 出图测试，全在一个浏览器面板，Stepper 引导。
+- **一站式流水线**：Booru 抓图 / 筛选 / 预处理（去重·放大·裁剪·涂抹·[自动头部遮罩](docs/user-guide/auto-head-mask.md)）/ 打标 / 正则集 / 训练 / 出图测试，全在一个浏览器面板，Stepper 引导。
 - **双模型族**：Anima 与 Krea 2 共用同一套流程；训练配置里一键切换模型族（权重路径与族默认值自动重算、逐项确认后生效），参数选项按族过滤，同一项目可并存两族版本。
 - **三种打标器**：WD14、CLTagger（本地 ONNX）、LLM（OpenAI 兼容，长 caption）；触发词填一次自动注入每张 caption。
+- **LLM 配置独立管理**：预设、普通设置与凭证分开存储，支持内置模板覆盖、原子写入与备份保护；已排队的 LLM 打标任务冻结预设配方。
 - **Booru 抓图集成**：原生 Gelbooru / Danbooru（Cloudflare 兼容 UA、速率限制、账号认证）。
 - **正则集自动生成**：训练集 tag 分布反向搜 + 长宽比聚类，或底模 AI 先验出图（无需 LoRA）。
 - **Project / Version 双层管理**：单项目多 version 共享数据、独立配置 / 输出；预设池双向 fork。
@@ -38,6 +41,8 @@ studio.bat          # Windows
 首次运行自动建 `venv/` → 按 GPU 驱动装对应 CUDA torch（海光 DCU 上跳过，用镜像预装的 DTK torch）→ 构建前端 → 起后端 → 开浏览器到 <http://127.0.0.1:8765/>，并弹引导 modal 一键装 Anima 入门套件。打开后去 **设置 → 训练** 的模型下载中心按模型族下载权重（默认落 `./models/`）。
 
 → 完整步骤（启动选项 / 模型下载 / 国内镜像 / 流水线 walkthrough）见 **[上手教程](docs/user-guide/getting-started.md)**。
+
+→ 从旧版更新请先阅读 **[v0.27 升级说明](docs/user-guide/upgrading-v0.27.md)**（配置迁移、备份与 LyCORIS 依赖）。
 
 ## 硬件要求
 
@@ -78,7 +83,7 @@ python tools/probe_accelerator.py    # 后端识别、设备信息、fp8 / SDPA 
 bash tools/find_flash_attn.sh        # 找本机有没有现成的 flash-attn 包 / .so
 ```
 
-详见 [ADR 0016](docs/adr/0016-dual-accelerator-backend-hygon-dcu.md)。
+详见 [ADR 0019](docs/adr/0019-dual-accelerator-backend-hygon-dcu.md)。
 
 ## 文档
 

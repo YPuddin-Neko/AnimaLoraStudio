@@ -10,7 +10,10 @@ import {
   type TaskType,
 } from '../api/client'
 import { PauseProgressModal } from '../components/PauseProgressModal'
+import Badge, { type BadgeTone } from '../components/Badge'
+import Button, { buttonClassName } from '../components/Button'
 import { useDialog } from '../components/Dialog'
+import { Tabs, selectionItemId, type TabItem } from '../components/SelectionGroup'
 import { useToast } from '../components/Toast'
 import { useEventStream } from '../lib/useEventStream'
 import { useTaskEvalProgress } from '../lib/useEvalProgress'
@@ -62,14 +65,14 @@ function visibleTabsFor(task: Task | null, hasEval: boolean | null): readonly Ta
   return base.filter((tb) => tb !== 'metrics' && tb !== 'samples')
 }
 
-const STATUS_BADGE: Record<TaskStatus, string> = {
-  pending: 'badge badge-neutral',
-  running: 'badge badge-accent',
-  done: 'badge badge-ok',
-  failed: 'badge badge-err',
-  canceled: 'badge badge-neutral',
-  paused: 'badge badge-warn',
-  scheduled: 'badge badge-neutral',
+const STATUS_TONE: Record<TaskStatus, BadgeTone> = {
+  pending: 'neutral',
+  running: 'accent',
+  done: 'success',
+  failed: 'danger',
+  canceled: 'neutral',
+  paused: 'warning',
+  scheduled: 'neutral',
 }
 
 const TERMINAL: ReadonlyArray<TaskStatus> = ['done', 'failed', 'canceled']
@@ -107,12 +110,13 @@ function StatCard({ label, value, sub, mono, large, tone }: {
 }) {
   const toneClass = tone ? `text-${tone}` : 'text-fg-primary'
   return (
-    <div className="flex flex-col gap-1 px-[18px] py-3.5 bg-surface rounded-md border border-subtle">
+    <div className="flex min-w-0 flex-col gap-1 px-[18px] py-3.5 bg-surface rounded-md border border-subtle">
       <span className="text-xs text-fg-tertiary font-mono tracking-widest uppercase">
         {label}
       </span>
       <span
-        className={`${large ? 'text-3xl' : 'text-xl'} font-semibold ${mono ? 'font-mono' : 'font-sans'} tabular-nums ${toneClass}`}
+        className={`${large ? 'text-3xl' : 'text-xl'} overflow-hidden text-ellipsis whitespace-nowrap font-semibold ${mono ? 'font-mono' : 'font-sans'} tabular-nums ${toneClass}`}
+        title={value}
         style={{ letterSpacing: '-0.02em', lineHeight: 1.1 }}
       >
         {value}
@@ -335,61 +339,65 @@ export default function QueueDetailPage() {
   // 按 task_type 过滤可见 tab（task 未加载时先按 train 给全量，加载后收敛）。
   const kind = task ? taskKind(task) : 'train'
   const visibleTabs = visibleTabsFor(task, taskHasEval)
-  const allTabs: Array<{ key: Tab; label: string }> = [
-    { key: 'overview', label: t('queueDetail.tabOverview') },
-    { key: 'log',      label: t('queueDetail.tabLogs') },
-    { key: 'monitor',  label: t('queueDetail.tabMonitor') },
-    { key: 'metrics',  label: t('queueDetail.tabEval') },
-    { key: 'samples',  label: t('queueDetail.tabSamples') },
-    { key: 'outputs',  label: t('queueDetail.tabOutputs') },
-    { key: 'snapshot', label: t('queueDetail.tabSnapshot') },
+  const allTabs: TabItem<Tab>[] = [
+    { value: 'overview', label: t('queueDetail.tabOverview'), controls: 'queue-detail-panel' },
+    { value: 'log',      label: t('queueDetail.tabLogs'), controls: 'queue-detail-panel' },
+    { value: 'monitor',  label: t('queueDetail.tabMonitor'), controls: 'queue-detail-panel' },
+    { value: 'metrics',  label: t('queueDetail.tabEval'), controls: 'queue-detail-panel' },
+    { value: 'samples',  label: t('queueDetail.tabSamples'), controls: 'queue-detail-panel' },
+    { value: 'outputs',  label: t('queueDetail.tabOutputs'), controls: 'queue-detail-panel' },
+    { value: 'snapshot', label: t('queueDetail.tabSnapshot'), controls: 'queue-detail-panel' },
   ]
-  const tabs = allTabs.filter((tb) => visibleTabs.includes(tb.key))
+  const tabs = allTabs.filter((item) => visibleTabs.includes(item.value))
 
   return (
     <div className="flex flex-col h-full min-h-0 overflow-hidden">
       {/* Header */}
       <header className="px-6 py-4 border-b border-subtle flex flex-col gap-2 shrink-0 bg-canvas">
         <div className="flex items-center gap-2.5 flex-wrap">
-          <Link to="/queue" className="btn btn-ghost btn-sm no-underline"
-          >{t('queueDetail.backToQueue')}</Link>
+          <Link
+            to="/queue"
+            className={buttonClassName({ variant: 'ghost', size: 'sm', className: 'no-underline' })}
+          >
+            {t('queueDetail.backToQueue')}
+          </Link>
           <span className="text-fg-tertiary">/</span>
           <h1 className="m-0 text-xl font-semibold font-mono">
             #{taskId}
           </h1>
           {task && (
             <>
-              <span className="text-fg-secondary text-md">{task.name}</span>
-              <code className="text-xs text-fg-tertiary font-mono">{task.config_name}.yaml</code>
+              <span className="ui-queue-detail-title text-fg-secondary text-md" title={task.name}>{task.name}</span>
+              <code className="ui-queue-detail-title text-xs text-fg-tertiary font-mono" title={`${task.config_name}.yaml`}>{task.config_name}.yaml</code>
             </>
           )}
           {status && (
-            <span className={STATUS_BADGE[status]}>
-              {status === 'running' && <span className="dot dot-running" />}
+            <Badge tone={STATUS_TONE[status]} active={status === 'running'}>
               {STATUS_LABEL[status]}
-            </span>
+            </Badge>
           )}
           {evalProgress?.active && (
-            <span className="badge badge-accent" title={t('eval.evaluatingHint')}>
-              <span className="dot dot-running" />
+            <Badge tone="accent" active title={t('eval.evaluatingHint')}>
               {t('eval.evaluatingProgress', { done: evalProgress.done, total: evalProgress.total })}
-            </span>
+            </Badge>
           )}
           <span className="flex-1" />
           {/* P-H 深链：generate/reg_ai 无训练结果 tab，跳原生页看结果 */}
           {task && kind === 'generate' && (
-            <button
+            <Button
+              variant="secondary"
+              size="sm"
               onClick={() => navigate(`/tools/generate?task=${task.id}`)}
-              className="btn btn-secondary btn-sm"
               data-testid="detail-view-generate"
-            >{t('queueDetail.viewInGenerate')}</button>
+            >{t('queueDetail.viewInGenerate')}</Button>
           )}
           {task && kind === 'reg_ai' && task.project_id && task.version_id && (
-            <button
+            <Button
+              variant="secondary"
+              size="sm"
               onClick={() => navigate(`/projects/${task.project_id}/v/${task.version_id}/reg`)}
-              className="btn btn-secondary btn-sm"
               data-testid="detail-view-reg"
-            >{t('queueDetail.viewInReg')}</button>
+            >{t('queueDetail.viewInReg')}</Button>
           )}
           {/* R-5：数据作业类 task 跳原生步骤页（download→项目下载页、tag→打标页…） */}
           {/* 诊断包（logging-target-state §3.6）：run.log + 配置快照 + 时间窗 studio.log +
@@ -398,51 +406,71 @@ export default function QueueDetailPage() {
             <a
               href={api.diagnosticsBundleUrl(task.id)}
               download
-              className="btn btn-ghost btn-sm no-underline"
+              className={buttonClassName({ variant: 'ghost', size: 'sm', className: 'no-underline' })}
               title={t('queueDetail.diagBundleHint')}
               data-testid="detail-diag-bundle"
             >{t('queueDetail.diagBundle')}</a>
           )}
           {task && jobJumpPath(task, evalSessionIdOf(task)) && (
-            <button
+            <Button
+              variant="secondary"
+              size="sm"
               onClick={() => navigate(jobJumpPath(task, evalSessionIdOf(task))!)}
-              className="btn btn-secondary btn-sm"
               data-testid="detail-view-job-source"
-            >{t('queue.jobs.jump')} →</button>
+            >{t('queue.jobs.jump')} →</Button>
           )}
           {isLive && status === 'running' && task?.is_pausable && (
-            <button onClick={pauseRunning} disabled={busy || pauseModalOpen} className="btn btn-sm"
+            <Button
+              variant="secondary"
+              size="sm"
+              onClick={pauseRunning}
+              disabled={busy || pauseModalOpen}
               data-testid="detail-pause-btn"
               title={t('queue.pauseHint')}
-            >{t('queue.pause')}</button>
+            >{t('queue.pause')}</Button>
           )}
           {isLive && (
-            <button onClick={cancel} disabled={busy} className="btn btn-sm bg-warn-soft border border-warn text-warn"
-            >{t('queueDetail.cancelTask')}</button>
+            <Button variant="warning" size="sm" onClick={cancel} disabled={busy}>
+              {t('queueDetail.cancelTask')}
+            </Button>
           )}
           {/* 0.17 P-B — scheduled：可手动提前 / 取消计划 */}
           {status === 'scheduled' && (
             <>
-              <button onClick={startNow} disabled={busy} className="btn btn-primary btn-sm"
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={startNow}
+                disabled={busy}
                 data-testid="detail-startnow-btn"
                 title={t('queue.startNowHint')}
-              >{t('queue.startNow')}</button>
-              <button onClick={cancel} disabled={busy}
-                className="btn btn-sm bg-warn-soft border border-warn text-warn"
+              >{t('queue.startNow')}</Button>
+              <Button
+                variant="warning"
+                size="sm"
+                onClick={cancel}
+                disabled={busy}
                 title={t('queue.cancelScheduledHint')}
-              >{t('queue.cancelScheduled')}</button>
+              >{t('queue.cancelScheduled')}</Button>
             </>
           )}
           {status === 'paused' && (
             <>
-              <button onClick={resumePaused} disabled={busy} className="btn btn-primary btn-sm"
+              <Button
+                variant="primary"
+                size="sm"
+                onClick={resumePaused}
+                disabled={busy}
                 data-testid="detail-resume-btn"
                 title={t('queue.resumeHint')}
-              >{t('queue.resume')}</button>
-              <button onClick={cancel} disabled={busy}
-                className="btn btn-sm bg-err-soft border border-err text-err"
+              >{t('queue.resume')}</Button>
+              <Button
+                variant="danger"
+                size="sm"
+                onClick={cancel}
+                disabled={busy}
                 title={t('queue.cancelPausedHint')}
-              >{t('queue.cancelPaused')}</button>
+              >{t('queue.cancelPaused')}</Button>
             </>
           )}
           {isTerminal && (
@@ -451,21 +479,31 @@ export default function QueueDetailPage() {
                   （done 后端不放行，is_resumable 必为 false）。retry 是从头重跑，
                   两个按钮并列给用户选。 */}
               {task?.is_resumable && (
-                <button onClick={resumePaused} disabled={busy} className="btn btn-primary btn-sm"
+                <Button
+                  variant="primary"
+                  size="sm"
+                  onClick={resumePaused}
+                  disabled={busy}
                   data-testid="detail-resume-btn"
                   title={t('queue.resumeTerminalHint')}
-                >{t('queue.resumeTerminal')}</button>
+                >{t('queue.resumeTerminal')}</Button>
               )}
               {/* train 任务 done 后还挂着训练后评估：这里叫「重试」会被误读成
                   重跑失败的评估（实际是复制配置从头重新训练），所以 train 显式
                   叫「重新训练」；其余类型无此歧义保持「重试」。 */}
-              <button onClick={retry} disabled={busy}
-                className={`btn btn-sm ${task?.is_resumable ? 'btn-secondary' : 'btn-primary'}`}
+              <Button
+                variant={task?.is_resumable ? 'secondary' : 'primary'}
+                size="sm"
+                onClick={retry}
+                disabled={busy}
                 title={kind === 'train' ? t('queueDetail.retryTrainHint') : undefined}
-              >{kind === 'train' ? t('queueDetail.retryTrain') : t('common.retry')}</button>
-              <button onClick={() => setConfirmDelete(true)} disabled={busy}
-                className="btn btn-sm bg-err-soft border border-err text-err"
-              >{t('queueDetail.deleteRecord')}</button>
+              >{kind === 'train' ? t('queueDetail.retryTrain') : t('common.retry')}</Button>
+              <Button
+                variant="danger"
+                size="sm"
+                onClick={() => setConfirmDelete(true)}
+                disabled={busy}
+              >{t('queueDetail.deleteRecord')}</Button>
             </>
           )}
         </div>
@@ -478,7 +516,7 @@ export default function QueueDetailPage() {
 
         {/* Stat cards for running tasks */}
         {task && task.status === 'running' && (
-          <div className="grid grid-cols-4 gap-2.5 mt-1">
+          <div className="ui-queue-detail-stats grid gap-2.5 mt-1" data-testid="queue-detail-stats">
             <StatCard label={t('queueDetail.duration')} value={fmtDuration(task.started_at, null)} mono large tone="accent" />
             <StatCard label={t('queueDetail.startTime')} value={fmtTime(task.started_at)} mono />
             <StatCard label="Config" value={task.config_name} mono />
@@ -488,20 +526,22 @@ export default function QueueDetailPage() {
       </header>
 
       {/* Tabs */}
-      <nav className="flex items-center gap-0 border-b border-subtle shrink-0 px-6">
-        {tabs.map(({ key, label }) => (
-          <button
-            key={key}
-            onClick={() => setTab(key)}
-            className={`py-2 px-[18px] text-sm border-0 bg-transparent -mb-px cursor-pointer transition-colors ${tab === key ? 'font-semibold text-accent border-b-2 border-accent' : 'font-normal text-fg-tertiary hover:text-fg-primary border-b-2 border-transparent hover:border-default'}`}
-          >
-            {label}
-          </button>
-        ))}
-      </nav>
+      <Tabs
+        items={tabs}
+        value={tab}
+        onChange={setTab}
+        ariaLabel={t('queueDetail.tabsAriaLabel')}
+        idPrefix="queue-detail-tab"
+        className="shrink-0 px-page"
+      />
 
       {/* Tab body */}
-      <div className="flex flex-col flex-1 min-h-0 min-w-0 overflow-hidden">
+      <div
+        id="queue-detail-panel"
+        role="tabpanel"
+        aria-labelledby={selectionItemId('queue-detail-tab', tab)}
+        className="flex flex-col flex-1 min-h-0 min-w-0 overflow-hidden"
+      >
         {tab === 'overview' && task && <OverviewTab task={task} />}
         {tab === 'overview' && !task && (
           <div className="p-6 text-center text-fg-tertiary text-sm">
@@ -588,7 +628,7 @@ function OverviewTab({ task }: { task: Task }) {
     { label: 'ID',     value: <code className="font-mono">{task.id}</code> },
     { label: t('common.name'), value: task.name },
     { label: 'Config', value: <code className="font-mono">{task.config_name}.yaml</code> },
-    { label: t('common.status'), value: <span className={STATUS_BADGE[task.status]}>{task.status === 'running' && <span className="dot dot-running" />}{statusLabel[task.status]}</span> },
+    { label: t('common.status'), value: <Badge tone={STATUS_TONE[task.status]} active={task.status === 'running'}>{statusLabel[task.status]}</Badge> },
     { label: t('queueDetail.priority'), value: task.priority, mono: true },
     { label: t('queueDetail.enqueuedAt'), value: fmtTime(task.created_at) },
     // 0.17 P-B — 计划任务显示计划开始时间（提升为 pending 后保留作记录）。
@@ -1043,15 +1083,14 @@ export function OutputsTab({ taskId }: { taskId: number }) {
       <div
         key={f.path}
         onClick={selectMode ? () => toggleOne(f.path) : undefined}
-        className={`grid gap-2 px-4 py-2 items-center border-b border-subtle text-xs transition-colors ${selectMode ? `cursor-pointer ${isSel ? 'bg-accent-soft' : 'hover:bg-overlay'}` : 'hover:bg-overlay'}`}
-        style={{ gridTemplateColumns: '1fr 100px 160px 80px' }}
+        className={`ui-queue-output-grid grid gap-2 px-4 py-2 items-center border-b border-subtle text-xs transition-colors ${selectMode ? `cursor-pointer ${isSel ? 'bg-accent-soft' : 'hover:bg-overlay'}` : 'hover:bg-overlay'}`}
       >
         <div className="flex items-center gap-1.5 min-w-0">
           <code className="font-mono text-fg-primary overflow-hidden text-ellipsis whitespace-nowrap">{f.path || f.name}</code>
-          {f.is_lora && <span className="badge badge-ok">LoRA</span>}
-          {f.kind === 'training_state' && <span className="badge badge-warn">State</span>}
-          {f.kind === 'pause_state' && <span className="badge badge-warn">Pause</span>}
-          {f.kind === 'auto_epoch_state' && <span className="badge badge-warn">Auto</span>}
+          {f.is_lora && <Badge tone="success">LoRA</Badge>}
+          {f.kind === 'training_state' && <Badge tone="warning">State</Badge>}
+          {f.kind === 'pause_state' && <Badge tone="warning">Pause</Badge>}
+          {f.kind === 'auto_epoch_state' && <Badge tone="warning">Auto</Badge>}
         </div>
         <span className="text-right font-mono text-fg-tertiary">{fmtBytes(f.size)}</span>
         <span className="text-right font-mono text-fg-tertiary">{fmtTime(f.mtime)}</span>
@@ -1075,11 +1114,15 @@ export function OutputsTab({ taskId }: { taskId: number }) {
     )
   })
 
-  const renderFileTable = (files: typeof sortedFiles) => (
-    <div className="card overflow-hidden p-0">
+  const renderFileTable = (files: typeof sortedFiles, label: string) => (
+    <div
+      className="ui-queue-output-table card p-0"
+      role="region"
+      aria-label={label}
+      tabIndex={0}
+    >
       <div
-        className="grid gap-2 px-4 py-2 text-xs text-fg-tertiary border-b border-subtle font-mono"
-        style={{ gridTemplateColumns: '1fr 100px 160px 80px' }}
+        className="ui-queue-output-grid grid gap-2 px-4 py-2 text-xs text-fg-tertiary border-b border-subtle font-mono"
       >
         <button
           onClick={() => onHeaderClick('name')}
@@ -1113,39 +1156,50 @@ export function OutputsTab({ taskId }: { taskId: number }) {
   return (
     <div className="flex flex-col flex-1 min-h-0 p-4 gap-2.5">
       {data?.output_dir ? (
-        <div className="flex items-center gap-2 text-xs shrink-0 border-b border-subtle pb-2.5">
+        <div className="ui-queue-output-actions flex items-center gap-2 text-xs shrink-0 border-b border-subtle pb-2.5" data-testid="queue-output-actions">
           <span className="text-fg-tertiary shrink-0">{t('common.directory')}</span>
-          <code className="flex-1 min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-fg-primary font-mono">{data.output_dir}</code>
-          <button onClick={copyPath} className="btn btn-ghost btn-sm">{t('queueDetail.copyPath')}</button>
+          <code
+            className="ui-queue-output-path min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-fg-primary font-mono"
+            title={data.output_dir}
+          >
+            {data.output_dir}
+          </code>
+          <Button variant="ghost" size="sm" onClick={copyPath}>{t('queueDetail.copyPath')}</Button>
           {data.supports_open_folder ? (
-            <button onClick={openFolder} disabled={busy || !data.exists}
-              className="btn btn-ghost btn-sm"
-            >{t('queueDetail.openFolder')}</button>
+            <Button variant="ghost" size="sm" onClick={openFolder} disabled={busy || !data.exists}>
+              {t('queueDetail.openFolder')}
+            </Button>
           ) : (
             <span className="text-xs text-fg-tertiary shrink-0">{t('common.remote')}</span>
           )}
-          <button onClick={() => setRefreshKey((k) => k + 1)} className="btn btn-ghost btn-sm">{t('common.refresh')}</button>
+          <Button variant="ghost" size="sm" onClick={() => setRefreshKey((k) => k + 1)}>
+            {t('common.refresh')}
+          </Button>
           {data.exists && data.files.length > 0 && (
             <>
-              <button
+              <Button
+                variant={selectMode ? 'secondary' : 'ghost'}
+                size="sm"
                 onClick={toggleSelectMode}
-                className={selectMode ? 'btn btn-secondary btn-sm' : 'btn btn-ghost btn-sm'}
+                aria-pressed={selectMode}
               >
                 {selectMode ? t('queueDetail.exitBatchMode') : t('queueDetail.batchMode')}
-              </button>
+              </Button>
               {selectMode && (
-                <button
+                <Button
+                  variant="danger"
+                  size="sm"
                   onClick={handleDelete}
                   disabled={deleting || noneSelected}
-                  className="btn btn-ghost btn-sm text-err"
                 >
                   {t('queueDetail.deleteSelected', { n: selected.size })}
-                </button>
+                </Button>
               )}
-              <button
+              <Button
+                variant="primary"
+                size="sm"
                 onClick={() => setDownloadDialog({ destination: 'download' })}
                 disabled={zipping || exportingOutputs || deleting || (selectMode && noneSelected)}
-                className="btn btn-primary btn-sm"
               >
                 {zipping
                   ? t('queueDetail.compressing')
@@ -1154,7 +1208,7 @@ export function OutputsTab({ taskId }: { taskId: number }) {
                     : selectMode
                       ? (noneSelected ? t('queueDetail.downloadSelectedEmpty') : t('queueDetail.downloadSelected', { n: selected.size, size: fmtBytes(selectedSize) }))
                       : t('queueDetail.downloadAll')}
-              </button>
+              </Button>
             </>
           )}
         </div>
@@ -1177,14 +1231,14 @@ export function OutputsTab({ taskId }: { taskId: number }) {
           <div className="flex flex-col gap-3">
             {regularFiles.length > 0 && (
               <section className="flex flex-col gap-1.5">
-                <div className="px-1 text-xs font-semibold text-fg-secondary">输出文件</div>
-                {renderFileTable(regularFiles)}
+                <div className="px-1 text-xs font-semibold text-fg-secondary">{t('queueDetail.outputFiles')}</div>
+                {renderFileTable(regularFiles, t('queueDetail.outputFiles'))}
               </section>
             )}
             {stateFiles.length > 0 && (
               <section className="flex flex-col gap-1.5">
-                <div className="px-1 text-xs font-semibold text-warn">训练状态</div>
-                {renderFileTable(stateFiles)}
+                <div className="px-1 text-xs font-semibold text-warn">{t('queueDetail.trainingStates')}</div>
+                {renderFileTable(stateFiles, t('queueDetail.trainingStates'))}
               </section>
             )}
           </div>
@@ -1256,10 +1310,12 @@ function OutputsDownloadDialog({
           </label>
         </div>
         <footer className="px-[18px] py-3 border-t border-subtle flex items-center gap-2 justify-end">
-          <button onClick={onCancel} disabled={busy} className="btn btn-ghost btn-sm">{t('common.cancel')}</button>
-          <button onClick={onConfirm} disabled={busy} className="btn btn-primary btn-sm">
+          <Button variant="ghost" size="sm" onClick={onCancel} disabled={busy}>
+            {t('common.cancel')}
+          </Button>
+          <Button variant="primary" size="sm" onClick={onConfirm} disabled={busy}>
             {busy ? '...' : t('common.confirm')}
-          </button>
+          </Button>
         </footer>
       </div>
     </div>
@@ -1340,14 +1396,15 @@ export function SnapshotConfigTab({ task }: { task: Task | null }) {
           <h3 className="m-0 text-md font-semibold">{t('snapshot.title')}</h3>
           <p className="m-0 mt-1 text-xs text-fg-tertiary">{t('snapshot.subtitle')}</p>
         </div>
-        <button
-          className="btn btn-primary btn-sm"
+        <Button
+          variant="primary"
+          size="sm"
           onClick={() => setConfirmApply(true)}
           disabled={!canApply || applying}
           title={canApply ? undefined : t('snapshot.noVersionLink')}
         >
           {t('snapshot.applyBtn')}
-        </button>
+        </Button>
       </div>
       <pre className="m-0 p-4 rounded-md border border-subtle bg-sunken text-xs font-mono overflow-auto whitespace-pre flex-1 min-h-0">{data.yaml}</pre>
 
@@ -1382,10 +1439,15 @@ function ConfirmDialog({
         </header>
         <div className="px-[18px] py-3.5 text-sm text-fg-secondary">{message}</div>
         <footer className="px-[18px] py-3 border-t border-subtle flex items-center gap-2 justify-end">
-          <button onClick={onCancel} disabled={busy} className="btn btn-ghost btn-sm">{cancelLabel}</button>
-          <button onClick={onConfirm} disabled={busy}
-            className={danger ? 'btn btn-sm bg-err border border-err text-fg-inverse' : 'btn btn-primary btn-sm'}
-          >{busy ? '...' : confirmLabel}</button>
+          <Button variant="ghost" size="sm" onClick={onCancel} disabled={busy}>
+            {cancelLabel}
+          </Button>
+          <Button
+            variant={danger ? 'danger' : 'primary'}
+            size="sm"
+            onClick={onConfirm}
+            disabled={busy}
+          >{busy ? '...' : confirmLabel}</Button>
         </footer>
       </div>
     </div>

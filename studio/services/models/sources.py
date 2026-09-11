@@ -251,7 +251,7 @@ def _get_download_source() -> str:
 
 
 def _source_for(type_key: str) -> str:
-    """某下载类型（training / wd14 / upscaler）当前选的源。
+    """某下载类型（training / wd14 / upscaler / head_detector）当前选的源。
 
     MODELSCOPE_SOURCE env 仍作全局强制覆盖（CLI flag / CI）；否则读
     secrets.download_sources[type_key]，缺省 / 非法值回落 huggingface。
@@ -378,6 +378,7 @@ def download_flat(
     repo_subpath: str,
     target: Path,
     *,
+    revision: Optional[str] = None,
     on_log: TaskLogLike = _DEFAULT_LOG,
 ) -> bool:
     """从 HF 下载 repo_subpath，扁平落到 target；返回 True = 已就绪。
@@ -403,6 +404,8 @@ def download_flat(
             local_dir=str(target.parent),
             local_dir_use_symlinks=False,
         )
+        if revision:
+            kwargs["revision"] = revision
         if endpoint:
             kwargs["endpoint"] = endpoint
         if token:

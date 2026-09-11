@@ -332,14 +332,14 @@ class _FakeTorchVersion:
     def __init__(self, cuda, hip=None):
         self.cuda = cuda
         # 必须显式存在：`utils.accelerator.detect()` 判定顺序是 hip 优先，读不到这个
-        # 属性会抛 AttributeError 被兜底 except 吞掉，整段探测静默降级（ADR 0016）。
+        # 属性会抛 AttributeError 被兜底 except 吞掉，整段探测静默降级（ADR 0019）。
         self.hip = hip
 
 
 class _FakeTorch:
     """最小 torch 替身，覆盖 `utils.accelerator.detect()` 实际读取的全部接口。
 
-    `_check_torch_cuda()` 自 ADR 0016 起不再自己读 `torch.version.*`，而是走
+    `_check_torch_cuda()` 自 ADR 0019 起不再自己读 `torch.version.*`，而是走
     `accelerator.detect()`。那个函数除了 `is_available()` / `get_device_name()`
     还会调 `device_count()` 与 `get_device_properties()` 拿卡数与 gfx 架构 ——
     替身缺这两个方法时异常被兜底 except 吞掉，`device_names` 留空，断言里的卡名
@@ -494,7 +494,7 @@ def test_check_torch_cuda_ok_on_dcu(
 
     DTK wheel 的特征组合：`version.cuda is None` + `version.hip` 有值 +
     版本串带本地标签。历史 bug 正是在这个组合上把 DCU 判成 CPU-only 误装
-    （见 ADR 0016），所以这条要把「不误判」钉死。
+    （见 ADR 0019），所以这条要把「不误判」钉死。
 
     断言走 caplog 而非 capsys：日志改写后 `_say` 是 `studio.cli` logger 的薄包装，
     CLI 不再自己 print（设计 D3 / logging-target-state.md §3.2）。级别一并断言 ——

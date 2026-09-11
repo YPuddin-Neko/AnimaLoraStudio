@@ -41,6 +41,7 @@ describe('SystemStats', () => {
     vi.spyOn(api, 'systemStats').mockResolvedValue(makeStats())
     render(<SystemStats />)
     await waitFor(() => expect(screen.getByText('CPU')).toBeInTheDocument())
+    expect(screen.getByText('CPU').closest('.ui-app-shell-topbar-stats')).toBeInTheDocument()
     expect(screen.getByText('13%')).toBeInTheDocument()
     expect(screen.getByText('MEM')).toBeInTheDocument()
     expect(screen.getByText('8.0/32G')).toBeInTheDocument()
@@ -48,6 +49,28 @@ describe('SystemStats', () => {
     expect(screen.getByText('50%')).toBeInTheDocument()
     expect(screen.getByText('VRAM')).toBeInTheDocument()
     expect(screen.getByText('4.0/24G')).toBeInTheDocument()
+
+    const cpu = screen.getByRole('meter', { name: 'CPU' })
+    expect(cpu).toHaveAttribute('aria-valuemin', '0')
+    expect(cpu).toHaveAttribute('aria-valuemax', '100')
+    expect(cpu).toHaveAttribute('aria-valuenow', '12.5')
+    expect(cpu).toHaveAttribute('aria-valuetext', 'CPU 占用 12.5%')
+    expect(screen.getByRole('meter', { name: '内存' })).toHaveAttribute(
+      'aria-valuetext',
+      '内存 8.0 / 32.0 GB（25%）',
+    )
+    // 上游 v0.27.0 的单卡格式是「GPU 利用率 50% · Test GPU」（卡名内嵌）。
+    // 本分支统一走**逐卡行**（`#0 名字  读数`），单卡多卡同一套格式 —— 因为 pill
+    // 显示的是全卡汇总，description 的职责是「这个汇总由哪几张卡构成」，单卡只是
+    // 一行的特例。两种格式并存会让单卡/多卡的读法不一致。
+    expect(screen.getByRole('meter', { name: 'GPU' })).toHaveAttribute(
+      'aria-valuetext',
+      expect.stringContaining('#0 Test GPU  50% · 55°C'),
+    )
+    expect(screen.getByRole('meter', { name: '显存' })).toHaveAttribute(
+      'aria-valuetext',
+      expect.stringContaining('#0 Test GPU  4.0/24G (17%)'),
+    )
   })
 
   it('hides GPU / VRAM when stats.gpu is null', async () => {
@@ -95,6 +118,18 @@ describe('SystemStats', () => {
     await waitFor(() => expect(screen.getByText('36.0/128G')).toBeInTheDocument())
     // 利用率取平均：(90 + 10) / 2 = 50%，**不是** 100%（相加无意义）
     expect(screen.getByText('50%')).toBeInTheDocument()
+    // 上游 v0.27.0 把 pill 改成 role="meter" + aria-valuetext（无障碍）。
+    // 这里沿用那套断言手法，但断的是**汇总**语义：上游那版只显示 active 那一张
+    // （断言 `queryByText('1.1/8G')` 为 null），在本分支的汇总视图下不成立 ——
+    // 双卡 DCU 上「只显示一张」等于一半显存看不见。
+    const vramMeter = screen.getByRole('meter', { name: '显存' })
+    expect(vramMeter).toHaveAttribute(
+      'aria-valuetext',
+      expect.stringContaining('显存合计 36.0 / 128 GB'),
+    )
+    // 两张卡都要在逐卡明细里
+    expect(vramMeter.getAttribute('aria-valuetext')).toContain('#0 BW  32.0/64G')
+    expect(vramMeter.getAttribute('aria-valuetext')).toContain('#1 BW  4.0/64G')
   })
 
   it('marks multi-card pills with card count in the label', async () => {
@@ -111,7 +146,7 @@ describe('SystemStats', () => {
     render(<SystemStats />)
     const vram = await screen.findByText('36.0/128G')
     const tip = vram.closest('[title]')?.getAttribute('title') ?? ''
-    expect(tip).toContain('显存合计 36.0 / 128 GB (28%) · 2 卡')
+    expect(tip).toContain('显存合计 36.0 / 128 GB（28%）· 2 卡')
     expect(tip).toContain('#0 BW  32.0/64G (50%)')
     expect(tip).toContain('#1 BW  4.0/64G (6%)')
   })

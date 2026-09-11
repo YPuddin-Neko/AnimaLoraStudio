@@ -6,7 +6,7 @@
 
 多卡（DDP）启动也在这里决定：`utils/distributed.py` 只**读** torchrun 注入的
 `RANK` / `LOCAL_RANK` / `WORLD_SIZE`，自己不拉进程，所以「起几个进程」这件事
-的唯一决策点是本模块（见 ADR 0016 双后端说明与 utils/distributed 模块 docstring）。
+的唯一决策点是本模块（见 ADR 0019 双后端说明与 utils/distributed 模块 docstring）。
 """
 from __future__ import annotations
 

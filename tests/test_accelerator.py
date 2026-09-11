@@ -1,9 +1,9 @@
-"""utils/accelerator.py — 后端识别 + 能力查询 + 显存采集（ADR 0016）。
+"""utils/accelerator.py — 后端识别 + 能力查询 + 显存采集（ADR 0019）。
 
 这个模块是全仓库判断「NVIDIA CUDA / 海光 DCU / CPU」的单一权威源，被装包链路、
 启动自检、显存护栏、topbar 监控共同消费。所以测试重点不是覆盖率，而是**误判的代价**：
 把 DCU 判成 CPU 会让 Studio 推荐「重装 cu128 torch」，而那会覆盖掉 DTK 镜像预装的
-torch、让整个容器报废（见 ADR 0016 背景段）。
+torch、让整个容器报废（见 ADR 0019 背景段）。
 
 真机无关：全部用假 torch 模块，不需要装 torch，也不需要有卡。
 """
@@ -374,7 +374,7 @@ def _fake_pynvml(monkeypatch, *, free_bytes=None, devices=None, init_raises=Fals
 
 def test_free_vram_prefers_nvml_on_nvidia(monkeypatch):
     """NVIDIA 上**必须**优先 NVML：WDDM 下 mem_get_info 是每进程视角，
-    看不到他进程占用，拿它做跨进程护栏形同虚设（ADR 0016 / sysmem.py 踩坑记录）。
+    看不到他进程占用，拿它做跨进程护栏形同虚设（ADR 0019 / sysmem.py 踩坑记录）。
 
     假 NVML 报 7GB、假 torch 报 2GB —— 断言拿到的是 NVML 那个数。
     """
@@ -475,7 +475,7 @@ def test_device_stats_none_without_gpu(monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# SDPA 后端探测与配置（ADR 0016 / 真机 DTK 26.04 实测驱动的修复）
+# SDPA 后端探测与配置（ADR 0019 / 真机 DTK 26.04 实测驱动的修复）
 # ---------------------------------------------------------------------------
 
 

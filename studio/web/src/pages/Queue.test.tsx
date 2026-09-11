@@ -6,7 +6,7 @@
  *   2) 缺字段（老 mock / 极老行）兜底 'train'；
  *   3) 不再受 config_name 影响 —— 修掉旧 inferKind 把名字含 "reg"/"tag" 的
  *      训练任务误判成别的类型的 latent bug。 */
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { DialogProvider } from '../components/Dialog'
@@ -84,7 +84,40 @@ function renderQueue() {
 }
 
 describe('QueuePage 分区 + 分页', () => {
-  it('渲染进行中/等待/历史三分区，历史超过一页时出分页器', async () => {
+  it('空队列使用共享的主空状态层级', async () => {
+    vi.spyOn(api, 'getQueueHold').mockResolvedValue({ held: false } as never)
+    vi.spyOn(api, 'listQueueLive').mockResolvedValue([])
+    vi.spyOn(api, 'listQueueHistory').mockResolvedValue({
+      items: [], total: 0, page: 1, page_size: 20,
+    })
+
+    renderQueue()
+
+    const title = await screen.findByText('队列为空')
+    expect(title.closest('.empty-state')).toHaveClass('card', 'empty-state')
+    expect(screen.getByText('从项目训练页入队任务即可'))
+      .toHaveClass('empty-state-description')
+  })
+
+  it('队列挂起使用共享 warning Alert，并保留恢复操作', async () => {
+    vi.spyOn(api, 'getQueueHold').mockResolvedValue({
+      held: true, pending_waiting: 2,
+    })
+    vi.spyOn(api, 'listQueueLive').mockResolvedValue([])
+    vi.spyOn(api, 'listQueueHistory').mockResolvedValue({
+      items: [], total: 0, page: 1, page_size: 20,
+    })
+
+    renderQueue()
+
+    const banner = await screen.findByTestId('queue-hold-banner')
+    expect(banner).toHaveClass('alert', 'alert-warning', 'alert-sm')
+    expect(banner).not.toHaveClass('sticky')
+    expect(within(banner).getByRole('button', { name: '恢复调度' }))
+      .toHaveClass('btn', 'btn-ghost', 'btn-xs')
+  })
+
+  it('渲染进行中/等待/历史三分区，历史超过一页时固定分页器', async () => {
     vi.spyOn(api, 'getQueueHold').mockResolvedValue({ held: false } as never)
     vi.spyOn(api, 'listQueueLive').mockResolvedValue([
       makeTask({ id: 10, name: 'run', status: 'running', started_at: 1000 }),
@@ -97,13 +130,47 @@ describe('QueuePage 分区 + 分页', () => {
 
     renderQueue()
 
-    await waitFor(() => expect(screen.getByText(/进行中/)).toBeInTheDocument())
-    expect(screen.getByText(/等待入队/)).toBeInTheDocument()
-    expect(screen.getByText(/历史/)).toBeInTheDocument()
+    expect(screen.getByTestId('queue-page'))
+      .toHaveClass('h-full', 'min-h-0', 'flex', 'flex-col', 'overflow-hidden')
+    expect(screen.getByTestId('queue-page'))
+      .toHaveAttribute('data-app-shell-scroll', 'contained')
+    expect(screen.getByTestId('queue-page')).not.toHaveClass('min-h-full')
+    expect(screen.getByTestId('queue-scroll-region'))
+      .toHaveClass('ui-queue-scroll-region', 'flex-1', 'min-h-0')
+    expect(screen.getByTestId('queue-scroll-region'))
+      .toHaveAttribute('role', 'region')
+    expect(screen.getByTestId('queue-scroll-region'))
+      .toHaveAccessibleName(/任务队列/)
+    expect(screen.getByTestId('queue-scroll-region')).toHaveAttribute('tabindex', '0')
+    expect(screen.getByTestId('queue-page-content'))
+      .toHaveClass('px-page', 'py-section')
+    expect(screen.getByTestId('queue-page-content'))
+      .not.toHaveClass('overflow-y-auto', 'overflow-hidden')
+    expect(screen.getByRole('heading', { level: 1 }).closest('.ui-page-header'))
+      .not.toHaveClass('sticky')
+
+    await waitFor(() => expect(screen.getByRole('heading', { level: 3, name: /进行中/ })).toBeInTheDocument())
+    expect(screen.getByRole('heading', { level: 3, name: /进行中/ }))
+      .toHaveClass('type-section-label')
+    expect(screen.getByRole('heading', { level: 3, name: /进行中/ }).parentElement)
+      .toHaveClass('gap-related')
+    expect(screen.getByRole('heading', { level: 3, name: /等待入队/ }))
+      .toHaveClass('type-section-label')
+    expect(screen.getByRole('heading', { level: 3, name: /历史/ }))
+      .toHaveClass('type-section-label')
+    expect(screen.getByTestId('queue-task-grid-10'))
+      .toHaveClass('ui-queue-task-grid')
+    expect(screen.getByTestId('queue-task-grid-10').querySelector('.ui-queue-task-timing'))
+      .toBeInTheDocument()
     // 历史 total=25 > page_size=20 → 分页器 + 页码指示
     expect(screen.getByText(/第 1 \/ 2 页/)).toBeInTheDocument()
     expect(screen.getByTestId('history-prev')).toBeDisabled()
     expect(screen.getByTestId('history-next')).not.toBeDisabled()
+    const pagination = screen.getByTestId('queue-pagination')
+    expect(pagination).toHaveClass('shrink-0', 'px-page', 'border-t')
+    expect(pagination).not.toHaveClass('mt-section', '-mx-page', '-mb-page')
+    expect(screen.getByTestId('queue-scroll-region').nextElementSibling)
+      .toBe(pagination)
     historySpy.mockClear()
 
     // 点下一页 → 以 page=2 重新请求后端
@@ -123,6 +190,14 @@ describe('QueuePage 分区 + 分页', () => {
     renderQueue()
     await waitFor(() => expect(screen.getByTestId('queue-filter-toggle')).toBeInTheDocument())
     fireEvent.click(screen.getByTestId('queue-filter-toggle'))
+    expect(screen.getByTestId('queue-filterbar'))
+      .toHaveClass('list-toolbar')
+    expect(screen.getByTestId('queue-filterbar'))
+      .toHaveAttribute('role', 'region')
+    expect(screen.getByTestId('queue-filter-toggle'))
+      .toHaveAttribute('aria-controls', 'queue-tasks-list-toolbar')
+    expect(screen.getByTestId('queue-search'))
+      .toHaveClass('form-control', 'form-control-sm', 'form-control-surface')
     fireEvent.change(screen.getByTestId('queue-search'), { target: { value: 'abc' } })
 
     await waitFor(
@@ -291,8 +366,14 @@ describe('QueuePage 分区 + 分页', () => {
     await waitFor(() => expect(screen.getByTestId('data-jobs-panel')).toBeInTheDocument())
     // 任务分区没了；漏斗还在（数据作业视图的 kind 过滤），点开出 kind select
     expect(screen.queryByText(/等待入队/)).not.toBeInTheDocument()
+    expect(screen.getByTestId('queue-filter-toggle'))
+      .toHaveAttribute('aria-controls', 'queue-jobs-list-toolbar')
+    expect(screen.getByTestId('queue-jobs-filterbar')).toHaveAttribute('hidden')
     fireEvent.click(screen.getByTestId('queue-filter-toggle'))
+    expect(screen.getByTestId('queue-jobs-filterbar')).not.toHaveAttribute('hidden')
     expect(screen.getByTestId('jobs-kind-filter')).toBeInTheDocument()
+    expect(screen.getByTestId('jobs-kind-filter'))
+      .toHaveClass('form-control', 'form-control-sm', 'form-control-surface')
     expect(screen.getByTestId('jobs-search')).toBeInTheDocument()
     // 任务视图专属的搜索框不在
     expect(screen.queryByTestId('queue-search')).not.toBeInTheDocument()
@@ -314,10 +395,16 @@ describe('QueuePage 分区 + 分页', () => {
     renderQueue()
 
     await waitFor(() => expect(screen.getByTestId('queue-filter-toggle')).toBeInTheDocument())
-    // 默认收起：搜索框不在
-    expect(screen.queryByTestId('queue-search')).not.toBeInTheDocument()
-    // 点漏斗 → 过滤行展开，搜索框出现
-    fireEvent.click(screen.getByTestId('queue-filter-toggle'))
-    expect(screen.getByTestId('queue-search')).toBeInTheDocument()
+    const toggle = screen.getByTestId('queue-filter-toggle')
+    const toolbar = screen.getByTestId('queue-filterbar')
+    expect(toggle).toHaveAttribute('aria-controls', 'queue-tasks-list-toolbar')
+    expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    expect(toolbar).toHaveAttribute('hidden')
+    expect(screen.getByTestId('queue-search')).not.toBeVisible()
+    // 点漏斗 → 同一个具名 region 展开，控件恢复可见
+    fireEvent.click(toggle)
+    expect(toggle).toHaveAttribute('aria-expanded', 'true')
+    expect(toolbar).not.toHaveAttribute('hidden')
+    expect(screen.getByTestId('queue-search')).toBeVisible()
   })
 })

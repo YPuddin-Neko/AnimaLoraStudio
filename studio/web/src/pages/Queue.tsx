@@ -6,10 +6,16 @@ import {
   type TaskStatus, type TaskType,
 } from '../api/client'
 import { DATA_VIEW_KINDS } from './queue/jobUtils'
+import Alert from '../components/Alert'
+import Button from '../components/Button'
+import Card from '../components/Card'
+import EmptyState from '../components/EmptyState'
+import { Input, Select } from '../components/FormControl'
+import ListToolbar from '../components/ListToolbar'
+import PageHeader from '../components/PageHeader'
 import { HoldQueueModal, type HoldDecision } from '../components/HoldQueueModal'
 import { PauseConfirmModal } from '../components/PauseConfirmModal'
 import { PauseProgressModal } from '../components/PauseProgressModal'
-import StepShell from '../components/StepShell'
 import { useDialog } from '../components/Dialog'
 import { useToast } from '../components/Toast'
 import { useEventStream } from '../lib/useEventStream'
@@ -43,6 +49,8 @@ export function taskKind(task: Task): TaskKind {
 const HISTORY_PAGE_SIZES = [20, 50, 100]
 // 0.17 P-F — 队列默认只看训练（generate/reg_ai 短任务多、会淹没列表）。
 const DEFAULT_TYPE_FILTER: TaskKind = 'train'
+const QUEUE_TASKS_LIST_TOOLBAR_ID = 'queue-tasks-list-toolbar'
+const QUEUE_JOBS_LIST_TOOLBAR_ID = 'queue-jobs-list-toolbar'
 
 function fmtAgo(ts: number): string {
   const sec = Math.max(0, Date.now() / 1000 - ts)
@@ -94,7 +102,7 @@ function estimateEta(task: Task): string | null {
   return `已运行 ${fmtDurationShort(elapsed)}`
 }
 
-/** 历史分页固定底栏（GPU / 数据两个视图共用同款，P-G 反馈统一）。
+/** 历史分页持久底栏（GPU / 数据两个视图共用同款，P-G 反馈统一）。
  *  只要 total 超过最小每页数就常显；testid 复用（同一时刻只渲染一个视图）。 */
 function PaginationBar({
   page, total, pageSize, onPage, onPageSize,
@@ -108,8 +116,11 @@ function PaginationBar({
   const { t } = useTranslation()
   const totalPages = Math.max(1, Math.ceil(total / pageSize))
   return (
-    <div className="shrink-0 -mx-6 -mb-6 px-6 py-1 border-t border-subtle flex items-center justify-between flex-wrap gap-2 bg-canvas text-[11px]">
-      <div className="flex items-center gap-2 text-fg-tertiary">
+    <div
+      className="shrink-0 px-page py-1 border-t border-subtle flex items-center justify-between flex-wrap gap-related bg-canvas text-[11px]"
+      data-testid="queue-pagination"
+    >
+      <div className="flex items-center gap-related text-fg-tertiary">
         <span>{t('queue.pageIndicator', { page, pages: totalPages })}</span>
         <select
           value={pageSize}
@@ -214,8 +225,8 @@ function QueueTaskRow({
       className={`card card-hover block overflow-hidden text-left p-0 cursor-pointer ${isRunning ? 'border border-accent bg-accent-soft' : 'border border-subtle bg-surface'}`}
     >
       <div
-        className="px-[22px] py-4 grid gap-3 items-center"
-        style={{ gridTemplateColumns: '48px minmax(0,1fr) 88px 96px 150px 128px 176px' }}
+        className="ui-queue-task-grid px-[22px] py-4 grid gap-3 items-center"
+        data-testid={`queue-task-grid-${task.id}`}
       >
         <span className={`font-mono text-sm ${isRunning ? 'text-accent font-semibold' : 'text-fg-tertiary font-normal'}`}>
           #{task.id}
@@ -307,7 +318,7 @@ function QueueTaskRow({
           )}
         </div>
 
-        <span className="font-mono text-sm text-fg-tertiary text-right">
+        <span className="ui-queue-task-timing font-mono text-sm text-fg-tertiary text-right">
           {isRunning ? (
             <>
               {eta && <span className="text-accent">{eta}</span>}
@@ -476,7 +487,7 @@ export default function QueuePage() {
   const [jobsSearch, setJobsSearch] = useLocalStorageState('studio:queue:jobsSearch', '')
   const [jobsSearchDebounced, setJobsSearchDebounced] = useState(jobsSearch)
   const [jobsRefreshToken, setJobsRefreshToken] = useState(0)
-  // 数据任务历史分页（与 GPU 视图同款固定底栏；total 由 Panel 拉取后回报）。
+  // 数据任务历史分页（与 GPU 视图共用持久底栏；total 由 Panel 拉取后回报）。
   const [jobsHistoryPage, setJobsHistoryPage] = useState(1)
   const [jobsPageSize, setJobsPageSize] =
     useLocalStorageState('studio:queue:jobsPageSize', HISTORY_PAGE_SIZES[0])
@@ -793,8 +804,12 @@ export default function QueuePage() {
     search.trim() !== '' || historyStatus !== null || typeFilter !== DEFAULT_TYPE_FILTER
 
   return (
-    <StepShell
-      idx={-1}
+    <div
+      className="ui-queue-page fade-in h-full min-h-0 flex flex-col overflow-hidden"
+      data-app-shell-scroll="contained"
+      data-testid="queue-page"
+    >
+      <PageHeader
       /* 0.17 P-G — title/描述随视图切换：明确这是两条独立队列，不是同一列表的
          类型 filter。 */
       title={queueTab === 'jobs' ? t('queue.titleJobs') : t('queue.title')}
@@ -807,6 +822,7 @@ export default function QueuePage() {
               className={`btn btn-sm ${filtersOpen ? 'btn-secondary' : 'btn-ghost'}`}
               onClick={() => setFiltersOpen((o) => !o)}
               aria-expanded={filtersOpen}
+              aria-controls={QUEUE_JOBS_LIST_TOOLBAR_ID}
               aria-label={t('queue.filters')}
               title={t('queue.filters')}
               data-testid="queue-filter-toggle"
@@ -831,6 +847,7 @@ export default function QueuePage() {
             className={`btn btn-sm ${filtersOpen ? 'btn-secondary' : 'btn-ghost'}`}
             onClick={() => setFiltersOpen((o) => !o)}
             aria-expanded={filtersOpen}
+            aria-controls={QUEUE_TASKS_LIST_TOOLBAR_ID}
             aria-label={t('queue.filters')}
             title={t('queue.filters')}
             data-testid="queue-filter-toggle"
@@ -905,116 +922,130 @@ export default function QueuePage() {
           </button>
         </>
       }
-      belowHeader={filtersOpen && (queueTab === 'jobs' ? (
-        // 0.17 P-G — 数据作业过滤行：kind 单选（与任务视图的过滤行同位）。
-        <div
-          className="px-6 py-2 border-b border-subtle flex items-center gap-3"
+      />
+
+      {queueTab === 'jobs' ? (
+        <ListToolbar
+          id={QUEUE_JOBS_LIST_TOOLBAR_ID}
+          hidden={!filtersOpen}
+          ariaLabel={t('queue.filters')}
           data-testid="queue-jobs-filterbar"
-        >
-          <input
-            className="input"
-            style={{ width: '60%' }}
-            value={jobsSearch}
-            onChange={(e) => setJobsSearch(e.target.value)}
-            placeholder={t('queue.jobs.searchPlaceholder')}
-            aria-label={t('common.search')}
-            data-testid="jobs-search"
-          />
-          <span className="flex-1" />
-          <select
-            className="input"
-            style={{ width: '15%', minWidth: 150 }}
-            value={jobsKind ?? 'all'}
-            onChange={(e) => {
-              const v = e.target.value
-              setJobsKind(v === 'all' ? null : (v as TaskType))
-            }}
-            aria-label={t('queue.typeFilterLabel')}
-            data-testid="jobs-kind-filter"
-          >
-            <option value="all">{t('queue.filterAll')}</option>
-            {DATA_VIEW_KINDS.map((k) => (
-              <option key={k} value={k}>{t(`queue.jobs.kind.${k}`)}</option>
-            ))}
-          </select>
-        </div>
+          search={(
+            <Input
+              controlSize="sm"
+              value={jobsSearch}
+              onChange={(e) => setJobsSearch(e.target.value)}
+              placeholder={t('queue.jobs.searchPlaceholder')}
+              aria-label={t('common.search')}
+              data-testid="jobs-search"
+            />
+          )}
+          filters={(
+            <Select
+              controlSize="sm"
+              value={jobsKind ?? 'all'}
+              onChange={(e) => {
+                const v = e.target.value
+                setJobsKind(v === 'all' ? null : (v as TaskType))
+              }}
+              aria-label={t('queue.typeFilterLabel')}
+              data-testid="jobs-kind-filter"
+            >
+              <option value="all">{t('queue.filterAll')}</option>
+              {DATA_VIEW_KINDS.map((k) => (
+                <option key={k} value={k}>{t(`queue.jobs.kind.${k}`)}</option>
+              ))}
+            </Select>
+          )}
+        />
       ) : (
-        // 0.17 P-C/P-F 过滤行 —— 与项目页 FilterBar 一致：header 下全宽条。搜索 60%
-        // 下沉后端搜 name/config；类型 select 跨 live+history 按 task_type 过滤；状态
-        // select 是历史段终态子过滤。
-        <div
-          className="px-6 py-2 border-b border-subtle flex items-center gap-3"
+        <ListToolbar
+          id={QUEUE_TASKS_LIST_TOOLBAR_ID}
+          hidden={!filtersOpen}
+          ariaLabel={t('queue.filters')}
           data-testid="queue-filterbar"
-        >
-          <input
-            className="input"
-            style={{ width: '60%' }}
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
-            placeholder={t('queue.searchPlaceholder')}
-            aria-label={t('common.search')}
-            data-testid="queue-search"
-          />
-          <span className="flex-1" />
-          <select
-            className="input"
-            style={{ width: '10%', minWidth: 120 }}
-            value={typeFilter ?? 'all'}
-            onChange={(e) => {
-              const v = e.target.value
-              setTypeFilter(v === 'all' ? null : (v as TaskKind))
-              setHistoryPage(1)
-            }}
-            aria-label={t('queue.typeFilterLabel')}
-            data-testid="queue-type-filter"
-          >
-            <option value="all">{t('queue.filterAll')}</option>
-            <option value="train">{t('queue.typeTrain')}</option>
-            <option value="reg_ai">{t('queue.typeReg')}</option>
-            <option value="generate">{t('queue.typeGenerate')}</option>
-            <option value="eval_session">{t('queue.jobs.kind.eval_session')}</option>
-          </select>
-          <select
-            className="input"
-            style={{ width: '10%', minWidth: 120 }}
-            value={historyStatus ?? 'all'}
-            onChange={(e) => {
-              const v = e.target.value
-              setHistoryStatus(v === 'all' ? null : (v as TaskStatus))
-              setHistoryPage(1)
-            }}
-            aria-label={t('common.status')}
-            data-testid="history-status-filter"
-          >
-            <option value="all">{t('queue.filterAll')}</option>
-            <option value="done">{t('status.done')}</option>
-            <option value="failed">{t('status.failed')}</option>
-            <option value="canceled">{t('status.canceled')}</option>
-          </select>
-        </div>
-      ))}
-    >
-      <div className="flex flex-col gap-2.5 flex-1 min-h-0 overflow-y-auto">
-        {/* ADR §4.1 队列挂起 banner — 仅 held=true 时显示，sticky 顶部。
+          search={(
+            <Input
+              controlSize="sm"
+              value={search}
+              onChange={(e) => setSearch(e.target.value)}
+              placeholder={t('queue.searchPlaceholder')}
+              aria-label={t('common.search')}
+              data-testid="queue-search"
+            />
+          )}
+          filters={(
+            <>
+              <Select
+                controlSize="sm"
+                value={typeFilter ?? 'all'}
+                onChange={(e) => {
+                  const v = e.target.value
+                  setTypeFilter(v === 'all' ? null : (v as TaskKind))
+                  setHistoryPage(1)
+                }}
+                aria-label={t('queue.typeFilterLabel')}
+                data-testid="queue-type-filter"
+              >
+                <option value="all">{t('queue.filterAll')}</option>
+                <option value="train">{t('queue.typeTrain')}</option>
+                <option value="reg_ai">{t('queue.typeReg')}</option>
+                <option value="generate">{t('queue.typeGenerate')}</option>
+                <option value="eval_session">{t('queue.jobs.kind.eval_session')}</option>
+              </Select>
+              <Select
+                controlSize="sm"
+                value={historyStatus ?? 'all'}
+                onChange={(e) => {
+                  const v = e.target.value
+                  setHistoryStatus(v === 'all' ? null : (v as TaskStatus))
+                  setHistoryPage(1)
+                }}
+                aria-label={t('common.status')}
+                data-testid="history-status-filter"
+              >
+                <option value="all">{t('queue.filterAll')}</option>
+                <option value="done">{t('status.done')}</option>
+                <option value="failed">{t('status.failed')}</option>
+                <option value="canceled">{t('status.canceled')}</option>
+              </Select>
+            </>
+          )}
+        />
+      )}
+
+      <div
+        className="ui-queue-scroll-region flex-1 min-h-0"
+        role="region"
+        aria-label={queueTab === 'jobs' ? t('queue.titleJobs') : t('queue.title')}
+        tabIndex={0}
+        data-testid="queue-scroll-region"
+      >
+      <div className="px-page py-section flex flex-col gap-field" data-testid="queue-page-content">
+        {/* ADR §4.1 队列挂起 banner — 仅 held=true 时显示在文档内容顶部。
             hold 覆盖全队列（含数据作业派发），两个视图都显示。 */}
         {holdState?.held && (
-          <div
-            className="sticky top-0 z-10 px-3.5 py-2.5 rounded-md bg-warn-soft border border-warn text-warn text-xs flex items-center justify-between"
+          <Alert
+            tone="warning"
+            size="sm"
             data-testid="queue-hold-banner"
+            action={(
+              <Button
+                variant="ghost"
+                size="xs"
+                onClick={() => void releaseQueue()}
+              >
+                {t('queue.releaseQueue')}
+              </Button>
+            )}
           >
-            <span>{t('queue.heldBanner')}</span>
-            <button
-              onClick={() => void releaseQueue()}
-              className="btn btn-ghost btn-xs text-warn"
-            >
-              {t('queue.releaseQueue')}
-            </button>
-          </div>
+            {t('queue.heldBanner')}
+          </Alert>
         )}
         {error && (
-          <div className="px-3.5 py-2.5 rounded-md bg-err-soft border border-err text-err text-xs font-mono">
+          <Alert tone="danger" size="sm" role="alert" className="font-mono">
             {error}
-          </div>
+          </Alert>
         )}
 
         {queueTab === 'jobs' ? (
@@ -1028,12 +1059,11 @@ export default function QueuePage() {
             refreshToken={jobsRefreshToken}
           />
         ) : !loaded ? (
-          <div className="rounded-lg border border-subtle bg-surface overflow-hidden">
+          <Card className="overflow-hidden">
             {Array.from({ length: 3 }).map((_, i) => (
               <div
                 key={i}
-                className={`py-[18px] px-[22px] grid gap-3 items-center opacity-40 ${i < 2 ? 'border-b border-subtle' : 'border-b-0'}`}
-                style={{ gridTemplateColumns: '48px minmax(0,1fr) 88px 96px 150px 128px 176px' }}
+                className={`ui-queue-task-grid py-[18px] px-[22px] grid gap-3 items-center opacity-40 ${i < 2 ? 'border-b border-subtle' : 'border-b-0'}`}
               >
                 <div className="h-3.5 rounded bg-overlay" />
                 <div className="flex flex-col gap-1">
@@ -1043,26 +1073,22 @@ export default function QueuePage() {
                 <div className="h-2.5 rounded bg-overlay" />
                 <div className="h-5 rounded bg-overlay" />
                 <div className="h-2.5 rounded bg-overlay" />
-                <div className="h-2.5 rounded bg-overlay" />
+                <div className="ui-queue-task-timing h-2.5 rounded bg-overlay" />
                 <div className="h-6 rounded bg-overlay" />
               </div>
             ))}
-          </div>
+          </Card>
         ) : isEmpty ? (
-          <div className="rounded-lg border border-subtle bg-surface py-12 text-center">
-            <div className="text-md font-semibold text-fg-secondary mb-1.5">
-              {t('queue.empty')}
-            </div>
-            <div className="text-sm text-fg-tertiary">
-              {t('queue.emptyHint')}
-            </div>
-          </div>
+          <EmptyState
+            title={t('queue.empty')}
+            description={t('queue.emptyHint')}
+          />
         ) : (
-          <div className="flex flex-col gap-4">
+          <div className="flex flex-col gap-section">
             {/* 进行中（running + paused） */}
             {activeItems.length > 0 && (
-              <section className="flex flex-col gap-2">
-                <h3 className="text-xs font-semibold text-fg-tertiary uppercase tracking-wide">
+              <section className="flex flex-col gap-related">
+                <h3 className="type-section-label">
                   {t('queue.sectionActive')} ({activeItems.length})
                 </h3>
                 {activeItems.map(renderRow)}
@@ -1071,8 +1097,8 @@ export default function QueuePage() {
 
             {/* 等待入队（pending） */}
             {pendingItems.length > 0 && (
-              <section className="flex flex-col gap-2">
-                <h3 className="text-xs font-semibold text-fg-tertiary uppercase tracking-wide">
+              <section className="flex flex-col gap-related">
+                <h3 className="type-section-label">
                   {t('queue.sectionWaiting')} ({pendingItems.length})
                 </h3>
                 {pendingItems.map(renderRow)}
@@ -1081,8 +1107,8 @@ export default function QueuePage() {
 
             {/* 计划任务（scheduled，0.17 P-B）——到点自动转入等待入队 */}
             {scheduledItems.length > 0 && (
-              <section className="flex flex-col gap-2" data-testid="queue-scheduled-section">
-                <h3 className="text-xs font-semibold text-fg-tertiary uppercase tracking-wide">
+              <section className="flex flex-col gap-related" data-testid="queue-scheduled-section">
+                <h3 className="type-section-label">
                   {t('queue.sectionScheduled')} ({scheduledItems.length})
                 </h3>
                 {scheduledItems.map(renderRow)}
@@ -1090,15 +1116,13 @@ export default function QueuePage() {
             )}
 
             {/* 历史（terminal，后端分页） */}
-            <section className="flex flex-col gap-2">
-              <h3 className="text-xs font-semibold text-fg-tertiary uppercase tracking-wide">
+            <section className="flex flex-col gap-related">
+              <h3 className="type-section-label">
                 {t('queue.sectionHistory')} ({history.total})
               </h3>
 
               {history.items.length === 0 ? (
-                <div className="rounded-lg border border-subtle bg-surface py-8 text-center text-sm text-fg-tertiary">
-                  {t('queue.noMatch')}
-                </div>
+                <EmptyState size="sm" description={t('queue.noMatch')} />
               ) : (
                 history.items.map(renderRow)
               )}
@@ -1106,10 +1130,11 @@ export default function QueuePage() {
           </div>
         )}
       </div>
+      </div>
 
-      {/* 0.17 item6：分页下沉成 fixed 底栏（-mx-6/-mb-6 抵消内容区 padding 做全宽贴底）。
+      {/* 持久分页栏位于列表 scrollport 之后，始终固定在 route viewport 底部。
           item2：只要历史超过最小每页数就常显（切到 50/100 只剩一页时不消失，能切回
-          20）；样式压缩省空间。GPU / 数据两个视图共用同款底栏（P-G 反馈）。 */}
+          20）；GPU / 数据两个视图共用同款底栏（P-G 反馈）。 */}
       {queueTab === 'tasks' && loaded && !isEmpty && history.total > HISTORY_PAGE_SIZES[0] && (
         <PaginationBar
           page={history.page}
@@ -1154,6 +1179,6 @@ export default function QueuePage() {
           onConfirm={onHoldConfirm}
         />
       )}
-    </StepShell>
+    </div>
   )
 }

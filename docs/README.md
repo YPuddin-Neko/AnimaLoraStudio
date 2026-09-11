@@ -20,6 +20,8 @@
 | 文档 | 内容 |
 |---|---|
 | [getting-started.md](user-guide/getting-started.md) | 上手教程：启动 / 按族下载模型 / 流水线 walkthrough |
+| [upgrading-v0.27.md](user-guide/upgrading-v0.27.md) / [English](user-guide/upgrading-v0.27.en.md) | v0.27 升级：配置迁移、备份 / 回退与 LyCORIS v4 |
+| [auto-head-mask.md](user-guide/auto-head-mask.md) / [English](user-guide/auto-head-mask.en.md) | 自动头部遮罩：识别模型、未保存编辑、训练限制 |
 | [tagging-guide.md](user-guide/tagging-guide.md) | Anima 标签格式、最佳实践、tag 顺序（booru tag 生态；Krea 2 用自然语言 caption） |
 | [training-tips.md](user-guide/training-tips.md) | 训练参数、按族显存配置、Krea 2 专章、过拟合/欠拟合排查、ComfyUI 用法 |
 | [optimizers.md](user-guide/optimizers.md) | 各优化器（Lion / Prodigy / PPSF / SOAP 等）起步参数与换算 |
