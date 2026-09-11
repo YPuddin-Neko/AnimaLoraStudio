@@ -4,18 +4,24 @@ import { Link, useOutletContext } from 'react-router-dom'
 import {
   api,
   type CropWorkspaceItem,
+  type HeadMaskProposals,
   type ProjectDetail,
   type Version,
 } from '../../../api/client'
+import ActionGroup from '../../../components/ActionGroup'
+import Button from '../../../components/Button'
 import Filmstrip from '../../../components/preprocess/Filmstrip'
+import AutoHeadMaskPanel from '../../../components/preprocess/AutoHeadMaskPanel'
 import InpaintCanvas, {
   renderInpaintedBlob,
   renderMaskBlob,
   type InpaintCanvasHandle,
   type InpaintMode,
   type InpaintStroke,
+  type MaskEdit,
 } from '../../../components/preprocess/InpaintCanvas'
 import PreprocessToolsBar from '../../../components/preprocess/PreprocessToolsBar'
+import { SegmentedControl } from '../../../components/SelectionGroup'
 import StepShell from '../../../components/StepShell'
 import { useToast } from '../../../components/Toast'
 import { compareImagePath } from '../../../lib/imageSort'
@@ -30,10 +36,9 @@ interface Ctx {
 type Filter = 'all' | 'pending' | 'edited'
 
 /** 统一编辑历史条目：涂抹与 mask 笔画共用一条时间线。 */
-interface HistoryEntry {
-  kind: InpaintMode
-  stroke: InpaintStroke
-}
+type HistoryEntry =
+  | { kind: 'paint'; stroke: InpaintStroke }
+  | { kind: 'mask'; edit: MaskEdit }
 
 interface BrushState {
   color: string
@@ -55,10 +60,20 @@ function splitRel(name: string): { folder: string; filename: string } {
  *  随便切图改动都留在内存，保存按当前模式分发（§9 决策 2）。只有活动图挂
  *  真实 canvas，「保存全部」对非活动图走离屏重放。 */
 export default function PreprocessInpaintPage() {
+  const { project, activeVersion } = useOutletContext<Ctx>()
+  return <InpaintWorkspace key={`${project.id}:${activeVersion?.id ?? 0}`} />
+}
+
+function InpaintWorkspace() {
   const { t } = useTranslation()
   const { project, activeVersion, reload } = useOutletContext<Ctx>()
   const { toast } = useToast()
   const vid = activeVersion?.id ?? 0
+  const mounted = useRef(true)
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
 
   // ────── Workspace data（复用 crop workspace：name + w/h + mtime + mask_mtime）──────
   const [images, setImages] = useState<CropWorkspaceItem[]>([])
@@ -68,11 +83,12 @@ export default function PreprocessInpaintPage() {
     if (!vid) return
     try {
       const r = await api.listCropWorkspaceTrain(project.id, vid)
+      if (!mounted.current) return
       setImages([...r.images].sort((a, b) => compareImagePath(a.name, b.name)))
     } catch {
       /* ignore */
     } finally {
-      setLoading(false)
+      if (mounted.current) setLoading(false)
     }
   }, [project.id, vid])
 
@@ -89,6 +105,8 @@ export default function PreprocessInpaintPage() {
   const [redoByImage, setRedoByImage] = useState<Record<string, HistoryEntry[]>>({})
   const [filter, setFilter] = useState<Filter>('all')
   const [busy, setBusy] = useState(false)
+  const [setupOpen, setSetupOpen] = useState(false)
+  const [autoBusy, setAutoBusy] = useState(false)
 
   const [brush, setBrush] = useLocalStorageState<BrushState>(
     'studio:inpaint:brush', DEFAULT_BRUSH,
@@ -123,8 +141,8 @@ export default function PreprocessInpaintPage() {
     () => activeHistory.filter((h) => h.kind === 'paint').map((h) => h.stroke),
     [activeHistory],
   )
-  const activeMaskStrokes = useMemo(
-    () => activeHistory.filter((h) => h.kind === 'mask').map((h) => h.stroke),
+  const activeMaskEdits = useMemo(
+    () => activeHistory.filter((h) => h.kind === 'mask').map((h) => h.edit),
     [activeHistory],
   )
 
@@ -147,6 +165,53 @@ export default function PreprocessInpaintPage() {
     if (filter === 'edited') return n > 0
     return true
   }), [images, filter, historyByImage])
+
+  const incorporateAutoMask = useCallback((result: HeadMaskProposals) => {
+    const completed = result.images.filter((item) => (item.status ?? 'done') === 'done')
+    const applicable = completed.filter((item) => !item.stale && item.regions.length > 0)
+    if (applicable.length > 0) {
+      setHistoryByImage((prev) => {
+        const next = { ...prev }
+        for (const item of applicable) {
+          next[item.name] = [
+            ...(next[item.name] ?? []),
+            {
+              kind: 'mask',
+              edit: { type: 'auto', regions: item.regions.map((region) => region.mask_region) },
+            },
+          ]
+        }
+        return next
+      })
+      setRedoByImage((prev) => {
+        const next = { ...prev }
+        for (const item of applicable) next[item.name] = []
+        return next
+      })
+      setMode('mask')
+      setErase(false)
+    }
+    const heads = applicable.reduce((sum, item) => sum + item.regions.length, 0)
+    const failed = result.images.filter((item) => item.status === 'failed').length
+    const skipped = result.images.filter((item) => item.status === 'skipped').length
+    const stale = result.images.filter((item) => item.stale).length
+    const summary = applicable.length > 0
+      ? t('preprocessInpaint.headMask.completed', { images: applicable.length, heads })
+      : t('preprocessInpaint.headMask.completedNone')
+    const issues = [
+      failed > 0 ? t('preprocessInpaint.headMask.issueFailed', { n: failed }) : '',
+      skipped > 0 ? t('preprocessInpaint.headMask.issueSkipped', { n: skipped }) : '',
+      stale > 0 ? t('preprocessInpaint.headMask.issueStale', { n: stale }) : '',
+    ].filter(Boolean)
+    const message = issues.length > 0
+      ? t('preprocessInpaint.headMask.completedWithIssues', {
+          summary,
+          issues: issues.join(t('preprocessInpaint.headMask.issueSeparator')),
+        })
+      : summary
+    toast(message, applicable.length === 0 && (failed > 0 || skipped > 0) ? 'error'
+      : issues.length > 0 ? 'info' : 'success')
+  }, [t, toast])
 
   const rawUrl = useCallback((im: CropWorkspaceItem) => {
     const { folder, filename } = splitRel(im.name)
@@ -179,7 +244,7 @@ export default function PreprocessInpaintPage() {
   }, [pushEntry, pushRecentColor])
 
   const onMaskStrokeEnd = useCallback((s: InpaintStroke) => {
-    pushEntry({ kind: 'mask', stroke: s })
+    pushEntry({ kind: 'mask', edit: { type: 'stroke', stroke: s } })
   }, [pushEntry])
 
   const undo = useCallback(() => {
@@ -255,7 +320,7 @@ export default function PreprocessInpaintPage() {
   const saveImageBoth = useCallback(async (
     im: CropWorkspaceItem,
     paintStrokes: InpaintStroke[],
-    maskStrokes: InpaintStroke[],
+    maskEdits: MaskEdit[],
     exporters?: {
       paint: () => Promise<Blob | null>
       mask: () => Promise<{ blob: Blob; coverage: number } | null>
@@ -266,20 +331,24 @@ export default function PreprocessInpaintPage() {
       const blob = exporters
         ? await exporters.paint()
         : await renderInpaintedBlob(rawUrl(im), im.w, im.h, paintStrokes)
+      if (!mounted.current) return name
       if (!blob) throw new Error('canvas not ready')
       const res = await api.saveInpaintTrain(project.id, vid, name, blob)
+      if (!mounted.current) return name
       clearSavedKind(im.name, 'paint')
       name = res.name
     }
-    if (maskStrokes.length > 0) {
+    if (maskEdits.length > 0) {
       const res = exporters
         ? await exporters.mask()
-        : await renderMaskBlob(maskBaseUrlFor(im), im.w, im.h, maskStrokes)
+        : await renderMaskBlob(maskBaseUrlFor(im), im.w, im.h, maskEdits)
+      if (!mounted.current) return name
       if (res === null) {
         if (im.mask_mtime != null) await api.deleteMaskTrain(project.id, vid, name)
       } else {
         await api.saveMaskTrain(project.id, vid, name, res.blob)
       }
+      if (!mounted.current) return name
       clearSavedKind(im.name, 'mask')
     }
     return name
@@ -292,7 +361,7 @@ export default function PreprocessInpaintPage() {
     try {
       // 活动图用挂载中的 canvas 导出（所见即所得），非活动图才走离屏重放
       const newName = await saveImageBoth(
-        activeImage, activePaintStrokes, activeMaskStrokes,
+        activeImage, activePaintStrokes, activeMaskEdits,
         {
           paint: () => canvasRef.current?.exportBlob() ?? Promise.resolve(null),
           mask: async () => {
@@ -301,18 +370,20 @@ export default function PreprocessInpaintPage() {
           },
         },
       )
+      if (!mounted.current) return
       toast(t('preprocessInpaint.toastSaved', { name: newName }), 'success')
       await refreshWorkspace()
+      if (!mounted.current) return
       if (newName !== activeName) setActiveName(newName)
-      void reload()
+      if (mounted.current) void reload()
     } catch (e) {
-      toast(String(e), 'error')
+      if (mounted.current) toast(String(e), 'error')
     } finally {
-      setBusy(false)
+      if (mounted.current) setBusy(false)
     }
   }, [
     activeName, activeImage, activeHistory.length,
-    activePaintStrokes, activeMaskStrokes,
+    activePaintStrokes, activeMaskEdits,
     saveImageBoth, refreshWorkspace, reload, toast, t,
   ])
 
@@ -324,6 +395,7 @@ export default function PreprocessInpaintPage() {
     const failed: string[] = []
     try {
       for (const name of dirty) {
+        if (!mounted.current) return
         const im = images.find((i) => i.name === name)
         const hist = historyByImage[name] ?? []
         if (!im || hist.length === 0) continue
@@ -331,13 +403,14 @@ export default function PreprocessInpaintPage() {
           await saveImageBoth(
             im,
             hist.filter((h) => h.kind === 'paint').map((h) => h.stroke),
-            hist.filter((h) => h.kind === 'mask').map((h) => h.stroke),
+            hist.filter((h) => h.kind === 'mask').map((h) => h.edit),
           )
           ok++
         } catch {
           failed.push(name)
         }
       }
+      if (!mounted.current) return
       toast(
         failed.length > 0
           ? t('preprocessInpaint.toastSavedAllPartial', { ok, failed: failed.length })
@@ -345,9 +418,9 @@ export default function PreprocessInpaintPage() {
         failed.length > 0 ? 'error' : 'success',
       )
       await refreshWorkspace()
-      void reload()
+      if (mounted.current) void reload()
     } finally {
-      setBusy(false)
+      if (mounted.current) setBusy(false)
     }
   }, [
     editedNames, images, historyByImage, saveImageBoth,
@@ -365,93 +438,95 @@ export default function PreprocessInpaintPage() {
 
   return (
     <StepShell
-      idx={2}
       title={t('steps.preprocess.title')}
       subtitle={t('preprocessInpaint.subtitle')}
       actions={
-        <>
-          {/* 保存 = 两个数据面的全部未保存改动；文案 / 可用性不随模式变 */}
-          <button
-            type="button"
-            onClick={() => void saveAll()}
-            disabled={busy || editedNames.length === 0}
-            className="btn btn-ghost btn-sm"
-          >
-            {t('preprocessInpaint.saveAll', { n: editedNames.length })}
-          </button>
-          <button
-            type="button"
-            onClick={() => void saveActive()}
-            disabled={busy || activeHistory.length === 0}
-            className="btn btn-primary btn-sm"
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M17 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2V7l-4-4zm-5 16a3 3 0 1 1 0-6 3 3 0 0 1 0 6zm3-10H5V5h10v4z" />
-            </svg>
-            <span>{t('preprocessInpaint.saveActive')}</span>
-          </button>
-        </>
+        <ActionGroup
+          aria-label={t('preprocessInpaint.actionsLabel')}
+          secondary={(
+            <>
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={busy || autoBusy || images.length === 0}
+              title={busy
+                ? t('preprocessInpaint.headMask.unavailableSaving')
+                : autoBusy
+                  ? t('preprocessInpaint.headMask.unavailableRunning')
+                  : images.length === 0
+                    ? t('preprocessInpaint.headMask.unavailableEmpty')
+                    : undefined}
+              loading={autoBusy}
+              aria-haspopup="dialog"
+              onClick={() => setSetupOpen(true)}
+            >
+              {autoBusy
+                ? t('preprocessInpaint.headMask.runningAction')
+                : t('preprocessInpaint.headMask.openSetup')}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              onClick={() => void saveAll()}
+              disabled={busy || autoBusy || editedNames.length === 0}
+            >
+              {t('preprocessInpaint.saveAll', { n: editedNames.length })}
+            </Button>
+            </>
+          )}
+          primary={(
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={() => void saveActive()}
+              disabled={busy || autoBusy || activeHistory.length === 0}
+            >
+              {t('preprocessInpaint.saveActive')}
+            </Button>
+          )}
+        />
       }
       belowHeader={<PreprocessToolsBar current="inpaint" projectId={project.id} versionId={vid} />}
     >
       <div className="flex flex-col h-full gap-3 min-h-0">
         <section className="flex flex-col flex-1 min-h-0 rounded-md border border-subtle bg-surface overflow-hidden">
-          <header className="flex items-center gap-2 shrink-0 px-2.5 py-1.5 border-b border-subtle text-sm flex-wrap">
-            <div className="flex items-center gap-1">
-              {(['all', 'pending', 'edited'] as const).map((k) => (
-                <button
-                  key={k}
-                  onClick={() => setFilter(k)}
-                  className={
-                    'px-2 py-0.5 rounded-full text-xs font-medium transition-colors ' +
-                    (filter === k
-                      ? 'bg-accent text-white'
-                      : 'bg-overlay text-fg-secondary hover:bg-accent-soft')
-                  }
-                >
-                  {t(`preprocessInpaint.filter.${k}`)} {counts[k]}
-                </button>
-              ))}
-            </div>
+          <header className="flex items-center gap-2 shrink-0 px-2.5 py-1.5 border-b border-subtle text-sm">
             {activeImage && (
-              <span className="text-fg-tertiary text-xs font-mono ml-2">
+              <span
+                className="min-w-0 truncate text-fg-tertiary text-xs font-mono"
+                title={activeImage.name}
+              >
                 {activeImage.name} · {activeImage.w}×{activeImage.h}
               </span>
             )}
             <span className="flex-1" />
-            <button
+            <Button
+              variant="ghost"
+              size="sm"
               onClick={undo}
               disabled={!activeName || activeHistory.length === 0}
-              className="btn btn-ghost btn-sm"
               title="Ctrl+Z"
-            >↶ {t('preprocessInpaint.undo')}</button>
-            <button
+            >{t('preprocessInpaint.undo')}</Button>
+            <Button
+              variant="ghost"
+              size="sm"
               onClick={redo}
               disabled={!activeName || activeRedo.length === 0}
-              className="btn btn-ghost btn-sm"
               title="Ctrl+Shift+Z"
-            >↷ {t('preprocessInpaint.redo')}</button>
-            <button
+            >{t('preprocessInpaint.redo')}</Button>
+            <Button
+              variant="ghost"
+              size="sm"
               onClick={clearActive}
               disabled={!activeName || activeHistory.length === 0}
-              className="btn btn-ghost btn-sm"
-            >{t('preprocessInpaint.clearActive')}</button>
+            >{t('preprocessInpaint.clearActive')}</Button>
           </header>
 
           <div className="flex-1 min-h-0 overflow-hidden p-3">
             {loading && (
               <p className="text-fg-tertiary text-sm">{t('preprocessInpaint.loading')}</p>
             )}
-            {!loading && images.length === 0 && (
-              <p className="text-fg-tertiary text-sm">
-                {t('preprocessInpaint.emptyWorkspace')}{' '}
-                <Link to={`/projects/${project.id}/v/${vid}/preprocess`} className="text-accent hover:underline">
-                  {t('preprocessInpaint.goToOverview')}
-                </Link>
-              </p>
-            )}
-
-            {activeImage && (
+            {!loading && (
               <div
                 className="grid gap-3 h-full min-h-0"
                 style={{ gridTemplateColumns: '220px minmax(0, 1fr) 260px' }}
@@ -466,6 +541,22 @@ export default function PreprocessInpaintPage() {
                       project.id, vid, 'train', filename, folder, 256,
                     ) + `&_=${im.mtime}`
                   }}
+                  ariaLabel={t('preprocessInpaint.filmstripLabel')}
+                  header={(
+                    <SegmentedControl
+                      items={(['all', 'pending', 'edited'] as const).map((value) => ({
+                        value,
+                        label: `${t(`preprocessInpaint.filter.${value}`)} ${counts[value]}`,
+                      }))}
+                      value={filter}
+                      onChange={setFilter}
+                      ariaLabel={t('preprocessInpaint.filterLabel')}
+                      idPrefix="inpaint-image-filter"
+                      size="sm"
+                      layout="content"
+                    />
+                  )}
+                  itemLabel={(im) => t('preprocessInpaint.imageLabel', { name: im.name })}
                   emptyHint={t(`preprocessInpaint.filmstripEmpty.${filter}`)}
                   renderOverlay={(im) => {
                     const hist = historyByImage[im.name] ?? []
@@ -481,8 +572,12 @@ export default function PreprocessInpaintPage() {
                   }}
                 />
 
-                <div className="min-w-0 min-h-0 overflow-hidden">
-                  <InpaintCanvas
+                <div className={`min-w-0 min-h-0 overflow-hidden ${autoBusy || busy ? 'pointer-events-none' : ''}`} aria-busy={autoBusy || busy}>
+                  {!activeImage && <p className="text-fg-tertiary text-sm">
+                    {t('preprocessInpaint.emptyWorkspace')}{' '}
+                    <Link to={`/projects/${project.id}/v/${vid}/preprocess`} className="text-accent hover:underline">{t('preprocessInpaint.goToOverview')}</Link>
+                  </p>}
+                  {activeImage && <InpaintCanvas
                     key={activeImage.name}
                     ref={canvasRef}
                     imageUrl={rawUrl(activeImage)}
@@ -490,14 +585,14 @@ export default function PreprocessInpaintPage() {
                     imageH={activeImage.h}
                     mode={mode}
                     strokes={activePaintStrokes}
-                    maskStrokes={activeMaskStrokes}
+                    maskEdits={activeMaskEdits}
                     maskBaseUrl={maskBaseUrlFor(activeImage)}
                     brush={brush}
                     erase={erase}
                     onStrokeEnd={onStrokeEnd}
                     onMaskStrokeEnd={onMaskStrokeEnd}
                     onPickColor={onPickColor}
-                  />
+                  />}
                 </div>
 
                 <ToolPanel
@@ -508,7 +603,18 @@ export default function PreprocessInpaintPage() {
                   brush={brush}
                   setBrush={setBrush}
                   recentColors={recentColors}
-                />
+                >
+                  <AutoHeadMaskPanel
+                    projectId={project.id}
+                    versionId={vid}
+                    activeName={activeName}
+                    unsavedCount={editedNames.length}
+                    setupOpen={setupOpen}
+                    onCloseSetup={() => setSetupOpen(false)}
+                    onResults={incorporateAutoMask}
+                    onBusyChange={setAutoBusy}
+                  />
+                </ToolPanel>
               </div>
             )}
           </div>
@@ -522,38 +628,6 @@ export default function PreprocessInpaintPage() {
 // Tool panel（right side）
 // ---------------------------------------------------------------------------
 
-/** 胶囊 radio（视觉对齐设置页更新通道的 vs-channel-radio：圆点 + 文字）。 */
-function RadioPill({
-  on, label, onClick,
-}: {
-  on: boolean
-  label: string
-  onClick: () => void
-}) {
-  return (
-    <button
-      type="button"
-      role="radio"
-      aria-checked={on}
-      onClick={onClick}
-      className={
-        'inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full border text-xs transition-colors ' +
-        (on
-          ? 'border-accent text-accent bg-accent-soft'
-          : 'border-dim text-fg-secondary bg-transparent hover:bg-overlay')
-      }
-    >
-      <span
-        className={
-          'w-[7px] h-[7px] rounded-full border border-current shrink-0 ' +
-          (on ? 'bg-current' : 'bg-transparent')
-        }
-      />
-      {label}
-    </button>
-  )
-}
-
 function ToolPanel({
   mode,
   setMode,
@@ -562,6 +636,7 @@ function ToolPanel({
   brush,
   setBrush,
   recentColors,
+  children,
 }: {
   mode: InpaintMode
   setMode: (m: InpaintMode) => void
@@ -570,6 +645,7 @@ function ToolPanel({
   brush: BrushState
   setBrush: (v: BrushState | ((prev: BrushState) => BrushState)) => void
   recentColors: string[]
+  children?: React.ReactNode
 }) {
   const { t } = useTranslation()
   const [recentOpen, setRecentOpen] = useState(false)
@@ -577,29 +653,35 @@ function ToolPanel({
     <div className="bg-sunken border border-subtle rounded-md flex flex-col h-full min-h-0 overflow-hidden">
       <div className="flex flex-col gap-2 p-2.5 flex-1 min-h-0 overflow-y-auto">
         <h3 className="caption">{t('preprocessInpaint.panelTitle')}</h3>
-        {/* 模式 / 工具两行 radio（样式对齐设置页更新通道） */}
-        <div className="flex items-center gap-1.5 text-xs" role="radiogroup">
+        {/* 模式与工具复用共享分段选择，方向键跟随选择。 */}
+        <div className="flex items-center gap-1.5 text-xs">
           <span className="text-fg-tertiary shrink-0 w-10">{t('preprocessInpaint.modeLabel')}</span>
-          {(['paint', 'mask'] as const).map((m) => (
-            <RadioPill
-              key={m}
-              on={mode === m}
-              label={t(`preprocessInpaint.mode.${m}`)}
-              onClick={() => setMode(m)}
-            />
-          ))}
-        </div>
-        <div className="flex items-center gap-1.5 text-xs" role="radiogroup">
-          <span className="text-fg-tertiary shrink-0 w-10">{t('preprocessInpaint.toolLabel')}</span>
-          <RadioPill
-            on={!erase}
-            label={t('preprocessInpaint.toolBrush')}
-            onClick={() => setErase(false)}
+          <SegmentedControl
+            items={(['paint', 'mask'] as const).map((value) => ({
+              value,
+              label: t(`preprocessInpaint.mode.${value}`),
+            }))}
+            value={mode}
+            onChange={setMode}
+            ariaLabel={t('preprocessInpaint.modeLabel')}
+            idPrefix="inpaint-mode"
+            size="sm"
+            layout="content"
           />
-          <RadioPill
-            on={erase}
-            label={t('preprocessInpaint.toolEraser')}
-            onClick={() => setErase(true)}
+        </div>
+        <div className="flex items-center gap-1.5 text-xs">
+          <span className="text-fg-tertiary shrink-0 w-10">{t('preprocessInpaint.toolLabel')}</span>
+          <SegmentedControl
+            items={(['brush', 'eraser'] as const).map((value) => ({
+              value,
+              label: t(`preprocessInpaint.tool.${value}`),
+            }))}
+            value={erase ? 'eraser' : 'brush'}
+            onChange={(value) => setErase(value === 'eraser')}
+            ariaLabel={t('preprocessInpaint.toolLabel')}
+            idPrefix="inpaint-tool"
+            size="sm"
+            layout="content"
           />
         </div>
 
@@ -612,26 +694,28 @@ function ToolPanel({
               onChange={(e) => setBrush((p) => ({ ...p, color: e.target.value }))}
               className="flex-1 min-w-0 h-7 p-0 border border-subtle rounded cursor-pointer bg-transparent"
               title={t('preprocessInpaint.colorWheel')}
+              aria-label={t('preprocessInpaint.colorWheel')}
             />
-            <button
-              type="button"
+            <Button
+              variant="ghost"
+              size="xs"
               onClick={() => setRecentOpen((v) => !v)}
               disabled={recentColors.length === 0}
-              className={
-                'btn btn-ghost btn-sm justify-center shrink-0 ' +
-                (recentOpen ? 'bg-overlay text-fg-primary' : '')
-              }
-              style={{ width: 56 }}
+              aria-expanded={recentOpen}
+              aria-controls={recentOpen && recentColors.length > 0 ? 'inpaint-recent-colors' : undefined}
               title={t('preprocessInpaint.recentColors')}
             >
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-                <path d="M13 3a9 9 0 0 0-9 9H1l3.89 3.89.07.14L9 12H6a7 7 0 1 1 7 7 6.98 6.98 0 0 1-4.9-2l-1.42 1.42A8.96 8.96 0 0 0 13 21a9 9 0 0 0 0-18zm-1 5v5l4.28 2.54.72-1.21-3.5-2.08V8H12z" />
-              </svg>
-            </button>
+              {t('preprocessInpaint.recentColorsShort')}
+            </Button>
           </div>
         )}
         {mode === 'paint' && recentOpen && recentColors.length > 0 && (
-          <div className="flex items-center gap-1 flex-wrap">
+          <div
+            id="inpaint-recent-colors"
+            role="group"
+            aria-label={t('preprocessInpaint.recentColors')}
+            className="flex items-center gap-1 flex-wrap"
+          >
             {recentColors.map((c) => (
               <button
                 key={c}
@@ -646,12 +730,13 @@ function ToolPanel({
                 }
                 style={{ backgroundColor: c }}
                 title={c}
+                aria-label={t('preprocessInpaint.useRecentColor', { color: c })}
               />
             ))}
           </div>
         )}
 
-        <label className="flex items-center gap-1.5 text-xs">
+        <div className="flex items-center gap-1.5 text-xs">
           <span className="text-fg-tertiary shrink-0 w-10">{t('preprocessInpaint.brushSize')}</span>
           <input
             type="range"
@@ -659,6 +744,7 @@ function ToolPanel({
             value={brush.size}
             onChange={(e) => setBrush((p) => ({ ...p, size: Number(e.target.value) }))}
             className="flex-1 min-w-0"
+            aria-label={t('preprocessInpaint.brushSizeSlider')}
           />
           <input
             type="number"
@@ -669,9 +755,10 @@ function ToolPanel({
             }))}
             className="input input-mono text-sm shrink-0"
             style={{ width: 56, padding: '2px 6px' }}
+            aria-label={t('preprocessInpaint.brushSizeValue')}
           />
-        </label>
-        <label className="flex items-center gap-1.5 text-xs">
+        </div>
+        <div className="flex items-center gap-1.5 text-xs">
           <span className="text-fg-tertiary shrink-0 w-10">{t('preprocessInpaint.brushHardness')}</span>
           <input
             type="range"
@@ -679,6 +766,7 @@ function ToolPanel({
             value={Math.round(brush.hardness * 100)}
             onChange={(e) => setBrush((p) => ({ ...p, hardness: Number(e.target.value) / 100 }))}
             className="flex-1 min-w-0"
+            aria-label={t('preprocessInpaint.brushHardnessSlider')}
           />
           <input
             type="number"
@@ -690,8 +778,10 @@ function ToolPanel({
             }))}
             className="input input-mono text-sm shrink-0"
             style={{ width: 56, padding: '2px 6px' }}
+            aria-label={t('preprocessInpaint.brushHardnessValue')}
           />
-        </label>
+        </div>
+        {children}
       </div>
     </div>
   )

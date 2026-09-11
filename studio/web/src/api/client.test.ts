@@ -1,8 +1,46 @@
-import { describe, expect, it } from 'vitest'
-import { makeApiError } from './client'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { api, makeApiError } from './client'
 
 // ADR-0009 Phase 2：makeApiError 统一把后端错误信封解析成 ApiError。
 // 测试 locale = zh（setup.ts），故本地化断言用中文。
+afterEach(() => {
+  vi.unstubAllGlobals()
+})
+
+describe('preprocess stage status', () => {
+  it.each([undefined, 'upscale', 'crop', 'head_mask'] as const)('preserves optional stage %s in the request URL', async (stage) => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('{}', { status: 200 }))
+    vi.stubGlobal('fetch', fetchMock)
+    await api.getPreprocessStatusTrain(2, 3, stage)
+    expect(fetchMock.mock.calls[0][0]).toBe(`/api/projects/2/versions/3/preprocess/status${stage ? `?stage=${stage}` : ''}`)
+  })
+})
+
+describe('request headers', () => {
+  it('keeps JSON content type when a conditional mutation supplies If-Match', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response('{}', {
+      status: 200,
+      headers: { 'Content-Type': 'application/json' },
+    }))
+    vi.stubGlobal('fetch', fetchMock)
+
+    await api.patchLLMPreset(
+      'general_json',
+      { base_url: 'http://127.0.0.1/v1' },
+      'preset-etag',
+    )
+
+    expect(fetchMock).toHaveBeenCalledOnce()
+    const [path, init] = fetchMock.mock.calls[0] as [string, RequestInit]
+    const headers = new Headers(init.headers)
+    expect(path).toBe('/api/llm-tagger/presets/general_json')
+    expect(init.method).toBe('PATCH')
+    expect(headers.get('Accept')).toBe('application/json')
+    expect(headers.get('Content-Type')).toBe('application/json')
+    expect(headers.get('If-Match')).toBe('preset-etag')
+  })
+})
+
 describe('makeApiError', () => {
   it('body.error.code → errors.<code> i18n 本地化 + details 插值', () => {
     const e = makeApiError(404, 'Not Found', {

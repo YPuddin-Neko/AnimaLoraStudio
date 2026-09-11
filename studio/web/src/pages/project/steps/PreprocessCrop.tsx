@@ -1,3 +1,4 @@
+import { ownsPreprocessJob } from '../../../lib/preprocessJob'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { Link, useOutletContext } from 'react-router-dom'
@@ -8,9 +9,14 @@ import {
   type ProjectDetail,
   type Version,
 } from '../../../api/client'
+import ActionGroup from '../../../components/ActionGroup'
+import Button from '../../../components/Button'
+import { Input } from '../../../components/FormControl'
+import Modal from '../../../components/Modal'
 import Filmstrip from '../../../components/preprocess/Filmstrip'
 import FreeCropEditor, { type CropRect } from '../../../components/preprocess/FreeCropEditor'
 import PreprocessToolsBar from '../../../components/preprocess/PreprocessToolsBar'
+import { SegmentedControl } from '../../../components/SelectionGroup'
 import StepShell from '../../../components/StepShell'
 import BarHistogram from '../../../components/BarHistogram'
 import { useToast } from '../../../components/Toast'
@@ -61,10 +67,22 @@ function genRectId(): string {
 }
 
 export default function PreprocessCropPage() {
+  const { project, activeVersion } = useOutletContext<Ctx>()
+  return <StageWorkspace key={`${project.id}:${activeVersion?.id ?? 0}`} />
+}
+
+function StageWorkspace() {
   const { t } = useTranslation()
   const { project, activeVersion, reload } = useOutletContext<Ctx>()
   const { toast } = useToast()
   const vid = activeVersion?.id ?? 0
+  const mounted = useRef(true)
+  const statusRequest = useRef(0)
+  useEffect(() => {
+    mounted.current = true
+    statusRequest.current++
+    return () => { mounted.current = false }
+  }, [])
 
   // ────── Workspace data ──────
   const [images, setImages] = useState<CropWorkspaceItem[]>([])
@@ -74,11 +92,12 @@ export default function PreprocessCropPage() {
     if (!vid) return
     try {
       const r = await api.listCropWorkspaceTrain(project.id, vid)
+      if (!mounted.current) return
       setImages([...r.images].sort((a, b) => compareImagePath(a.name, b.name)))
     } catch {
       /* ignore */
     } finally {
-      setLoading(false)
+      if (mounted.current) setLoading(false)
     }
   }, [project.id, vid])
 
@@ -126,7 +145,11 @@ export default function PreprocessCropPage() {
   const refreshJobStatus = useCallback(async () => {
     if (!vid) return
     try {
-      const r = await api.getPreprocessStatusTrain(project.id, vid)
+      const request = ++statusRequest.current
+      const response = await api.getPreprocessStatusTrain(project.id, vid, 'crop')
+      if (!mounted.current || request !== statusRequest.current) return
+      const r = ownsPreprocessJob(response.job, project.id, vid, 'crop')
+        ? response : { ...response, job: null, log_tail: '' }
       const rid = r.job?.id ?? null
       setJob(r.job)
       setLogs((prev) =>
@@ -144,6 +167,7 @@ export default function PreprocessCropPage() {
   useEffect(() => { void refreshJobStatus() }, [refreshJobStatus])
 
   useEventStream((evt) => {
+    if (!mounted.current) return
     const jid = jobIdRef.current
     if (evt.type === 'job_log_appended' && jid && evt.job_id === jid) {
       setLogs((prev) => [...prev, String(evt.text ?? '')])
@@ -165,13 +189,14 @@ export default function PreprocessCropPage() {
   }, { onOpen: () => void refreshJobStatus() })
 
   const cancelJob = useCallback(async () => {
-    if (!job) return
+    if (!ownsPreprocessJob(job, project.id, vid, 'crop')) return
     try {
       await api.cancelJob(job.id)
+      if (!mounted.current) return
     } catch (e) {
-      toast(String(e), 'error')
+      if (mounted.current) toast(String(e), 'error')
     }
-  }, [job, toast])
+  }, [job, toast, project.id, vid])
 
   // ────── Derived ──────
   const arLock = useMemo<{ w: number; h: number } | null>(() => {
@@ -326,16 +351,20 @@ export default function PreprocessCropPage() {
       toast(t('preprocessCrop.toastNoCrops'), 'error')
       return
     }
+    statusRequest.current++
     setBusy(true)
     try {
       const j = await api.startPreprocessCropTrain(project.id, vid, payload)
+      if (!mounted.current) return
+      statusRequest.current++
+      jobIdRef.current = j.id
       setJob(j)
       setLogs([])
       toast(t('preprocessCrop.toastStarted', { id: j.id }), 'success')
     } catch (e) {
-      toast(String(e), 'error')
+      if (mounted.current) toast(String(e), 'error')
     } finally {
-      setBusy(false)
+      if (mounted.current) setBusy(false)
     }
   }, [cropsByImage, activeName, project.id, vid, toast, t])
 
@@ -351,40 +380,42 @@ export default function PreprocessCropPage() {
 
   return (
     <StepShell
-      idx={2}
       title={t('steps.preprocess.title')}
       subtitle={t('preprocessCrop.subtitle')}
       actions={
-        <>
-          {/* 次操作 = ghost（对齐正则/打标页 header 范式）；主操作「裁剪当前图」= primary + icon，放最右 */}
-          <button
-            type="button"
-            onClick={() => setClusterModalOpen(true)}
-            disabled={busy || images.length === 0}
-            className="btn btn-ghost btn-sm"
-          >
-            {t('preprocessCrop.autoCluster')}
-          </button>
-          <button
-            type="button"
-            onClick={() => void submitCrop(false)}
-            disabled={busy || totalRects === 0}
-            className="btn btn-ghost btn-sm"
-          >
-            {t('preprocessCrop.cropAll', { n: totalRects })}
-          </button>
-          <button
-            type="button"
-            onClick={() => void submitCrop(true)}
-            disabled={busy || activeCrops.length === 0}
-            className="btn btn-primary btn-sm"
-          >
-            <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor">
-              <path d="M8 5v14l11-7z" />
-            </svg>
-            <span>{t('preprocessCrop.cropActive')}</span>
-          </button>
-        </>
+        <ActionGroup
+          aria-label={t('preprocessCrop.actionsLabel')}
+          secondary={(
+            <>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => setClusterModalOpen(true)}
+                disabled={busy || images.length === 0}
+              >
+                {t('preprocessCrop.autoCluster')}
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => void submitCrop(false)}
+                disabled={busy || totalRects === 0}
+              >
+                {t('preprocessCrop.cropAll', { n: totalRects })}
+              </Button>
+            </>
+          )}
+          primary={(
+            <Button
+              variant="primary"
+              size="sm"
+              onClick={() => void submitCrop(true)}
+              disabled={busy || activeCrops.length === 0}
+            >
+              {t('preprocessCrop.cropActive')}
+            </Button>
+          )}
+        />
       }
       belowHeader={<PreprocessToolsBar current="crop" projectId={project.id} versionId={vid} />}
       logSources={[
@@ -400,38 +431,19 @@ export default function PreprocessCropPage() {
       ]}
     >
       <div className="flex flex-col h-full gap-3 min-h-0">
-        <div className="grid gap-3 flex-1 min-h-0" style={{ gridTemplateColumns: '1fr 260px' }}>
+        <div className="grid gap-3 flex-1 min-h-0" style={{ gridTemplateColumns: 'minmax(0, 1fr) 240px' }}>
           {/* 左栏 —— 裁剪参数区已删，工作区占满高度；长宽比锁定移到工作区底部固定栏 */}
           <div className="flex flex-col gap-2 min-h-0 min-w-0">
             <section className="flex flex-col flex-1 min-h-0 rounded-md border border-subtle bg-surface overflow-hidden">
-              <header className="flex items-center gap-2 shrink-0 px-2.5 py-1.5 border-b border-subtle text-sm flex-wrap">
-                <div className="flex items-center gap-1">
-                  {(['all', 'pending', 'cropped'] as const).map((k) => (
-                    <button
-                      key={k}
-                      onClick={() => setFilter(k)}
-                      className={
-                        'px-2 py-0.5 rounded-full text-xs font-medium transition-colors ' +
-                        (filter === k
-                          ? 'bg-accent text-white'
-                          : 'bg-overlay text-fg-secondary hover:bg-accent-soft')
-                      }
-                    >
-                      {t(`preprocessCrop.filter.${k}`)} {counts[k]}
-                    </button>
-                  ))}
-                </div>
+              <header className="flex items-center gap-2 shrink-0 px-2.5 py-1.5 border-b border-subtle text-sm">
                 {activeImage && (
-                  <span className="text-fg-tertiary text-xs font-mono ml-2">
+                  <span
+                    className="min-w-0 truncate text-fg-tertiary text-xs font-mono"
+                    title={activeImage.name}
+                  >
                     {activeImage.name} · {activeImage.w}×{activeImage.h} · {arLabel(activeImage.w, activeImage.h)}
                   </span>
                 )}
-                <span className="flex-1" />
-                <button
-                  onClick={clearActive}
-                  disabled={!activeName || (cropsByImage[activeName] ?? []).length === 0}
-                  className="btn btn-ghost btn-sm"
-                >{t('preprocessCrop.clearActive')}</button>
               </header>
 
               <div className="flex-1 min-h-0 overflow-hidden p-3">
@@ -454,7 +466,7 @@ export default function PreprocessCropPage() {
                      the full WorkArea height to render in. */
                   <div
                     className="grid gap-3 h-full min-h-0"
-                    style={{ gridTemplateColumns: '220px minmax(0, 1fr) 260px' }}
+                    style={{ gridTemplateColumns: '184px minmax(280px, 1fr) 224px' }}
                   >
                     {/* Always render the filmstrip column — when the active filter
                         produces 0 matches (e.g. 「已裁剪 0」), conditionally hiding
@@ -476,6 +488,22 @@ export default function PreprocessCropPage() {
                           project.id, vid, 'train', filename, folder, 256,
                         ) + `&_=${im.mtime}`
                       }}
+                      ariaLabel={t('preprocessCrop.filmstripLabel')}
+                      header={(
+                        <SegmentedControl
+                          items={(['all', 'pending', 'cropped'] as const).map((value) => ({
+                            value,
+                            label: `${t(`preprocessCrop.filter.${value}`)} ${counts[value]}`,
+                          }))}
+                          value={filter}
+                          onChange={setFilter}
+                          ariaLabel={t('preprocessCrop.filterLabel')}
+                          idPrefix="crop-image-filter"
+                          size="sm"
+                          layout="equal"
+                        />
+                      )}
+                      itemLabel={(im) => t('preprocessCrop.imageLabel', { name: im.name })}
                       emptyHint={t(`preprocessCrop.filmstripEmpty.${filter}`)}
                       renderOverlay={(im) => {
                         const crops = cropsByImage[im.name] ?? []
@@ -541,6 +569,7 @@ export default function PreprocessCropPage() {
                         const r = activeCrops.find((c) => c.id === id)
                         if (r) updateRect(id, { ...r, label })
                       }}
+                      onClear={clearActive}
                       onDelete={deleteRect}
                       onDuplicate={duplicateRect}
                     />
@@ -595,23 +624,28 @@ function ClusterModal({
 }) {
   const { t } = useTranslation()
   return (
-    <div
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="cluster-modal-title"
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-md"
-      onClick={onClose}
+    <Modal
+      as="form"
+      size="sm"
+      title={t('preprocessCrop.autoCluster')}
+      description={t('preprocessCrop.clusterModalDesc')}
+      onClose={onClose}
+      onSubmit={(event) => {
+        event.preventDefault()
+        if (!busy && totalImages > 0) onRun()
+      }}
+      footer={(
+        <ActionGroup
+          secondary={<Button variant="secondary" onClick={onClose}>{t('common.cancel', { defaultValue: '取消' })}</Button>}
+          primary={(
+            <Button type="submit" variant="primary" disabled={busy || totalImages === 0}>
+              {t('preprocessCrop.runCluster')}
+            </Button>
+          )}
+        />
+      )}
     >
-      <div
-        className="w-[90%] max-w-[460px] flex flex-col gap-5 p-6 bg-elevated border border-dim rounded-lg shadow-xl"
-        onClick={(e) => e.stopPropagation()}
-      >
-        <h2 id="cluster-modal-title" className="m-0 text-lg font-semibold text-fg-primary">
-          {t('preprocessCrop.autoCluster')}
-        </h2>
-        <p className="m-0 text-sm text-fg-secondary leading-relaxed">
-          {t('preprocessCrop.clusterModalDesc')}
-        </p>
+      <div className="flex flex-col gap-section">
         <div className="grid grid-cols-3 gap-3">
           <ClusterField
             label={t('preprocessCrop.clusterMaxCrop')}
@@ -633,25 +667,12 @@ function ClusterModal({
           />
         </div>
         {lastClusterK !== null && (
-          <p className="m-0 text-xs text-ok font-mono">
-            ✓ {t('preprocessCrop.clusterDone')} {t('preprocessCrop.clusterUsed', { k: lastClusterK })}
+          <p className="m-0 text-xs text-ok font-mono" role="status">
+            {t('preprocessCrop.clusterDone')} {t('preprocessCrop.clusterUsed', { k: lastClusterK })}
           </p>
         )}
-        <div className="flex justify-end gap-2 pt-1">
-          <button type="button" onClick={onClose} className="btn btn-secondary">
-            {t('common.cancel', { defaultValue: '取消' })}
-          </button>
-          <button
-            type="button"
-            onClick={onRun}
-            disabled={busy || totalImages === 0}
-            className="btn btn-primary"
-          >
-            ▶ {t('preprocessCrop.runCluster')}
-          </button>
-        </div>
       </div>
-    </div>
+    </Modal>
   )
 }
 
@@ -694,6 +715,7 @@ function RectListPanel({
   busy,
   onSelect,
   onLabelChange,
+  onClear,
   onDelete,
   onDuplicate,
 }: {
@@ -708,10 +730,12 @@ function RectListPanel({
   busy: boolean
   onSelect: (id: string) => void
   onLabelChange: (id: string, label: string) => void
+  onClear: () => void
   onDelete: (id: string) => void
   onDuplicate: (id: string) => void
 }) {
   const { t } = useTranslation()
+  const selectedCrop = crops.find((crop) => crop.id === selectedId) ?? null
   return (
     <div className="bg-sunken border border-subtle rounded-md flex flex-col h-full min-h-0 overflow-hidden">
       <div className="flex flex-col gap-2 p-2.5 flex-1 min-h-0 overflow-y-auto">
@@ -720,12 +744,20 @@ function RectListPanel({
         <span className="text-fg-tertiary text-[11px]">
           {arLock ? t('preprocessCrop.arLockedTo', { ar: `${arLock.w}:${arLock.h}` }) : t('preprocessCrop.arUnlocked')}
         </span>
+        <span className="flex-1" />
+        <Button
+          variant="danger"
+          size="xs"
+          onClick={onClear}
+          disabled={crops.length === 0 || busy}
+        >
+          {t('preprocessCrop.clearActive')}
+        </Button>
         {/* Selected-rect actions — show only when a rect is selected; act as a
             second affordance for the per-row ⎘/✕ buttons so the user has a
             top-of-panel control even when scrolled in a long crop list. */}
         {selectedId && (
           <>
-            <span className="flex-1" />
             <button
               className="bg-transparent border-none text-fg-tertiary cursor-pointer px-1.5 py-0.5 text-xs hover:bg-overlay hover:text-fg-primary rounded"
               onClick={() => onDuplicate(selectedId)}
@@ -769,14 +801,11 @@ function RectListPanel({
               <span className="font-mono">{arLabel(outW, outH)}</span>
             </div>
             <div className="min-w-0 flex flex-col gap-0.5">
-              <div className="flex items-center gap-1">
+              <div className="flex items-center gap-1 min-w-0">
                 <span className="text-[10px] text-fg-tertiary font-mono">#{i + 1}</span>
-                <input
-                  value={c.label}
-                  onChange={(e) => onLabelChange(c.id, e.target.value)}
-                  onClick={(e) => e.stopPropagation()}
-                  className="bg-transparent border-none text-fg-primary text-[12.5px] outline-none w-full min-w-0"
-                />
+                <span className="text-[11px] text-fg-secondary font-mono truncate">
+                  {arLabel(outW, outH)}
+                </span>
               </div>
               <div className="text-[11px] text-fg-tertiary font-mono">{outW}×{outH} px</div>
             </div>
@@ -795,6 +824,23 @@ function RectListPanel({
           </div>
         )
       })}
+      {selectedCrop && (
+        <div className="rounded border border-subtle bg-surface p-2 flex flex-col gap-1">
+          <label className="flex flex-col gap-1 text-xs">
+            <span className="text-fg-secondary">{t('preprocessCrop.rectNote')}</span>
+            <Input
+              controlSize="sm"
+              value={selectedCrop.label}
+              onChange={(event) => onLabelChange(selectedCrop.id, event.target.value)}
+              aria-describedby="crop-rect-note-help"
+              placeholder={t('preprocessCrop.rectNotePlaceholder')}
+            />
+          </label>
+          <p id="crop-rect-note-help" className="m-0 text-[11px] text-fg-tertiary leading-snug">
+            {t('preprocessCrop.rectNoteHelp')}
+          </p>
+        </div>
+      )}
       </div>
 
       {/* 长宽比锁定固定栏：贴「本图裁剪」面板底部，画框时锁定裁剪框比例 */}

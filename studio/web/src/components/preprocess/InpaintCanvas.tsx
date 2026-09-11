@@ -24,6 +24,19 @@ export interface InpaintStroke {
 
 export type InpaintMode = 'paint' | 'mask'
 
+export interface AutoMaskRegion {
+  x1: number
+  y1: number
+  x2: number
+  y2: number
+  feather_x: number
+  feather_y: number
+}
+
+export type MaskEdit =
+  | { type: 'stroke'; stroke: InpaintStroke }
+  | { type: 'auto'; regions: AutoMaskRegion[] }
+
 export interface InpaintCanvasHandle {
   /** 当前图 + 全部涂抹笔画合成导出 PNG。图片未加载完成时返回 null。 */
   exportBlob: () => Promise<Blob | null>
@@ -123,6 +136,64 @@ function drawMaskStrokes(
   drawStrokesToLayer(ctx, strokes, scratchRef, () => MASK_COLOR)
 }
 
+export function applyAutoMaskRegions(
+  pixels: Uint8ClampedArray,
+  width: number,
+  height: number,
+  regions: AutoMaskRegion[],
+): void {
+  for (const region of regions) {
+    const x1 = Math.max(0, Math.min(width, Math.trunc(region.x1)))
+    const y1 = Math.max(0, Math.min(height, Math.trunc(region.y1)))
+    const x2 = Math.max(x1, Math.min(width, Math.trunc(region.x2)))
+    const y2 = Math.max(y1, Math.min(height, Math.trunc(region.y2)))
+    const fx = Math.max(0, Math.trunc(region.feather_x || 0))
+    const fy = Math.max(0, Math.trunc(region.feather_y || 0))
+    if (x2 <= x1 || y2 <= y1) continue
+    const ox1 = Math.max(0, x1 - fx)
+    const oy1 = Math.max(0, y1 - fy)
+    const ox2 = Math.min(width, x2 + fx)
+    const oy2 = Math.min(height, y2 + fy)
+    for (let y = oy1; y < oy2; y++) {
+      for (let x = ox1; x < ox2; x++) {
+        const dx = Math.max(x1 - x, x - (x2 - 1), 0)
+        const dy = Math.max(y1 - y, y - (y2 - 1), 0)
+        const nx = fx ? dx / fx : (dx > 0 ? 1 : 0)
+        const ny = fy ? dy / fy : (dy > 0 ? 1 : 0)
+        const alpha = Math.round((1 - Math.min(1, Math.max(nx, ny))) * 255)
+        const index = (y * width + x) * 4
+        if (alpha <= pixels[index + 3]) continue
+        pixels[index] = 255
+        pixels[index + 1] = 45
+        pixels[index + 2] = 45
+        pixels[index + 3] = alpha
+      }
+    }
+  }
+}
+
+function drawAutoRegions(
+  ctx: CanvasRenderingContext2D,
+  regions: AutoMaskRegion[],
+): void {
+  const width = ctx.canvas.width
+  const height = ctx.canvas.height
+  const data = ctx.getImageData(0, 0, width, height)
+  applyAutoMaskRegions(data.data, width, height, regions)
+  ctx.putImageData(data, 0, 0)
+}
+
+function drawMaskEdits(
+  ctx: CanvasRenderingContext2D,
+  edits: MaskEdit[],
+  scratchRef: ScratchRef,
+): void {
+  for (const edit of edits) {
+    if (edit.type === 'auto') drawAutoRegions(ctx, edit.regions)
+    else drawMaskStrokes(ctx, [edit.stroke], scratchRef)
+  }
+}
+
 function loadImage(url: string): Promise<HTMLImageElement> {
   return new Promise((resolve, reject) => {
     const img = new Image()
@@ -163,14 +234,14 @@ async function loadMaskBase(url: string, w: number, h: number): Promise<HTMLCanv
 function rebuildMaskLayer(
   layer: HTMLCanvasElement,
   base: HTMLCanvasElement | null,
-  strokes: InpaintStroke[],
+  edits: MaskEdit[],
   scratchRef: ScratchRef,
 ): void {
   const ctx = layer.getContext('2d')
   if (!ctx) return
   ctx.clearRect(0, 0, layer.width, layer.height)
   if (base) ctx.drawImage(base, 0, 0)
-  drawMaskStrokes(ctx, strokes, scratchRef)
+  drawMaskEdits(ctx, edits, scratchRef)
 }
 
 /** mask 层 → 灰度 PNG（255=学 0=不学）+ 覆盖率。全空 → null。 */
@@ -211,13 +282,13 @@ export async function renderMaskBlob(
   maskBaseUrl: string | null,
   w: number,
   h: number,
-  strokes: InpaintStroke[],
+  edits: MaskEdit[],
 ): Promise<{ blob: Blob; coverage: number } | null> {
   const layer = document.createElement('canvas')
   layer.width = w
   layer.height = h
   const base = maskBaseUrl ? await loadMaskBase(maskBaseUrl, w, h) : null
-  rebuildMaskLayer(layer, base, strokes, { current: null })
+  rebuildMaskLayer(layer, base, edits, { current: null })
   return await maskLayerToGray(layer)
 }
 
@@ -259,7 +330,7 @@ function toHex(r: number, g: number, b: number): string {
  *
  *  两个数据面（双桶受控）：
  *  - 涂抹笔画（strokes）：直接覆盖像素，重绘顺序 img → strokes。
- *  - mask 笔画（maskStrokes）+ 服务器底图（maskBaseUrl）：合成到独立
+ *  - mask edits（maskEdits）+ 服务器底图（maskBaseUrl）：合成到独立
  *    maskLayer（红色 alpha 位图），主画布最后以半透明叠加显示。
  *
  *  绘制中在主画布增量画预览段（mask 橡皮擦以半透明白示意），pointerup
@@ -273,7 +344,7 @@ const InpaintCanvas = forwardRef<
     imageH: number
     mode: InpaintMode
     strokes: InpaintStroke[]
-    maskStrokes: InpaintStroke[]
+    maskEdits: MaskEdit[]
     /** 服务器已有 mask 的 URL；null = 无底图。 */
     maskBaseUrl: string | null
     brush: { color: string; size: number; hardness: number }
@@ -285,7 +356,7 @@ const InpaintCanvas = forwardRef<
   }
 >(function InpaintCanvas(
   {
-    imageUrl, imageW, imageH, mode, strokes, maskStrokes, maskBaseUrl,
+    imageUrl, imageW, imageH, mode, strokes, maskEdits, maskBaseUrl,
     brush, erase, onStrokeEnd, onMaskStrokeEnd, onPickColor,
   },
   ref,
@@ -313,8 +384,8 @@ const InpaintCanvas = forwardRef<
 
   const strokesRef = useRef(strokes)
   strokesRef.current = strokes
-  const maskStrokesRef = useRef(maskStrokes)
-  maskStrokesRef.current = maskStrokes
+  const maskEditsRef = useRef(maskEdits)
+  maskEditsRef.current = maskEdits
   const brushRef = useRef(brush)
   brushRef.current = brush
   const modeRef = useRef(mode)
@@ -401,9 +472,9 @@ const InpaintCanvas = forwardRef<
   // mask 层重建（底图 / 笔画变化）→ 主画布重绘
   useEffect(() => {
     const layer = ensureLayer(maskLayerRef)
-    rebuildMaskLayer(layer, maskBaseRef.current, maskStrokes, scratchRef)
+    rebuildMaskLayer(layer, maskBaseRef.current, maskEdits, scratchRef)
     redraw()
-  }, [maskStrokes, maskBaseTick, ensureLayer, redraw])
+  }, [maskEdits, maskBaseTick, ensureLayer, redraw])
 
   // 涂抹层重建（undo / redo / 落笔提交 / 清除 —— 含橡皮 composite）
   useEffect(() => {
@@ -441,7 +512,7 @@ const InpaintCanvas = forwardRef<
     },
     exportMaskBlob: async () => {
       const layer = ensureLayer(maskLayerRef)
-      rebuildMaskLayer(layer, maskBaseRef.current, maskStrokesRef.current, scratchRef)
+      rebuildMaskLayer(layer, maskBaseRef.current, maskEditsRef.current, scratchRef)
       return await maskLayerToGray(layer)
     },
   }), [ensureLayer])

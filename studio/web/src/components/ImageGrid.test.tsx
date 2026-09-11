@@ -90,6 +90,23 @@ describe('ImageGrid (PP3)', () => {
     expect(cells[1]).toHaveAttribute('aria-selected', 'true')
   })
 
+  it('keeps the height chain on the grid while applying inset inside the Virtuoso scrollport', () => {
+    const { container } = render(
+      <ImageGrid
+        items={items}
+        selected={new Set()}
+        onSelect={() => {}}
+        className="flex-1 min-h-0"
+        contentClassName="p-2"
+      />
+    )
+
+    const grid = screen.getByRole('grid')
+    expect(grid).toHaveClass('h-full', 'min-h-0', 'flex-1')
+    expect(grid).not.toHaveClass('p-2', '-mr-2')
+    expect(container.querySelector('.grid')).toHaveClass('p-2')
+  })
+
   it('clicking a cell calls onSelect with name', async () => {
     const onSelect = vi.fn()
     const user = userEvent.setup()
@@ -140,6 +157,18 @@ describe('ImageGrid (PP3)', () => {
       expect.objectContaining({ shiftKey: false })
     )
     expect(onActivate).not.toHaveBeenCalled()
+  })
+
+  it('renders a warning badge for locally modified images', () => {
+    render(
+      <ImageGrid
+        items={[{ name: 'dirty.png', thumbUrl: '/dirty', badge: '未保存', badgeTone: 'warning' }]}
+        selected={new Set()}
+        onSelect={() => {}}
+      />
+    )
+
+    expect(screen.getByText('未保存')).toHaveClass('badge-warn')
   })
 
   it('shows empty hint', () => {

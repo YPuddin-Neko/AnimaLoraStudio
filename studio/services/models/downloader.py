@@ -9,8 +9,12 @@ download_flat[_ms] 实际下载，调 paths.py / families 拿 target Path 和模
 from __future__ import annotations
 
 import logging
+import hashlib
+import os
+import stat as stat_module
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -47,6 +51,11 @@ from .families.krea2 import (
 from .paths import (
     CLTAGGER_VERSIONS,
     DEFAULT_UPSCALER,
+    HEAD_DETECTOR_REPO,
+    HEAD_DETECTOR_REPO_PATH,
+    HEAD_DETECTOR_REVISION,
+    HEAD_DETECTOR_SHA256,
+    HEAD_DETECTOR_SIZE,
     TAEFLUX_FILES,
     TAEFLUX_REPO,
     UPSCALER_EXTS,
@@ -57,6 +66,9 @@ from .paths import (
     cltagger_required_files,
     cltagger_target_root,
     eval_model_target_dir,
+    head_detector_custom_target,
+    head_detector_dir,
+    head_detector_target,
     models_root,
     qwen_image_vae_target,
     selected_upscaler,
@@ -106,6 +118,155 @@ def download_taeflux(
         if not _sources.download_flat(TAEFLUX_REPO, f, target, on_log=on_log):
             ok = False
     return ok
+
+
+_HEAD_INTEGRITY_CACHE_LIMIT = 32
+_HEAD_INTEGRITY_LOCK = threading.Lock()
+_HEAD_INTEGRITY_CACHE: OrderedDict[str, tuple[tuple[Any, ...], dict[str, Any]]] = OrderedDict()
+
+
+def _head_file_metadata(stat: os.stat_result) -> tuple[int, ...]:
+    return (
+        stat.st_dev, stat.st_ino, stat.st_mode, stat.st_size,
+        stat.st_mtime_ns, stat.st_ctime_ns,
+    )
+
+
+def _invalidate_head_integrity(target: Path) -> None:
+    with _HEAD_INTEGRITY_LOCK:
+        _HEAD_INTEGRITY_CACHE.pop(str(target.absolute()), None)
+
+
+def head_detector_status(
+    root: Optional[Path] = None, *, force_verify: bool = False,
+) -> dict[str, Any]:
+    """Size + SHA-256 verification, cached only for stable file metadata.
+
+    The bounded process-local LRU also keys the pinned revision/size/digest.
+    Serialize checks so concurrent catalog requests do not duplicate a full hash.
+    Read errors and mutations are never cached; download completion bypasses cache.
+    """
+    target = head_detector_target(root)
+    key = str(target.absolute())
+    with _HEAD_INTEGRITY_LOCK:
+        cached = _HEAD_INTEGRITY_CACHE.pop(key, None)
+        try:
+            stat = target.stat()
+        except OSError:
+            return {"exists": False, "valid": False, "size": 0, "mtime": 0.0}
+        status = {
+            "exists": True, "valid": False,
+            "size": stat.st_size, "mtime": stat.st_mtime,
+        }
+        metadata = _head_file_metadata(stat)
+        if not stat_module.S_ISREG(stat.st_mode) or stat.st_size != HEAD_DETECTOR_SIZE:
+            return status
+        try:
+            with target.open("rb") as fh:
+                opened_metadata = _head_file_metadata(os.fstat(fh.fileno()))
+                # Windows path stat may expose creation time as ctime while
+                # fstat exposes change time. Compare those clocks only with
+                # themselves, retaining both in the cache signature.
+                if opened_metadata[:-1] != metadata[:-1]:
+                    return status
+                signature = (
+                    metadata, opened_metadata,
+                    HEAD_DETECTOR_REVISION, HEAD_DETECTOR_SIZE, HEAD_DETECTOR_SHA256,
+                )
+                if not force_verify and cached is not None and cached[0] == signature:
+                    _HEAD_INTEGRITY_CACHE[key] = cached
+                    return dict(cached[1])
+                digest = hashlib.sha256()
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    digest.update(chunk)
+                if _head_file_metadata(os.fstat(fh.fileno())) != opened_metadata:
+                    return status
+            if _head_file_metadata(target.stat()) != metadata:
+                return status
+        except OSError:
+            return status
+        status.update(sha256=digest.hexdigest(), valid=digest.hexdigest() == HEAD_DETECTOR_SHA256)
+        _HEAD_INTEGRITY_CACHE[key] = (signature, dict(status))
+        while len(_HEAD_INTEGRITY_CACHE) > _HEAD_INTEGRITY_CACHE_LIMIT:
+            _HEAD_INTEGRITY_CACHE.popitem(last=False)
+        return status
+
+
+def download_head_detector(
+    root: Optional[Path] = None,
+    *,
+    on_log: TaskLogLike = _DEFAULT_LOG,
+) -> bool:
+    """下载并严格校验自动头部遮罩模型。损坏文件不会被当成已安装。"""
+    target = head_detector_target(root)
+    before = head_detector_status(root)
+    if before["valid"]:
+        on_log.info("Head detector is already installed and verified: %s", target)
+        return True
+    _invalidate_head_integrity(target)
+    if target.exists():
+        try:
+            target.unlink()
+        except OSError as exc:
+            on_log.error("Cannot replace the invalid head detector at %s: %s", target, exc)
+            return False
+    ok = False
+    if _sources._source_for("head_detector") == "modelscope":
+        ok = _sources.download_flat_ms(
+            HEAD_DETECTOR_REPO,
+            HEAD_DETECTOR_REPO_PATH,
+            target,
+            on_log=on_log,
+        )
+        if not ok:
+            as_task_log(on_log).warning(
+                "Head detector has no usable ModelScope mirror; falling back to HuggingFace"
+            )
+    if not ok:
+        ok = _sources.download_flat(
+            HEAD_DETECTOR_REPO,
+            HEAD_DETECTOR_REPO_PATH,
+            target,
+            revision=HEAD_DETECTOR_REVISION,
+            on_log=on_log,
+        )
+    status = head_detector_status(root, force_verify=True)
+    if not ok or not status["valid"]:
+        _invalidate_head_integrity(target)
+        on_log.error(
+            "Head detector integrity check failed: expected size=%d sha256=%s; got size=%s sha256=%s",
+            HEAD_DETECTOR_SIZE, HEAD_DETECTOR_SHA256,
+            status.get("size"), status.get("sha256", "unavailable"),
+        )
+        try:
+            target.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    on_log.info("Head detector downloaded and verified: %s", target)
+    return True
+
+
+def download_head_detector_custom(
+    source: str,
+    repo_id: str,
+    filename: str,
+    root: Optional[Path] = None,
+    *,
+    on_log: TaskLogLike = _DEFAULT_LOG,
+) -> bool:
+    """Download a registered custom detector to a traversal-safe ONNX basename."""
+    if source not in ("hf", "ms"):
+        as_task_log(on_log).error("unknown download source %r", source)
+        return False
+    try:
+        target = head_detector_custom_target(filename, root)
+    except ValueError:
+        as_task_log(on_log).error("invalid or reserved head-detector ONNX filename %r", filename)
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    download = _sources.download_flat_ms if source == "ms" else _sources.download_flat
+    return download(repo_id, filename, target, on_log=on_log)
 
 
 def download_anima_main(
@@ -813,6 +974,14 @@ def delete_asset(model_id: str, variant: Optional[str] = None) -> None:
             else f"upscaler:custom:{variant}"
         )
         target = upscaler_target(variant, root)
+    elif model_id == "head_detector_custom":
+        if not variant:
+            raise ValueError("head_detector_custom 需要 variant=filename")
+        target = head_detector_custom_target(variant, root)
+        save_name = target.name
+        key = f"head_detector:custom:{save_name}"
+    elif model_id == "head_detector":
+        target = head_detector_target(root)
     elif model_id == "cltagger_custom":
         # fork repo 专属根目录整删（与官方 repo 目录隔离，安全）
         if not variant:
@@ -848,6 +1017,14 @@ def delete_asset(model_id: str, variant: Optional[str] = None) -> None:
         raise RuntimeError(
             f"删除失败（文件可能被占用——模型已加载或训练中）：{exc}"
         ) from exc
+
+    if model_id == "head_detector_custom":
+        current = secrets.load()
+        if current.models.selected_head_detector == Path(variant or "").name:
+            models = current.models.model_copy(
+                update={"selected_head_detector": "builtin"}
+            )
+            secrets.save(current.model_copy(update={"models": models}))
 
 
 def trigger(model_id: str, variant: Optional[str] = None) -> str:
@@ -965,6 +1142,31 @@ def trigger(model_id: str, variant: Optional[str] = None) -> str:
         key = f"upscaler:{label}"
         start_download_async(
             key, lambda log: download_upscaler(label, root, on_log=log)
+        )
+        return key
+    if model_id == "head_detector_custom":
+        if not variant:
+            raise ValueError("head_detector_custom 需要 variant=filename")
+        cand = _download_candidate("head_detector", variant)
+        target = head_detector_custom_target(cand.filename, root)
+        save_name = target.name
+        key = f"head_detector:custom:{save_name}"
+        source = (
+            "ms"
+            if _sources._source_for("head_detector") == "modelscope"
+            else "hf"
+        )
+        start_download_async(
+            key,
+            lambda log: download_head_detector_custom(
+                source, cand.repo, cand.filename, root, on_log=log
+            ),
+        )
+        return key
+    if model_id == "head_detector":
+        key = "head_detector"
+        start_download_async(
+            key, lambda log: download_head_detector(root, on_log=log)
         )
         return key
     if model_id == "cltagger_custom":

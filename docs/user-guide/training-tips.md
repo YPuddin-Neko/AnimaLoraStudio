@@ -88,6 +88,12 @@
 | LoRA | 简单稳定，兼容性好 | 表达力有限 | 单角色、简单画风 |
 | LoKr | 表达力强，参数高效 | 需要调参 | 多角色、复杂画风 |
 
+### LyCORIS v4 与自动训练遮罩
+
+当前依赖固定为 `lycoris-lora==4.0.0`，LoRA / LoHa / LoKr 使用 eager 兼容基线；不默认开启 Triton、custom backward 或低精度 kernel。旧权重的缩放语义由兼容层保留，升级时让启动器同步依赖，详见 [v0.27 升级说明](upgrading-v0.27.md)。
+
+服装、姿态、画风训练若需降低头部区域对 loss 的贡献，可在“预处理 → 涂抹”运行[自动头部遮罩](auto-head-mask.md)，手工修正并保存，再启用 masked loss。该功能不会修改 caption；角色名等身份标签仍需自行处理。masked loss 与 Leap / NaViT Packing 不兼容。
+
 ### 优化器选择
 
 | 优化器 | 何时用 | 关键参数 |
@@ -358,22 +364,18 @@ WDDM 预留量决定是否执行同样的顺序化。32 GB 显卡通常会顺序
 - **Timestep 采样**：`uniform` / `logit_normal` / `mode` / `mixed_uniform` 等，含可配置 schedule shift；Krea 2 另有分辨率感知的 `krea2_shift`。
 - **InfoNoise 自适应采样**（可选）：基于 I-MMSE 的反 CDF 时间步采样器。
 - **自蒸馏 / 表征对齐**（可选，进阶，**仅 Anima**）：LeapAlign 两步跳跃自蒸馏（含 FlowBP 四变体）、SRA v2 中间表征对齐 VAE latent。
-- **优化器**：AdamW / Lion / Automagic / Prodigy / Prodigy+ScheduleFree / SOAP / Schedule-Free SOAP（起步参数 / 切换换算见 [optimizers.md](optimizers.md)）。
-- **Adapter**：LoRA + LyCORIS LoKr（走 [lycoris-lora](https://github.com/KohakuBlueleaf/LyCORIS) 官方库，含 DoRA / rs-LoRA / dropout）。
+- **优化器**：AdamW / Lion / Automagic / CAME / Prodigy / Prodigy+ScheduleFree / SOAP / Schedule-Free SOAP（起步参数 / 切换换算见 [optimizers.md](optimizers.md)）。
+- **Adapter**：LoRA / LoHa / LoKr（走 [lycoris-lora](https://github.com/KohakuBlueleaf/LyCORIS) v4 eager 基线），以及 OrthoLoRA / T-LoRA；DoRA、rs-LoRA 与 dropout 的可用性按 adapter 和模型族过滤。
 - **分层 rank**：`lora_rank_rules` 按层名正则配不同 rank，便于按模块重要性差异化分配参数预算。
 - **Attention backend**：xformers / flash_attn / PyTorch SDPA（Krea 2 固定 SDPA）。
 
 ---
 
-## Schema 简单/高级模式 与 字段位置（0.7.1 改动）
+## Schema 简单/高级模式 与历史字段迁移
 
-0.7.1 引入了 Train 页和 Presets 页的 **简单/高级** 切换：
+Train 页和 Presets 页提供 **简单/高级** 切换，共享同一份浏览器偏好。简单模式只显示常用字段，高级模式展开进阶选项；实际可见字段还取决于模型族、adapter 和当前启用的功能，不以固定字段数为准。
 
-- **简单模式**：只显示常用字段（学习率、rank、optimizer、采样间隔等），约 30 个字段
-- **高级模式**：显示全部字段（约 65 个），包含 dropout、scheduler tuning、PPSF 细节、噪声
-  schedule、InfoNoise 等
-
-两个页面共享同一个 toggle 状态（localStorage），打开任一页面切换都会同步到另一个。
+以下分组和默认值表是 **0.7.x → 0.8.0 的历史迁移记录**，不是当前版本的完整 schema；当前字段定义以 `studio/domain/training.py` 和页面显示为准。
 
 ### 字段位置变化（0.7.0 → 0.8.0）
 
@@ -529,7 +531,7 @@ epoch 版写 `..._epoch{N}.{ext}`，文件名互不覆盖，可同时启用。�
 ### 使用训练监控
 
 走 Studio 的监控页：启动训练后打开 <http://127.0.0.1:8765/tools/monitor>，
-或在 ⑥ 训练 / 队列页里点任务进入 **任务详情 → 监控** 标签。
+或在训练 / 队列页里点任务进入 **任务详情 → 监控** 标签。
 
 监控面板显示：
 - 实时 loss 曲线
@@ -557,7 +559,7 @@ epoch 版写 `..._epoch{N}.{ext}`，文件名互不覆盖，可同时启用。�
 - 任务失败时详情页红框里是日志中最后一个错误块，和日志标签里看到的一致。
 - 报 issue 时点详情页顶部的 **诊断包**：一个 zip，里面是该任务的 `run.log`、配置快照、训练指标快照、
   任务起止时间窗内的 `studio.log` 片段和环境摘要（版本 / 驱动 / CUDA / PyTorch），已做密钥脱敏、不含
-  `secrets.json`；发出前自己过一眼即可。不针对某个任务的诊断包在 **设置 → 系统 → 日志 → 导出诊断包**。
+  `secrets.json` / `credentials.json` 等敏感存储文件；发出前自己过一眼即可。不针对某个任务的诊断包在 **设置 → 系统 → 日志 → 导出诊断包**。
 
 日志文件本身在 `studio_data/tasks/<任务 id>/run.log`；随任务删除一起删，不单独清理。
 

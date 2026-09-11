@@ -4,6 +4,7 @@ import type { SchemaProperty } from '../api/client'
 import { useProjectCtx } from '../context/ProjectContext'
 import { controlKind, fieldLabel, schemaEnumLabel } from '../lib/schema'
 import { useAutoGrowTextarea } from '../lib/useAutoGrowTextarea'
+import { Checkbox, Input, Select, Textarea } from './FormControl'
 import ModelPathPicker from './ModelPathPicker'
 import PathPicker from './PathPicker'
 import ResumeFieldPicker from './ResumeFieldPicker'
@@ -37,24 +38,6 @@ interface Props {
   disabledOptionHint?: string
 }
 
-// input 覆盖 .input 默认值（更紧凑；背景用 canvas 而不是 surface）
-const inputStyle: React.CSSProperties = {
-  width: '100%', padding: '5px 10px',
-  background: 'var(--bg-canvas)', border: '1px solid var(--border-default)',
-  borderRadius: 'var(--r-sm)', fontSize: 'var(--t-sm)',
-  color: 'var(--fg-primary)',
-}
-
-// disabled 灰显：行内 inputStyle 指定了 background/color，浏览器默认的
-// disabled 外观被盖掉 —— input/textarea 必须显式叠加（checkbox 的
-// opacity-60 wrapper / select 的原生灰显不受此影响）。
-const disabledInputStyle: React.CSSProperties = {
-  ...inputStyle, opacity: 0.55, cursor: 'not-allowed',
-}
-
-const fieldStyle = (disabled: boolean): React.CSSProperties =>
-  disabled ? disabledInputStyle : inputStyle
-
 const FieldHint = ({ children }: { children: React.ReactNode }) => (
   <span className="ml-2 text-[11px] text-warn align-middle">{children}</span>
 )
@@ -75,20 +58,19 @@ export default function Field({
   // bool ----------------------------------------------------------------
   if (kind === 'bool') {
     return (
-      <label className={`flex items-start gap-3 py-1.5 ${disabled ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}`}>
-        <input
-          type="checkbox"
+      <label className={`flex items-start gap-3 py-1.5 ${disabled ? 'cursor-not-allowed' : 'cursor-pointer'}`}>
+        <Checkbox
           checked={Boolean(value)}
           onChange={(e) => onChange(e.target.checked)}
           disabled={disabled}
-          style={{ marginTop: 4, height: 16, width: 16, borderRadius: 'var(--r-sm)' }}
+          className="mt-1"
         />
-        <span className="flex-1">
+        <span className={`flex-1 ${disabled ? 'opacity-60' : ''}`}>
           <div className="text-sm text-fg-primary">
             {label}
             {hintNode}
           </div>
-          {help && <div className="text-xs text-fg-tertiary mt-1">{help}</div>}
+          {help && <div className="type-field-help mt-1">{help}</div>}
         </span>
       </label>
     )
@@ -99,23 +81,24 @@ export default function Field({
     const triValue = value === true ? 'true' : value === false ? 'false' : ''
     return (
       <div className="py-1.5">
-        <div className="text-sm font-medium text-fg-secondary mb-1">
+        <div className="type-field-label mb-1">
           {label}{hintNode}
         </div>
-        <select
+        <Select
           value={triValue}
           onChange={(e) => {
             const v = e.target.value
             onChange(v === 'true' ? true : v === 'false' ? false : null)
           }}
           disabled={disabled}
-          className="input" style={inputStyle}
+          controlSize="sm"
+          surface="canvas"
         >
           <option value="">{t('field.useGlobal')}</option>
           <option value="true">{t('field.yes')}</option>
           <option value="false">{t('field.no')}</option>
-        </select>
-        {help && <div className="text-xs text-fg-tertiary mt-1">{help}</div>}
+        </Select>
+        {help && <div className="type-field-help mt-1">{help}</div>}
       </div>
     )
   }
@@ -124,14 +107,15 @@ export default function Field({
   if (kind === 'select') {
     return (
       <div className="py-1.5">
-        <div className="text-sm font-medium text-fg-secondary mb-1">
+        <div className="type-field-label mb-1">
           {label}{hintNode}
         </div>
-        <select
+        <Select
           value={String(value ?? '')}
           onChange={(e) => onChange(e.target.value)}
           disabled={disabled}
-          className="input" style={inputStyle}
+          controlSize="sm"
+          surface="canvas"
         >
           {(enumOptions ?? prop.enum ?? []).map((opt) => {
             // 当前已选中的值即使被禁也保持可选中状态渲染（表单如实反映
@@ -150,8 +134,8 @@ export default function Field({
               </option>
             )
           })}
-        </select>
-        {help && <div className="text-xs text-fg-tertiary mt-1">{help}</div>}
+        </Select>
+        {help && <div className="type-field-help mt-1">{help}</div>}
       </div>
     )
   }
@@ -265,18 +249,21 @@ function TextareaField({
   useAutoGrowTextarea(taRef, text)
   return (
     <div className="py-1.5">
-      <div className="text-sm font-medium text-fg-secondary mb-1">
+      <div className="type-field-label mb-1">
         {label}{hintNode}
       </div>
-      <textarea
+      <Textarea
         ref={taRef}
         rows={5}
         value={text}
         onChange={(e) => onChange(e.target.value)}
         disabled={disabled}
-        className="input input-mono resize-none overflow-hidden" style={fieldStyle(disabled)}
+        controlSize="sm"
+        surface="canvas"
+        mono
+        className="resize-none overflow-hidden"
       />
-      {help && <div className="text-xs text-fg-tertiary mt-1">{help}</div>}
+      {help && <div className="type-field-help mt-1">{help}</div>}
     </div>
   )
 }
@@ -302,10 +289,10 @@ function StringListField({
 
   return (
     <div className="py-1.5">
-      <div className="text-sm font-medium text-fg-secondary mb-1">
+      <div className="type-field-label mb-1">
         {label}{hintNode}
       </div>
-      <textarea
+      <Textarea
         ref={taRef}
         rows={5}
         value={raw}
@@ -315,9 +302,12 @@ function StringListField({
         }}
         onBlur={() => setRaw(parse(raw).join('\n'))}
         disabled={disabled}
-        className="input input-mono resize-none overflow-hidden" style={fieldStyle(disabled)}
+        controlSize="sm"
+        surface="canvas"
+        mono
+        className="resize-none overflow-hidden"
       />
-      {help && <div className="text-xs text-fg-tertiary mt-1">{help}</div>}
+      {help && <div className="type-field-help mt-1">{help}</div>}
     </div>
   )
 }
@@ -374,10 +364,10 @@ function JsonCodeField({
 
   return (
     <div className="py-1.5">
-      <div className="text-sm font-medium text-fg-secondary mb-1">
+      <div className="type-field-label mb-1">
         {label}{hintNode}
       </div>
-      <textarea
+      <Textarea
         ref={inputRef}
         rows={Math.max(3, raw.split('\n').length + 1)}
         value={raw}
@@ -387,11 +377,13 @@ function JsonCodeField({
         }}
         onBlur={commit}
         disabled={disabled}
-        className="input input-mono"
-        style={fieldStyle(disabled)}
+        controlSize="sm"
+        surface="canvas"
+        mono
+        invalid={Boolean(error)}
       />
       {error && <div className="text-xs text-err mt-1">{error}</div>}
-      {help && <div className="text-xs text-fg-tertiary mt-1">{help}</div>}
+      {help && <div className="type-field-help mt-1">{help}</div>}
     </div>
   )
 }
@@ -441,10 +433,10 @@ function IntListField({
 
   return (
     <div className="py-1.5">
-      <div className="text-sm font-medium text-fg-secondary mb-1">
+      <div className="type-field-label mb-1">
         {label}{hintNode}
       </div>
-      <input
+      <Input
         ref={inputRef}
         type="text"
         inputMode="numeric"
@@ -458,10 +450,12 @@ function IntListField({
           }
         }}
         disabled={disabled}
-        className="input input-mono" style={fieldStyle(disabled)}
+        controlSize="sm"
+        surface="canvas"
+        mono
         placeholder={placeholder}
       />
-      {help && <div className="text-xs text-fg-tertiary mt-1">{help}</div>}
+      {help && <div className="type-field-help mt-1">{help}</div>}
     </div>
   )
 }
@@ -518,10 +512,10 @@ function NumberField({
 
   return (
     <div className="py-1.5">
-      <div className="text-sm font-medium text-fg-secondary mb-1">
+      <div className="type-field-label mb-1">
         {label}{hintNode}
       </div>
-      <input
+      <Input
         ref={inputRef}
         type="text"
         inputMode={kind === 'int' ? 'numeric' : 'decimal'}
@@ -535,9 +529,11 @@ function NumberField({
           }
         }}
         disabled={disabled}
-        className="input input-mono" style={fieldStyle(disabled)}
+        controlSize="sm"
+        surface="canvas"
+        mono
       />
-      {help && <div className="text-xs text-fg-tertiary mt-1">{help}</div>}
+      {help && <div className="type-field-help mt-1">{help}</div>}
     </div>
   )
 }
@@ -588,7 +584,7 @@ function PathStringField({
 
   return (
     <div className="py-1.5 relative">
-      <div className="text-sm font-medium text-fg-secondary mb-1">
+      <div className="type-field-label mb-1">
         {label}
         {kind === 'path' && (
           <span className="ml-2 text-xs text-fg-tertiary">{t('field.pathHint')}</span>
@@ -598,16 +594,15 @@ function PathStringField({
       <div className="flex gap-2">
         {/* 模型路径字段：input 末尾内嵌下箭头开 dropdown，不额外占一个按钮位 */}
         <div className="relative flex-1 min-w-0">
-          <input
+          <Input
             type="text"
             value={text}
             onChange={(e) => onChange(e.target.value)}
             disabled={disabled}
-            className={'input' + (kind === 'path' ? ' input-mono' : '')}
-            style={{
-              ...fieldStyle(disabled),
-              ...(useModelPicker ? { paddingRight: 30 } : null),
-            }}
+            controlSize="sm"
+            surface="canvas"
+            mono={kind === 'path'}
+            style={useModelPicker ? { paddingRight: 30 } : undefined}
           />
           {useModelPicker && (
             <button
@@ -660,7 +655,7 @@ function PathStringField({
         )}
         {suffix}
       </div>
-      {help && <div className="text-xs text-fg-tertiary mt-1">{help}</div>}
+      {help && <div className="type-field-help mt-1">{help}</div>}
       {/* resume_state / resume_lora：贴字段的 dropdown，按 version 分组列文件 */}
       {useResumePicker && picking && !disabled && (
         <ResumeFieldPicker

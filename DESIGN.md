@@ -1,0 +1,852 @@
+# AnimaLoraStudio Design System
+
+This document is the durable visual contract for Studio Web. Product behavior and
+information architecture remain authoritative in the application and product docs;
+this file defines how those behaviors are presented consistently.
+
+## 1. Direction
+
+AnimaLoraStudio is a focused creative workbench, not a marketing surface. Its visual
+world is warm ivory, restrained orange, precise typography, and compact technical
+controls. Light and dark themes express the same hierarchy. Changes should evolve
+this world rather than replace it.
+
+The interface serves two audiences at once:
+
+- New users need clear hierarchy, familiar controls, and visible next actions.
+- Experienced users need dense parameter editing, fast scanning, and stable layouts.
+
+Consistency means equal semantics receive equal treatment. It does not mean every
+surface has identical density.
+
+## 2. Sources of truth
+
+| Layer | Authority | Responsibility |
+| --- | --- | --- |
+| Foundation | `studio/web/src/styles/tokens.css` | Color, type, spacing, radius, shadow, motion, control states |
+| Utility bridge | `studio/web/tailwind.config.js` | Maps CSS tokens into Tailwind utilities |
+| Primitives | `studio/web/src/components/Button.tsx`, `Badge.tsx`, `Card.tsx`, `EmptyState.tsx`, `FormControl.tsx`, `Alert.tsx`, `ProgressBar.tsx` | Typed, accessible component APIs |
+| Patterns | `PageHeader`, `StepShell`, `ActionGroup`, `SaveIndicator`, `SaveBar`, `ListToolbar`, `Dialog`, `Modal`, `Drawer`, `Tabs`, `SegmentedControl`, `Toast`, `Field` | Repeated page and interaction structures |
+| Layout | `studio/web/src/components/AppShell.tsx`, `studio/web/src/styles/app-shell.css` | Viewport tracks, landmarks, and scroll ownership |
+| Product surfaces | `studio/web/src/pages/` | Business state and composition, not new visual primitives |
+
+A page may compose primitives with layout utilities. It must not recreate an
+existing primitive with arbitrary colors, padding, font sizes, or hover states.
+
+### Cross-surface UX decision protocol
+
+Every product-surface UX proposal must resolve consistency before local
+optimization, even when the request initially names only one page:
+
+1. Read this document first and follow an existing semantic contract when one
+   applies. Do not relocate a stable action, change feedback, or invent a new
+   interaction because it looks locally cleaner.
+2. If no contract applies, inspect representative current surfaces with the same
+   user intent, object scope, risk, and task lifecycle. Repetition is evidence,
+   not authority: distinguish an established pattern from migration debt and
+   intentional specialist behavior.
+3. When the same unresolved semantic decision recurs across surfaces, define the
+   app-wide mental model here before implementing the page. State whether the
+   current change completes the migration or is the first bounded adoption slice;
+   do not let a one-page exception silently become a standard.
+4. A surface may diverge only when its task semantics, object ownership, risk,
+   lifecycle, or required professional geometry materially differ. Record that
+   evidence and the anti-goals in its task brief.
+
+A decision-ready UI/UX proposal must therefore answer three questions: what this
+document already defines, how equivalent current surfaces behave, and whether the
+chosen rule should apply across the app. If those answers are unknown, continue
+the audit instead of entering implementation.
+
+## 3. Foundations
+
+### Color
+
+Use semantic tokens instead of literal colors:
+
+- `canvas` is the page field.
+- `surface` is the normal content plane.
+- `sunken` is for wells, navigation, and code/data regions.
+- `elevated` is for overlays and popovers.
+- `accent` identifies the primary action or active process.
+- `ok`, `warn`, `err`, and `info` communicate state, never decoration alone.
+
+Do not rely on color as the only state cue. Pair it with text, an icon, or an
+indicator. Dark mode must preserve hierarchy rather than simply invert colors.
+
+### Typography
+
+The Studio uses the local system sans stack for interface copy and the local mono
+stack for machine-readable data. Do not add a network font dependency: the app
+must remain readable while offline and should not shift when a font finishes
+loading. Use no more than `400`, `500`, and `600` for normal UI hierarchy.
+
+| Role | Contract | Use |
+| --- | --- | --- |
+| Page title | `.type-page-title`: `text-2xl`, 600, primary | One `h1` for the current page or workflow step |
+| Page description | `.type-page-description`: `text-md`, secondary, relaxed, max `68ch` | A concise explanation directly below the page title |
+| Section title | `.type-section-title`: `text-lg`, 600, primary | A major region inside a page or dialog |
+| Panel title | `.type-panel-title`: `text-sm`, 600, primary | A card, settings group, or compact panel |
+| Section label | `.type-section-label`: `text-xs`, 600, tertiary, tracked uppercase | A direct category heading such as queue status; never an eyebrow above another heading |
+| Field label | `.type-field-label`: `text-sm`, 500, secondary | The human-readable name of a form control |
+| Field help | `.type-field-help`: `text-xs`, tertiary, relaxed | Optional supporting copy below a field |
+| Metadata | `text-xs` + tertiary | Timestamps, counts, and passive context |
+| Technical data | `font-mono`; add `.tnum` for comparable numbers | Code, paths, identifiers, logs, and measurements—not generic UI chrome |
+
+Rules:
+
+- Normal interface and body copy uses `text-base`; compact controls and secondary
+  content use `text-sm`. `text-2xs` is reserved for dense supporting labels and
+  must never carry a primary action or required instruction.
+- Keep normal reading copy between `65ch` and `75ch`; headings and control labels
+  remain content-sized rather than stretching across the viewport.
+- Choose heading elements by document structure, then apply the matching role.
+  Do not skip levels to obtain a visual size.
+- Use sentence case for ordinary headings. Uppercase/tracking is reserved for a
+  category label that stands on its own; it is not a decorative kicker.
+- The configured density changes the scale without changing semantic roles.
+- Arbitrary pixel font sizes require a documented layout constraint and should
+  remain exceptional.
+
+### Spacing, radius, and depth
+
+Use the `--s-*`, `--r-*`, and `--sh-*` scales. New shared layouts use the
+semantic Tailwind spacing aliases below instead of choosing a number by eye:
+
+| Alias | Default | Relationship |
+| --- | ---: | --- |
+| `related` | 8px | Icons, labels, and controls that form one action or datum |
+| `field` | 12px | Parts of one field or compact component |
+| `section` | 16px | Sibling groups within one region |
+| `page-start` | 20px | Page-header leading inset |
+| `page` | 24px | Page-shell inset and separation between ordinary regions |
+| `page-loose` | 32px | Major region separation where a stronger pause is required |
+
+The aliases resolve through `--space-*` to the density-aware `--s-*` scale.
+Small `related` gaps stay stable; `field` and larger relationships contract or
+expand with the selected density. Numeric spacing utilities remain a compatibility
+path and migrate by component family. Do not globally remap them in a page PR.
+
+Vertical rhythm follows content hierarchy: elements that form one control stay
+closest, fields form a tighter group than sections, and sections form a tighter
+group than page regions. A heading has more separation from the preceding region
+than from the content it introduces. Shared page chrome uses semantic spacing so
+its header, optional toolbar, and content keep aligned horizontal insets.
+
+Within one hierarchy level, use one radius: controls use `--r-md`, ordinary cards
+use `--r-lg`, and pills use `--r-pill`. Dense workbench panels may use `--r-md`
+when their compactness is part of the information structure. Fixed or arbitrary
+spacing is allowed only where it is geometry rather than rhythm—for example canvas
+coordinates, image crops, table column sizing, or sticky offsets—and must remain
+local to that specialized surface.
+
+Shadows communicate elevation. Borders communicate grouping. Do not add shadows
+merely to decorate every container.
+
+### Density
+
+- **Default** is the baseline for navigation, settings, dialogs, and ordinary forms.
+- **Compact** is allowed for parameter-heavy workbenches, tables, and repeated row
+  controls. It must use an explicit small component size or the global tight density,
+  not local pixel values.
+- **Loose** increases readability without changing component semantics.
+
+## 4. Button contract
+
+Use `Button` for button elements. Links that navigate may use `buttonClassName()`
+when they need button presentation while retaining link semantics.
+
+| Variant | Use | Do not use for |
+| --- | --- | --- |
+| `primary` | The single leading action in a local decision scope | Every positive action on a page |
+| `secondary` | Normal actions and alternate choices | Passive navigation or icon-only chrome |
+| `ghost` | Low-emphasis actions, toolbar controls, dismissals | Destructive actions without another cue |
+| `warning` | Interrupting or canceling reversible/in-progress work | Permanent deletion |
+| `danger` | Irreversible deletion or discarding recoverable state | Routine cancellation |
+
+Sizes:
+
+- `md`: ordinary forms and dialogs.
+- `sm`: headers, cards, and compact action rows.
+- `xs`: dense tables, filters, and micro toolbars; never body copy squeezed smaller.
+
+Rules:
+
+- Button labels name the action.
+- Icon-only buttons require an accessible label.
+- Loading buttons remain labeled, expose `aria-busy`, and cannot be activated.
+- The imperative `useDialog()` API preserves the product's single-accent confirmation
+  convention: its `tone` marks urgent dialog semantics but does not recolor the confirm
+  button. Declarative destructive action groups continue to use `danger`.
+- Toggle buttons expose `aria-pressed`.
+- Disabled, hover, active, and keyboard-focus states come from the primitive.
+- Do not combine `bg-*`, `border-*`, and `text-*` to reinvent an existing variant.
+
+## 5. Badge contract
+
+Badges are non-interactive labels. A clickable pill is a button or link, not a badge.
+
+| Tone | Meaning | Common states |
+| --- | --- | --- |
+| `neutral` | Passive, queued, unknown, or canceled metadata | pending, scheduled, canceled |
+| `accent` | Active work or the current process | running, training, evaluating |
+| `success` | Successful completion or confirmed availability | done, completed, available |
+| `warning` | Paused, partial, or attention required | paused, partial |
+| `danger` | Failure or invalid state | failed, error |
+| `info` | Informational classification without success/failure | source or category labels |
+
+An active badge may include the shared pulsing indicator. Use `sm` only for dense
+metadata such as announcement tags; status badges use the default size.
+
+Domain components such as `VersionStatusBadge` own the mapping from backend state to
+badge tone. The generic `Badge` component must not know API enums.
+
+## 6. Surface and empty-state contract
+
+Use `Card` for ordinary bordered content surfaces. The default card uses the ordinary
+`--r-lg` radius; compact workbench panels opt into the compact radius explicitly.
+Padding belongs to the component API when it describes the whole surface, so density
+modes can adjust it through spacing tokens. Interactive links and buttons retain their
+native semantics and use `cardClassName()` for card presentation.
+
+Use `EmptyState` when a list or page region has no content to present:
+
+- `md` is the primary zero state for an otherwise empty page or tab.
+- `sm` is a compact no-match state inside an existing section.
+- Use `embedded` inside an existing panel to retain the empty-state hierarchy without
+  adding a nested Card surface; standalone states keep their default Card.
+- Titles state what is absent; descriptions explain the next useful step.
+- Actions are optional and must use the appropriate Button or link primitive.
+- Loading, errors, and warnings are not empty states and require their own semantics.
+
+A composite card with a primary open action and local actions must not nest buttons or
+links. Use a semantic `Card` container, a sibling full-surface native link/button for
+the primary action, and local `Button` controls above that hit area. Name the Card from
+its visible title, name the primary action explicitly, and keep hidden local actions
+non-pointer-interactive until hover or keyboard focus reveals them.
+
+Do not reproduce `rounded-* + border-subtle + bg-surface` for an ordinary card or
+hand-build centered zero-state typography on product pages.
+
+## 7. Form-control contract
+
+Use the typed `Input`, `Select`, `Textarea`, and `Checkbox` primitives for ordinary
+native form controls. They preserve browser semantics while sharing focus, disabled,
+invalid, sizing, and theme behavior. The legacy `.input` and `.input-mono` classes
+remain compatibility paths during incremental migration.
+
+The upscale operation panel adopts these controls at `sm` workbench size. Its
+preset and conditional custom-edge input have separate labels and share the
+computed target description via `aria-describedby`; never place two labelable
+controls in one label. Header scope-wide and selected-image actions use
+ActionGroup, with the selected-image primary action last. Model-missing guidance
+uses a compact, non-live Alert; download and task payloads remain page-owned.
+The image-resolution filter uses a named SegmentedControl (mutually exclusive
+filter values, not content tabs). Keep an active bin visible even when a refresh
+reduces its count to zero; do not silently change the selected filter. Folder
+filtering and selection clearing stay page-owned. ImageGrid keeps its existing
+bounded slot and internal list inset; the statistical sidebar owns its own scroll
+when its cards exceed the available height.
+
+Control sizes:
+
+- `md` is the default for dialogs and ordinary forms and aligns with `Button md`.
+- `sm` is for settings rows, filter toolbars, schema forms, and other explicitly
+  compact workbench regions; it must not be recreated with local padding overrides.
+
+Control surfaces communicate placement, not state:
+
+- `surface` is the ordinary form plane and default.
+- `canvas` is the compact Schema `Field` treatment inside a surrounding surface.
+- `sunken` is for settings wells and data-entry regions designed as inset controls.
+
+Use `mono` only for paths, identifiers, JSON, numeric technical values, and other
+machine-readable content. Errors pair visible recovery copy with `invalid`, which
+exposes `aria-invalid` and the shared error border/focus ring. Disabled appearance,
+keyboard focus, placeholder color, and checkbox accent come from the primitive.
+Do not replace a native select or checkbox with a custom interaction only to alter
+its appearance.
+
+The primitive owns presentation only. Debouncing, parsing, commit-on-blur, schema
+validation, picker composition, and business state remain in Field or product
+patterns. File/color/range inputs and composite pickers require their own contracts
+and are not styled as text controls by default.
+
+Settings explanations belong in the label-adjacent `InfoButton` tooltip according
+to `docs/design/ui-info-design.md`; do not add permanent explanatory paragraphs
+under individual settings.
+
+## 8. Feedback contract
+
+Use `Alert` for persistent, in-flow information, success confirmation, warnings, and
+errors. `Toast` remains the transient notification pattern and reuses Alert's visual
+tones without changing its timer or invocation API.
+
+| Tone | Meaning | Typical use |
+| --- | --- | --- |
+| `info` | Neutral operational context or guidance | non-blocking system information |
+| `success` | A completed action that remains relevant in the current view | saved or imported confirmation |
+| `warning` | Attention or recovery is required, but the state is not yet a failure | paused or held work |
+| `danger` | An operation failed or content is invalid | failed loads and rejected operations |
+
+Use `md` for ordinary page feedback and `sm` inside compact workbench regions. A
+semantic icon accompanies each tone so meaning does not depend on color alone. Titles
+are optional and should name the condition; body copy explains the consequence or
+recovery. Actions belong in the dedicated action slot and use `Button`.
+
+ARIA live behavior is explicit because not every visible notice is newly announced:
+use `role="alert"` only for urgent dynamic failures, `role="status"` for non-urgent
+dynamic confirmation, and no live role for persistent page context. Do not announce the
+same event through both an in-flow Alert and a Toast; choose the surface nearest to the
+recovery action. Field validation stays adjacent to its control; empty states, domain
+status cards, and modal workflow steps are not Alerts. Error copy and recovery details
+must wrap rather than truncate.
+
+Do not recreate feedback with local `bg-*-soft + border-* + text-*` combinations.
+
+## 9. Action-area and save-pattern contract
+
+`ActionGroup` is the typed Pattern-layer entry point for related save, submit, and
+recovery controls. Its slots render in a stable order: optional status first,
+secondary or destructive actions next, and the single primary action last. The primary
+action therefore stays at the far right in left-to-right layouts. A visual divider may
+separate destructive or context-changing actions, but it does not create another
+primary action.
+
+Save and submit buttons are text-first. Do not prefix ordinary labels with floppy-disk,
+checkmark, or other decorative emoji; reserve icons for established compact utilities,
+and provide an accessible label for icon-only controls. Use `Button` loading and disabled
+states rather than replacing the label with an unrelated spinner. An explicit save may
+lose primary emphasis when nothing is dirty, but it remains in the primary slot so the
+layout does not jump.
+
+Placement follows editing scope:
+
+- Use the page or step header for short, viewport-contained edits and quick actions.
+  Workspace steps keep stable page-level task actions (including Train's Start and
+  Schedule) in the header even when their inner parameter panels are long. Review
+  content does not justify moving or duplicating these actions in a panel footer.
+- Use a footer action area for long or scroll-heavy forms that require deliberate review
+  before submit. Make it sticky only when the final action would otherwise be difficult
+  to reach, and reserve content space so it never obscures fields.
+- Keep actions that affect only one panel inside that panel; do not promote them to a
+  page-level bar.
+- Autosave surfaces show `SaveIndicator` status instead of a redundant Save button.
+  If an error Toast already announces the same failure, disable the indicator's error
+  announcement so assistive technology receives it only once.
+  Train waits for the latest draft to save before SPA departure, version switching,
+  submission, or preset creation/application/export. These boundaries temporarily
+  disable draft editing; ordinary autosave and an active task do not. Failed saves
+  keep the draft on the page with one local retry alert, without automatic retry
+  loops or duplicate error Toasts. Retrying saves the draft; the user can then repeat
+  the intended action. Browser refresh/close retains the unsaved-work warning.
+
+Status copy precedes controls and uses a stable polite live region. At narrow widths,
+action groups may wrap, but the primary action remains last and right-aligned. Snapshot
+restore, reset, and destructive actions remain secondary to saving unless that recovery
+operation is the sole purpose of the current scope.
+
+## 10. Modal-dialog contract
+
+`Modal` is the declarative Pattern-layer shell for interruptive tasks that require
+protected focus: confirmations, short forms, option selection, and structured review.
+Use the imperative `useDialog()` API for simple text-only alert, confirm, and prompt
+flows; it renders through the same shell. Use a Drawer for persistent secondary work
+that should remain available alongside page context, and do not put ordinary page
+content in a modal merely to make it prominent.
+
+Confirmation follows consequence, not control type. Require it when execution will
+permanently delete persisted content, replace an existing persisted collection, discard
+recoverable local edits, or abandon in-progress work that cannot resume. Confirm at the
+execution boundary rather than when the user merely selects a dangerous mode, and name
+the affected object and consequence. Do not confirm routine, reversible, or easily
+undoable actions; warning copy beside the control is sufficient there.
+
+Every modal has one required title, an optional concise description, optional header
+utilities, one scrollable body, and an optional footer. Use `sm` for a short prompt, `md`
+for ordinary forms, `lg` for structured comparisons or dense option sets, and `wide`
+only for a genuine master-detail surface such as Announcement Center. The panel is
+portalled above the app, keeps viewport-safe outer padding and a bounded height, and
+leaves the title, header utilities, and footer visible while long body content scrolls.
+
+Dismissal and focus are part of the Pattern rather than caller-owned behavior:
+
+- Opening moves focus into the dialog; closing restores focus to the opener.
+- Tab and Shift+Tab remain within the active dialog, and Escape dismisses unless an
+  irreversible or in-progress operation explicitly disables it.
+- A backdrop press may dismiss a reversible dialog. Pressing inside the panel, or
+  starting an interaction inside and releasing outside, must not dismiss it.
+- The shell supplies `role="dialog"`, `aria-modal`, and title/description linkage. Use
+  `alertdialog` only when an immediate decision is required before work can continue.
+- Lock background scrolling while open. Do not stack modal dialogs.
+- Announcement Center is the representative `wide` master-detail modal. Its tag filter
+  uses `SegmentedControl`; its announcement list is a labelled single-select listbox with
+  wrapping vertical arrows plus Home/End; and the article region owns its own scroll.
+  Announcement data, read-state persistence, update checks, and settings deep links remain
+  feature-owned.
+
+Footer actions use `ActionGroup`: status first, secondary or destructive actions next,
+and the single primary action last. Keep validation near the relevant control; an error
+Toast must not duplicate an error already announced inside the modal. Toast feedback remains
+above the modal layer when an operation keeps the dialog open. Do not recreate modal
+backdrops, panel geometry, focus listeners, or title linkage in feature code.
+
+### Background model prerequisites and direct-edit task setup
+
+Settings owns model acquisition and selection through the shared model-source
+information architecture. Domains with selectable runtime models use the same
+`SourceSelect`, `ModelSourceCard`, download/local registration, status, removal,
+and fallback conventions. A task setup modal may select among currently installed
+catalog rows, but it is not a second model manager: when nothing compatible is
+installed, provide concise recovery guidance to Settings instead of embedding
+download controls or logs. A failed enqueue clears busy immediately and provides
+a local retry path.
+
+Automatic head masking is the representative direct-edit adoption. Its low-emphasis
+`Auto mask` ghost action matches Crop's optional prefill action and sits immediately
+before Save all, with Save current remaining the primary last action. The shared Modal
+is a short form containing
+Recognition model, scope (all/current), confidence, padding and feather. It has no
+explanatory subtitle, embedded model card, progress/review region, or Advanced
+section; IoU remains an internal established default. Validation stays at each
+field. The footer owns Cancel and Start; successful enqueue closes setup and
+restores opener focus without interrupting the page-owned background job.
+
+Completed non-stale detections become grouped unsaved edits on each affected
+image's existing mask layer. Exact rectangular geometry and feathering render and
+export through the same path as brush/eraser edits, coexist with loaded masks and
+manual strokes, and contribute to existing dirty indicators. Each affected image
+receives one undoable/redoable automatic operation; Save current and Save all are
+the only persistence boundary. Successful no-head, failed, skipped, and stale
+images remain clean. Open setup remains available when unsaved edits exist so the
+Modal can explain the save prerequisite, but Start remains blocked. Completion copy
+reports only applicable non-zero outcomes in plain user language; there is no proposal
+selection, bounding-box overlay, persistent review/log panel, Apply, or protected Undo
+in this UI; compatible legacy endpoints may remain.
+Project/version/job identity guards async completion, and unsaved edits block a new
+run. Only the matching preprocess stage can supply task state. After incorporation,
+the editor switches to Training mask and brush mode so users can correct results.
+
+## 11. Overlay-drawer contract
+
+Use `Drawer` for an interruptive task that slides above the current workspace while
+preserving visible context. It is an overlay side sheet, not a generic name for every
+panel attached to an edge: bottom task logs remain page-owned footer panels, and Generate
+pickers/editors remain attached workspaces with their own keep-alive geometry.
+
+Drawer motion has one owner and one lifecycle: `closed → opening → open → closing`.
+The shell remains mounted so cold and warm opens take the same path. Feature content must
+not add a second entrance animation or independently decide when the panel becomes visible.
+Static local content mounts in the same commit as the shell and moves with the panel; once
+mounted, keep it alive across later opens. Do not insert a transient loading label or skeleton
+for a page whose code and structure are already local—it creates flicker without communicating
+real progress. Use a local skeleton only for genuinely asynchronous remote content with a
+perceptible wait, and never replace the whole Drawer shell. Reduced-motion skips the authored
+transition consistently.
+
+Geometry and interaction belong to the Pattern:
+
+- The panel is portalled above the AppShell and below Modal/Toast layers. Its width is always
+  bounded by the viewport; long content scrolls inside the panel and never widens the page.
+- The backdrop and panel animate as one authored moment. Closing is shorter than opening;
+  loading, section changes, and lazy-module timing must not alter the shell motion.
+- Opening focuses the panel or an explicit initial target. Tab remains inside, Escape and a
+  direct backdrop press request a reversible close, and closing restores focus to the opener.
+- While open, the application root is inert. Do not mutate `body` overflow for Studio drawers:
+  the AppShell owns its own scroll container, and body scrollbar changes cause layout shift.
+- A Modal opened from a Drawer is the active top layer. Escape closes the Modal first; the
+  Drawer remains until its own close request succeeds.
+- Deep links or `open({ section })` requests wait for `open` readiness, then scroll only the
+  Drawer content owner. Never call early `scrollIntoView` in parallel with panel motion.
+
+Settings is the first representative adoption. Its data and instant-save behavior remain
+outside the Drawer Pattern; only shell timing, focus, dismissal, width, and internal scroll
+readiness are shared.
+
+## 12. Tabs and segmented-selection contract
+
+Use `Tabs` for navigation among peer content panels and `SegmentedControl` for changing
+one mutually exclusive value or working mode. They share visual rhythm and keyboard
+behavior, but their semantics are not interchangeable: Tabs render `tablist` / `tab`
+and reference labelled `tabpanel` content; segmented values render `radiogroup` /
+`radio`. Do not use tab semantics for filters, view toggles, or actions that navigate to
+a different route.
+
+Tabs support two appearances without changing meaning:
+
+- `underline` is the default for page-width or panel-level content sections. At narrow
+  widths it scrolls horizontally instead of wrapping labels into ambiguous rows.
+- `segmented` is for compact, bounded navigation inside a workbench panel. Use the same
+  segmented appearance for mutually exclusive modes, but through `SegmentedControl`.
+- Segmented tracks default to `layout="equal"` for existing fixed-width consumers.
+  Toolbar filters and overview labels with differing lengths use `layout="content"`:
+  intrinsic item widths, wrapping onto new rows when needed, and no label ellipsis.
+  An exceptionally long label may wrap within its item. Preprocess resolution filters
+  and Overview dataset tabs opt in; do not compensate with fixed widths or smaller text.
+
+Selection follows focus for this application: Arrow keys move to the next enabled item
+and activate it, wrapping at both ends; Home and End move to the first and last enabled
+item. Exactly one enabled item participates in the page Tab order. Disabled options are
+skipped. Every group has an accessible label, and every content tab supplies stable
+`aria-controls` / `aria-labelledby` linkage. Do not recreate local active-state class
+strings or implement feature-owned roving focus.
+
+Use `sm` for dense nested controls such as X/Y axes and sidebar sections; use `md` for
+primary panel navigation and mode choice. Compact selection labels may use `text-2xs`
+because they are peer navigation, not a primary action or required instruction. Labels
+may remain on one line in a segmented track only when the full label remains available
+as the accessible name and title. Underlined tabs keep their intrinsic width and scroll
+rather than truncating. Both appearances must preserve visible focus, disabled state,
+theme contrast, density response, and Chinese/English label stability.
+
+## 13. List-toolbar contract
+
+Use `ListToolbar` for an ordinary list's collapsible search, facet-filter, and sort
+region immediately below its page header. It is not the page action area, a bulk
+mutation bar, or a professional workbench toolbar. `PageHeader` continues to own the
+disclosure and refresh actions; Gallery autocomplete, draft filter popovers, Eval axis
+selection, and tag bulk editing retain their domain-specific composition.
+
+The Pattern owns a named region and stable slot order: dominant search first, filters
+second, and sort last. This is also the DOM and keyboard order. At wide desktop widths,
+the query owns the flexible primary track while compact facets remain trailing. At the
+project's approved narrow-desktop breakpoint, the query takes a full first row and the
+trailing controls wrap below it without changing order. Page-aligned padding, borders,
+gaps, theme colors, and density response come from semantic tokens; callers must not
+restore fixed percentage widths.
+
+The disclosure button supplies `aria-expanded` and `aria-controls`. Keep the current
+region mounted with `hidden` while collapsed so the ID reference remains valid and the
+row takes no layout space. Every region has a localized accessible name, and each input
+or select retains its own label. The Pattern is presentational: query debounce,
+persistence, active-filter dots, sorting, API parameters, paging resets, result counts,
+refresh, clear behavior, and list mutations remain page-owned. Do not add unused result
+or clear slots until a repeated product behavior has been established.
+
+## 14. Async-state and progress contract
+
+Async UI describes real work; it must not fabricate a waiting phase for local static
+content. Use `Button` loading for one pending action, `ConfigSkeleton` for a genuine
+initial remote schema/config fetch, and `ProgressBar` for an operation with duration.
+A spinner or progress bar is not a substitute for the page's ordinary empty state.
+
+A submitted task snapshot and an editable future draft are different interaction
+scopes. Controls that still represent the active snapshot become read-only or disabled
+for that operation scope. A surface may instead keep settings editable only when it
+labels and visually separates them as the next-run draft; the active task remains
+separately identifiable, and actions that would concurrently mutate the same destination
+stay disabled. Independent panels may remain available. After reload, never present
+fresh defaults as though they were the running task's submitted parameters. Existing
+surfaces migrate to this contract by workflow slice; new work must not add an unlabeled
+editable form beside a live task.
+
+`ProgressBar` is the typed visual and accessibility primitive. Every instance has a
+localized accessible label. Pass `value` and `max` only when the application has a
+meaningful quantity; the primitive clamps it and exposes `aria-valuemin`,
+`aria-valuemax`, and `aria-valuenow`. Omit `value` when work is real but its amount is
+unknown—the indeterminate state must not display a fabricated `0%` or a pretend ETA.
+`aria-valuetext` may add phase, batch, file, or step context. The primitive owns track,
+fill, sizes, motion, and reduced-motion fallback; it never owns SSE, polling, upload
+state, cancellation, retry, or business estimates.
+
+Use `xs` for an edge-aligned workbench pipeline, `sm` for ordinary inline/background
+work, and `md` for a blocking transfer dialog. Percentage text and byte/step metadata
+use tabular mono numerals beside the bar rather than inside a narrow fill. Progress
+color means active or complete work; errors move to `Alert`/Toast instead of leaving a
+red bar that still claims to be progressing. Capacity, utilization, scores, and crop
+ratios are data visualizations and do not use this async contract.
+
+Announcements are event-based, not frame-based:
+
+- Do not put rapidly changing percentages, bytes, or steps in a polite live region.
+  The progressbar value remains available to assistive technology without announcing
+  every tick.
+- Announce a phase boundary such as processing, completion, or failure once through a
+  stable atomic status/alert. Avoid duplicating the same event in inline feedback and
+  a Toast.
+- A blocking operation uses `Modal`; disable Escape/backdrop only while interruption
+  would be unsafe. A background operation must not steal focus merely because progress
+  updates.
+
+A skeleton reserves the expected geometry of remote content and carries `aria-busy`.
+Use it only while the initial remote structure is unavailable and the wait is
+perceptible. Do not insert skeletons for local Settings/static pages, short state
+transitions, refreshes where content can remain visible, or as an entrance animation.
+Skeleton and indeterminate motion become a stable static indicator under
+`prefers-reduced-motion`; meaning cannot depend on pulsing or travel.
+
+## 15. App-shell and viewport contract
+
+`AppShell` is the single desktop workspace frame. It owns the viewport, Sidebar
+track, Topbar track, default main landmark, and the page-level scroll container.
+Routes render inside its `main`; they must not recreate a second viewport-height
+application shell. The Studio supports a wide desktop class above 1280px and a
+compact desktop class at or below the shared 1280px breakpoint. This phase does
+not define a mobile information architecture.
+
+Geometry and scroll responsibility are fixed:
+
+- The shell uses `100dvh` with a `100vh` fallback, `minmax(0, 1fr)` for the
+  workspace track, and explicit `min-width: 0` / `min-height: 0` boundaries.
+  `html`, `body`, and `#root` fill the viewport and do not become competing
+  document scroll owners.
+- The main landmark is the default page scroll owner and reserves a stable
+  scrollbar gutter. A full-height workbench may add local panel scrolling only
+  when its outer route still fits the main track; nested scroll regions must be
+  deliberate and keyboard reachable.
+- Sidebar width and Topbar height come from layout tokens. Sidebar branding and
+  footer actions remain fixed while the named primary navigation region scrolls
+  internally, so long project workflows never push collapse/settings actions
+  outside the viewport. Current route links expose `aria-current`; theme uses the
+  navigation-row recipe and collapse uses the shared `Button`. The project version row is a
+  named control group: icon-only mutations use `Button`, while the switch trigger
+  controls a named single-select listbox with initial focus, arrows, Home/End,
+  Escape return, and explicit selected state.
+- Topbar breadcrumb, active-task status, global notices, and search preserve that
+  priority order. Active-task and queued-task status are native navigation links
+  styled by the shared button recipe; notice and search triggers use icon-only
+  `Button`s with dialog disclosure state. System resource pills expose bounded
+  `meter` semantics and localized value descriptions rather than relying on color,
+  width, or hover-only tooltips. At compact desktop widths, auxiliary system
+  resource meters yield before navigation or actions; breadcrumb labels truncate
+  visually while their full title and accessible name remain available.
+- A visible-on-focus skip link targets the main landmark. Sidebar, breadcrumb,
+  main, and overlay components retain native landmark/dialog semantics; route
+  changes do not steal focus automatically.
+- Modal, Drawer, Toast, command surfaces, and image preview remain portalled
+  overlay layers and never consume AppShell grid space. The anchored command
+  palette is a modal command surface: its named combobox controls a listbox,
+  keeps DOM focus in the query field, exposes the active option through
+  `aria-activedescendant`, supports wrapping arrows plus Home/End, traps Tab,
+  and restores the invoking search control after Escape or backdrop close.
+  Drawers may inert the app root; overlays must not alter shell width or
+  introduce a second body scrollbar.
+
+App-shell responsiveness belongs to `styles/responsive.css` and uses the shared
+1280px breakpoint. Route-specific workbench restructuring is a later Layout
+adoption concern, not permission to hide primary actions or add arbitrary
+component-local breakpoints.
+
+## 16. Page and workflow shell contract
+
+Routes use one of three explicit compositions; do not introduce a universal shell
+that hides scroll ownership.
+
+A **document page** follows `PageHeader` → optional full-bleed toolbar/subnav →
+page-inset body. `AppShell` main remains its only vertical scroll owner. Document
+routes must not add `h-full`, `overflow-hidden`, or a second page-level
+`overflow-y-auto`. The header may be sticky because it shares the main scroller.
+Projects is the representative ordinary list-page contract.
+
+A **bounded list page** is reserved for high-frequency lists whose persistent
+controls must remain visible while many items scroll. Its route fills the AppShell
+main track and composes `PageHeader` → optional full-bleed toolbar → named,
+keyboard-focusable list scrollport → persistent footer. Header, toolbar, and footer
+are siblings outside the scrollport; the route marks AppShell scrolling as contained
+so the outer stable scrollbar gutter is released, and content inset belongs to an
+inner wrapper so the active browser scrollbar reaches the route edge. Queue is the
+representative contract. Do not use `StepShell` for this composition or add nested
+scrolling inside list rows.
+
+A **workspace step** uses `StepShell`. It fills the route track, keeps page scrolling
+locked, and delegates scrolling to explicit inner panels. Its order is `PageHeader`
+→ optional `belowHeader` → workspace content → optional `TaskLogDrawer` footer.
+The workspace header is not sticky because the shell itself does not scroll.
+`belowHeader` is full bleed and owns its own padding. Content defaults to the shared
+page inset; specialized canvas geometry may choose `inset="none"` only when the
+caller also owns its boundaries and keyboard-reachable scroll regions.
+
+`StepShell` is not a workflow-state machine: it does not receive step indexes,
+change routes, save data, or own business status. `SaveBar` remains a header action,
+not an invented sticky footer. Settings Drawer, Generate, Gallery, evaluation
+matrices, and image editors retain their documented specialized scroll geometry.
+
+## 17. Responsive-layout contract
+
+The responsive layer distinguishes **wide desktop** (`> 1280px`) from
+**compact desktop** (`<= 1280px`). It adapts content hierarchy inside the
+AppShell; it does not invent a mobile navigation model. Shared responsive rules
+live in `styles/responsive.css`, while business state and DOM order remain owned
+by the page.
+
+Ordinary pages follow these rules:
+
+- Page headers keep title, helper navigation, and primary actions visible. At
+  compact desktop, the action slot may take a full row and `topRight` helpers
+  rejoin normal flow instead of overlapping title or actions.
+- Auto-fill card grids use a container-safe minimum such as
+  `minmax(min(100%, <preferred-width>), 1fr)`, so the grid never forces the main
+  track wider than the available content area.
+- Dense list rows preserve identity, type/state, live progress, and actions.
+  Auxiliary timestamps or duplicated metadata yield first at compact desktop;
+  hidden visual metadata must remain available in the row's accessible name,
+  title, or detail route.
+- Summary cards may reduce column count. Action rows wrap without changing DOM
+  order. A genuinely tabular fixed-width region establishes its own labelled,
+  keyboard-focusable horizontal scroll boundary instead of overflowing the page.
+- Truncation is limited to secondary labels and long paths, with the full value
+  available through `title` or an equivalent disclosure. Density and translated
+  copy must not remove controls or alter action priority.
+
+Professional split workspaces (Generate canvas, media curation, evaluation
+matrices, image editors, and similar surfaces) preserve their task-specific
+geometry and explicit local scroll owners. They must not inherit ordinary-page
+stacking mechanically. Any later restructuring requires a representative pilot
+and content-driven evidence; `md`/`lg`/`xl` utility classes are not an independent
+breakpoint policy.
+
+## 18. Split-workspace and pane-geometry contract
+
+Preprocess Overview follows the same virtual-grid boundary as Curation: the
+`ImageGrid` wrapper directly fills a `flex-1 min-h-0` panel slot; content inset is
+passed through `contentClassName` to the Virtuoso list. Do not add an outer
+`overflow-y-auto` wrapper or compensate with negative margins. The panel header
+and batch actions remain outside the grid scrollport. Loading, load failure and
+empty content are distinct; a failed refresh retains already loaded images.
+
+Download is the representative acquisition workspace. Booru search and file
+import are always-open sibling cards on desktop and stack only at compact widths;
+do not add a mode-tab row or a disclosure above the source grid. Booru preserves
+the deliberate `estimate → confirm count → start` sequence. Before the first
+estimate, the plan row shows one quiet “not queried” status and withholds the
+count field instead of repeating unknown placeholders or explanatory empty-state
+copy. After an estimate, show the match total once, the editable batch count once,
+and a plain start action; do not repeat the same count in shortcuts or button copy.
+Only when the backend applies exclusions may a compact inline indicator expose the
+effective query through its tooltip/accessibility text. File import distinguishes
+browser transfer from a server-accessible path, but both sources share
+`select → review selection → import`; the selection summary stays on one truncated
+line with full names/paths in its tooltip, and selecting a server path never imports
+immediately. Passive image count and total size belong in the
+source-image header. Do not restore a permanent statistics rail or
+format-distribution chart at the expense of the ImageGrid. The source grid remains
+the only image scroll owner, permanent deletion keeps confirmation, and a failed
+refresh retains loaded images with an in-place retry.
+
+Train preserves a collapsible side preview: the draft/data view is approximately
+3:1, while YAML receives approximately 3:2 for readable code. The divider handle
+remains reachable when closed; open/closed state and selected tab are persisted,
+and collapsing returns the preview's space to the draft. This is an attached
+workspace, not an overlay Drawer. Start and Schedule stay in the StepShell header
+alongside one SaveIndicator, never in a duplicate bottom bar. The preset trigger is
+content-sized with a safe maximum, not flex-grown across the row. Preset actions
+stay left while the visibly labelled Parameter display mode occupies the toolbar's
+far-right column directly above the section-index rail. At compact widths, when the
+index is hidden, the mode remains against the toolbar's right edge.
+The preview uses compact right-anchored peer Dataset stats / YAML Tabs. An isolated
+summary div shows only the configured base-model filename/display name, LoRA type,
+filename prefix, epochs, and estimated total steps. Labels stay near left-aligned
+values. Do not substitute the family's global default for the configured model or
+repeat rank, precision and optimizer fields. Dataset stats owns samples, batch/GA
+or NaViT pack derivation, step-cap explanation and size distribution. It retains
+the full `steps/epoch × epochs → natural total → max_steps-capped total` derivation
+even though the final estimate also appears in the identity summary, because the
+data view must explain how that number was obtained. No generic Ready badge implies
+preflight validation. Active tasks remain distinguishable from the next-run draft;
+a task-details entry stays visible in the header when its preview is collapsed.
+Compact desktop stacks the attached preview under one workspace scroller and
+retains the collapse control; YAML keeps a bounded code scrollport.
+
+Tagging and Regularization share one async-planner layout contract. At wide desktop,
+the editable setup column and the status rail use a consistent `3fr / 2fr` ratio;
+at compact desktop they stack under one workspace scroll owner. Idle state names the
+editable summary as this run's plan. While a job is live, the submitted parameters
+are an immutable Current task and the still-editable form/summary are explicitly
+Next-run settings; conflicting Start, clear, delete, and dedup actions remain disabled.
+The PageHeader owns only stable task actions and does not duplicate the plan summary.
+
+Tagging keeps the four run decisions (tagger, scope, existing-caption policy, trigger
+word) together and exposes only the active tagger's parameters. Existing captions
+default to `skip`; choosing overwrite must warn in the run-plan summary and require
+confirmation when the selected scope is known or may contain captions. Data status
+owns train/validation coverage and facts recoverable from the last job ledger; never
+present today's global model or preset as the previous run's exact configuration.
+Exact zero-work runs remain valid worker no-ops. Because the API has no per-folder
+tagged count, folder + skip displays “scan after start” rather than a false exact
+estimate. Start exposes labelled busy state, and Advanced is a named disclosure with
+`aria-expanded` / `aria-controls`.
+
+Regularization is a two-stage generation workspace. `Generate` and `Images` use the
+shared underline Tabs immediately below the PageHeader; this stable full-width divider
+separates page-level stages from controls inside either stage. AI prior remains the
+default source and Booru remains the faster alternative. Their local source picker uses
+content-sized pill radios with no full-column background track, preserving the existing
+source hierarchy and keeping the explanatory copy below the choice. The Images-stage
+folder filter likewise uses independent compact filter chips; the chips may wrap, but no
+shared background stretches through the remaining toolbar space. The generate stage
+separates the run plan from persisted reg-set facts.
+Full rebuild requires a confirmation that names the images, captions, metadata, and
+deletion history being removed. Initial load failure, stale refresh failure,
+unavailable train-tag statistics, and a truly empty reg set remain distinct states
+with local retry paths. The Images stage owns folder filtering and batch actions above
+a single `ImageGrid` scroll owner.
+
+Preprocess tool navigation remains native route Links (including the current
+route), with a named nav and `aria-current="page"`. It reuses the underline
+selection recipe and its local horizontal overflow/focus treatment, not tablist
+semantics. Only the Overview's local dataset views use Tabs and a stable shared
+panel with `aria-labelledby` pointing to the selected tab.
+
+
+A split workspace preserves simultaneous context for a task; it is not an ordinary
+responsive grid and there is no universal split-shell component. `PaneResizer` is
+the shared interaction primitive only for authored, user-resizable horizontal
+separators. The parent remains authoritative for pane DOM order, percentage state,
+persistence, compact behavior, and local scroll owners.
+
+Pane geometry follows these rules:
+
+- Persisted percentages are untrusted input. The same bounded effective value must
+  drive pane geometry, separator ARIA, pointer drag, and keyboard changes. Invalid
+  two-fixed-pane state is repaired against one shared width budget so a flexible
+  middle pane retains its declared minimum.
+- A separator names its controlled pane with `aria-controls`, exposes min/current/max
+  percentage values, supports Left/Right plus Home/End, and restores body cursor and
+  text-selection styles after pointer up, cancellation, capture loss, or unmount.
+- Every bounded flex pane and every link in its height chain uses `min-width: 0` /
+  `min-height: 0`. Exactly one descendant owns overflow for each axis. Virtualized
+  media grids remain direct bounded children of their pane; visual inset belongs to
+  the virtual list content, never to a wrapper that breaks measured height or moves
+  the browser scrollbar inward.
+- Curation is the representative responsive two-pane workspace: at compact desktop
+  it stacks panes and removes the inactive separator; at wide desktop the fixed pane
+  uses the bounded persisted percentage. Tag Edit is the representative authored
+  three-pane workspace: the two fixed panes share one budget and reserve the middle
+  preview minimum even when stored values are stale or corrupt. If the three authored
+  panes no longer fit, its named workspace establishes one keyboard-focusable
+  horizontal boundary rather than shrinking tools below useful widths or clipping them.
+  In Tag Edit, the active folder is also the authoritative selection/statistics scope:
+  changing it clears selection and the old single-image context. External caption
+  updates may refresh a clean cache, but must preserve dirty edits behind explicit
+  save-and-refresh or discard-and-refresh actions. Commit responses are authoritative;
+  skipped files remain dirty instead of being reported as saved. Text-mode edits enter
+  the local cache immediately—there is no separate sync action—and only the page-level
+  Save control persists them. While any caption is dirty, that control uses the danger
+  emphasis; each affected thumbnail and the active tag-editor header carry an explicit
+  unsaved marker so dataset and image scope remain distinguishable.
+- Train preview, Tagging status, Generate canvas and attached drawers, preprocessing
+  editors, and evaluation matrices retain their specialist topology. Do not add
+  resize handles or migrate them to `PaneResizer` without task-specific evidence.
+
+## 19. Accessibility and resilience
+
+Every primitive must work with keyboard focus, disabled state, light/dark themes,
+all three density modes, and both Chinese and English labels. Focus is always visible.
+Controls must tolerate longer English copy without fixed-width truncation unless the
+full value is available through an established disclosure pattern.
+
+Respect `prefers-reduced-motion`; status information must remain understandable when
+animation is disabled.
+
+## 20. Migration policy
+
+Migration is incremental:
+
+1. Preserve the CSS classes as compatibility primitives.
+2. Use typed components for new work.
+3. Migrate representative surfaces with tests.
+4. Move remaining pages by component family, not by arbitrary page batches.
+5. Remove old compatibility paths only after repository-wide adoption.
+
+A migration must preserve business behavior, route contracts, schema, SSE events,
+and localization unless those changes are explicitly part of its scope.

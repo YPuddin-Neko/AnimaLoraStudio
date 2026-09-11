@@ -41,6 +41,7 @@ AnimaLoraStudio/
     ├── text_encoders/             # 文本编码器 + tokenizer（Anima 的 Qwen3-0.6B；Krea 2 的 Qwen3-VL-4B bf16 目录 / fp8 单文件目录）
     ├── t5_tokenizer/              # T5 tokenizer 文件（下载）
     ├── wd14/                      # WD14 ONNX 模型（HF 自动下载）
+    ├── preprocess/head_detector/ # 自动头部遮罩 ONNX 识别模型（按需下载；注册本地文件不搬移）
     └── taeflux/                   # TAEFlux 中间步预览权重
 ```
 
@@ -48,7 +49,8 @@ AnimaLoraStudio/
 
 ## 运行时数据（gitignored）
 
-- `studio_data/` — SQLite + 用户 preset
+- `studio_data/` — SQLite、非敏感设置、独立凭证、训练预设与逐文件 LLM 预设（[升级迁移](../user-guide/upgrading-v0.27.md)）
+- `studio_data/projects/{id}-{slug}/versions/{label}/config.yaml` — version 私有训练配置，与全局训练预设池独立
 - `studio_data/tasks/{id}/` — 每个训练 task 的 config snapshot + monitor state + 采样图 + run.log（删 version 不丢历史）
 - `studio_data/projects/{id}-{slug}/versions/{label}/output/` — 训练产物 LoRA
 - `studio_data/projects/{id}-{slug}/versions/{label}/reg/` — 正则集（多 task 复用）

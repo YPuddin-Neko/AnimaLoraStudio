@@ -9,11 +9,17 @@ export interface ImageGridItem {
   meta?: string
   /** 常显小角标，cell 右下角（可选）。例如 "已处理"，用于在合并视图里区分状态。 */
   badge?: string
+  /** 小角标语义。warning 用于未保存的本地修改；默认沿用 accent。 */
+  badgeTone?: 'accent' | 'warning'
 }
 
 interface Props {
   items: ImageGridItem[]
   selected: Set<string>
+  /** Classes for the stable height-constrained grid wrapper. */
+  className?: string
+  /** Classes for grid content inside Virtuoso's scrollport (for example panel inset). */
+  contentClassName?: string
   /** 单击 = checkbox 切换；shift+click = 区间选；详见 applySelection。 */
   onSelect: (name: string, e: React.MouseEvent) => void
   /** 鼠标悬停时回调：用于驱动外部「大图预览面板」。 */
@@ -96,10 +102,18 @@ export default function ImageGrid({
   ariaLabel,
   columnsClass = DEFAULT_COLUMNS,
   activeName,
+  className = '',
+  contentClassName = '',
 }: Props) {
   const { t } = useTranslation()
   if (items.length === 0) {
-    return <p className="text-fg-tertiary text-sm py-2">{emptyHint ?? t('imageGrid.noImages')}</p>
+    return (
+      <div className={`h-full min-h-0 ${className}`.trim()}>
+        <p className={`text-fg-tertiary text-sm py-2 ${contentClassName}`.trim()}>
+          {emptyHint ?? t('imageGrid.noImages')}
+        </p>
+      </div>
+    )
   }
   const decoupled = activeName !== undefined
 
@@ -108,12 +122,16 @@ export default function ImageGrid({
   // style；外层 wrapper 是稳定的。getAllByRole('gridcell') 会穿透中间 div 找到
   // Cell 上的 role="gridcell"，AT / 测试都不受影响。
   return (
-    <div role="grid" aria-label={ariaLabel} className="h-full">
+    <div
+      role="grid"
+      aria-label={ariaLabel}
+      className={`h-full min-h-0 ${className}`.trim()}
+    >
       <VirtuosoGrid
         style={{ height: '100%' }}
         totalCount={items.length}
         overscan={OVERSCAN_PX}
-        listClassName={`grid ${columnsClass} gap-1`}
+        listClassName={`grid ${columnsClass} gap-1 ${contentClassName}`.trim()}
         itemContent={(index) => {
           const it = items[index]
           const isSel = selected.has(it.name)
@@ -256,7 +274,7 @@ const Cell = memo(function Cell({
           'absolute top-1 left-1 w-5 h-5 rounded-sm flex items-center justify-center text-[12px] font-bold transition-opacity ' +
           (selected
             ? 'bg-accent text-accent-fg opacity-100'
-            : 'bg-black/50 border border-subtle text-transparent opacity-0 group-hover:opacity-100')
+            : 'bg-black/50 border border-subtle text-transparent opacity-0 group-hover:opacity-100 focus-visible:opacity-100')
         }
       >
         ✓
@@ -270,13 +288,20 @@ const Cell = memo(function Cell({
             onPreview(item.name)
           }}
           aria-label={`${t('common.preview')} ${item.name}`}
-          className="absolute top-1 right-1 w-5 h-5 rounded-sm bg-black/60 text-white text-[11px] opacity-0 group-hover:opacity-100 hover:bg-black/80"
+          className="absolute top-1 right-1 w-5 h-5 rounded-sm bg-black/60 text-white text-[11px] opacity-0 group-hover:opacity-100 focus-visible:opacity-100 hover:bg-black/80"
         >
           ⤢
         </button>
       )}
       {item.badge && (
-        <div className="absolute bottom-1 right-1 px-1.5 py-0.5 rounded-sm bg-accent text-accent-fg text-[10px] font-medium pointer-events-none">
+        <div
+          className={
+            'absolute bottom-1 right-1 pointer-events-none ' +
+            (item.badgeTone === 'warning'
+              ? 'badge badge-warn badge-sm'
+              : 'px-1.5 py-0.5 rounded-sm bg-accent text-accent-fg text-[10px] font-medium')
+          }
+        >
           {item.badge}
         </div>
       )}

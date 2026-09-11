@@ -41,6 +41,7 @@ AnimaLoraStudio/
     ├── text_encoders/             # Text encoders + tokenizers (Anima's Qwen3-0.6B; Krea 2's Qwen3-VL-4B bf16 dir / fp8 single-file dir)
     ├── t5_tokenizer/              # T5 tokenizer files (downloaded)
     ├── wd14/                      # WD14 ONNX models (auto-downloaded from HF)
+    ├── preprocess/head_detector/ # Auto head-mask ONNX detectors (downloaded on demand; registered local files stay in place)
     └── taeflux/                   # TAEFlux intermediate preview weights
 ```
 
@@ -48,7 +49,8 @@ AnimaLoraStudio/
 
 ## Runtime data (gitignored)
 
-- `studio_data/` — SQLite + user presets
+- `studio_data/` — SQLite, non-sensitive settings, separate credentials, training presets, and per-file LLM presets ([upgrade migration](../user-guide/upgrading-v0.27.en.md))
+- `studio_data/projects/{id}-{slug}/versions/{label}/config.yaml` — private version training config, independent of the global training preset pool
 - `studio_data/tasks/{id}/` — per-training-task config snapshot + monitor state + samples + run.log (history survives version deletion)
 - `studio_data/projects/{id}-{slug}/versions/{label}/output/` — trained LoRA artifacts
 - `studio_data/projects/{id}-{slug}/versions/{label}/reg/` — regularization set (shared by tasks under that version)

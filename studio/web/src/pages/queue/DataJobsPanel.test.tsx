@@ -83,9 +83,47 @@ describe('DataJobsPanel', () => {
     renderPanel()
 
     await waitFor(() => expect(screen.getByTestId('job-row-10')).toBeInTheDocument())
+    expect(screen.getByTestId('data-jobs-panel')).toHaveClass('gap-section')
+    expect(screen.getByTestId('job-row-10').firstElementChild)
+      .toHaveClass('ui-queue-job-grid')
+    expect(screen.getByTestId('job-row-10').querySelector('.ui-queue-job-timing'))
+      .toBeInTheDocument()
+    expect(screen.getByRole('heading', { level: 3, name: /进行中/ }))
+      .toHaveClass('type-section-label')
+    expect(screen.getByRole('heading', { level: 3, name: /进行中/ }).parentElement)
+      .toHaveClass('gap-related')
+    expect(screen.getByRole('heading', { level: 3, name: /历史/ }))
+      .toHaveClass('type-section-label')
     expect(within(screen.getByTestId('job-row-10')).getByText('打标')).toBeInTheDocument()
     expect(within(screen.getByTestId('job-row-9')).getByText('素材下载')).toBeInTheDocument()
     await waitFor(() => expect(screen.getAllByText(/MyProj/).length).toBeGreaterThan(0))
+  })
+
+  it('空数据视图使用共享的主空状态层级', async () => {
+    vi.spyOn(api, 'listQueueLive').mockResolvedValue([])
+    vi.spyOn(api, 'listQueueHistory').mockResolvedValue({
+      items: [], total: 0, page: 1, page_size: 20,
+    })
+
+    renderPanel()
+
+    const title = await screen.findByText('暂无数据任务')
+    expect(title.closest('.empty-state')).toHaveClass('card', 'empty-state')
+    expect(screen.getByText('下载 / 打标 / 正则构建 / 评估等数据任务会显示在这里'))
+      .toHaveClass('empty-state-description')
+  })
+
+  it('加载失败使用共享 danger Alert 与即时播报语义', async () => {
+    vi.spyOn(api, 'listQueueLive').mockRejectedValue(new Error('offline'))
+    vi.spyOn(api, 'listQueueHistory').mockResolvedValue({
+      items: [], total: 0, page: 1, page_size: 20,
+    })
+
+    renderPanel()
+
+    const alert = await screen.findByRole('alert')
+    expect(alert).toHaveClass('alert', 'alert-danger', 'alert-sm', 'font-mono')
+    expect(alert).toHaveTextContent('offline')
   })
 
   it('数据源 = /api/queue resource_class=data（kind/q 透传）', async () => {

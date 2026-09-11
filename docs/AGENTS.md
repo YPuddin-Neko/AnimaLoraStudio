@@ -83,6 +83,28 @@ commit / PR / release）。本文不重复，只写代码质量、一致性、�
 - ❌ 不要默认作者完整描述了需求 —— 多数情况下作者给了 50%，AI 要把另
   50% 问出来或显式标记成"我假设是 X"
 
+### 1.4 UI/UX 方案的全站一致性门禁
+
+任何 UI/UX 建议（包括只讨论、不写代码）在提出前必须按以下顺序核对：
+
+1. **先读 `DESIGN.md`**：确认目标语义是否已有组件、布局、操作位置、状态、
+   响应式或交互契约；有权威契约就遵守，不以单页审美重新发明。
+2. **再查当前基线的同类页面**：至少比较具有相同用户意图、对象作用域或任务
+   状态的代表页面。区分权威模式、历史迁移债务和有证据的专业例外；代码里
+   “多数这样写”本身不等于设计标准。
+3. **没有标准时先判断是否应全站统一**：若同一语义会在多个页面重复（例如
+   主操作位置、运行中表单、危险确认、保存反馈），先提出跨页面心智模型及
+   影响范围，与作者确认后把契约写入 `DESIGN.md`，再实施当前页面。
+4. **避免制造局部新惯例**：不得为了单页局部最优，静默移动稳定入口、改变
+   同语义反馈或新增只在一页成立的交互。若全站迁移不能在同一 PR 完成，需在
+   契约和 task brief 中明确首个试点、过渡状态与后续 adoption，而不是让例外
+   冒充新标准。
+5. **例外必须由任务语义证明**：只有对象作用域、风险、生命周期或专业几何确实
+   不同时才允许不同处理；理由写入页面 task brief，并说明为何不适合推广。
+
+评审 UI/UX 方案时，必须能回答：`DESIGN.md` 怎么规定、同类页面怎么做、当前
+选择是否需要成为全站标准。回答不出来就继续审计，不进入实现。
+
 ---
 
 ## 2. 规范文件地图（按场景查）
@@ -94,6 +116,7 @@ commit / PR / release）。本文不重复，只写代码质量、一致性、�
 | 加 / 改训练栈（LoRA 变体 / optimizer / scheduler / sampler / loss） | [runtime/training/README.md](../runtime/training/README.md) + [adr/0003-anima-train-refactor.md](adr/0003-anima-train-refactor.md) |
 | 加 / 改**模型族**（第 3 个族 / 族能力 / 族资产） | [runtime/training/families/README.md](../runtime/training/families/README.md)（三居所导览 + 加族步骤）+ [design/multi-model/](design/multi-model/) |
 | 加 / 改 Studio Web 功能 | [architecture/studio-pipeline.md](architecture/studio-pipeline.md) + [studio/README.md](../studio/README.md) |
+| 提出或实施 UI/UX 方案 | 先读仓库根目录 [`DESIGN.md`](../DESIGN.md)，再按 §1.4 对照同语义页面；没有全站标准时先补契约 |
 | 加新依赖 / 改默认行为 / 接口 / schema | 写 ADR：[adr/README.md](adr/README.md) |
 | 改了用户能感知的行为 | [user-guide/](user-guide/) 同步更新 |
 | 看历史决策 | [adr/0001-0005](adr/)，**老 ADR 不删不改写**，只追加状态 |
@@ -133,7 +156,7 @@ models  →  utils  →  runtime  →  studio  →  tools
 | `docs/announcements/<date>-v<ver>.md`（`tag: release`） | `CHANGELOG.md`、公告栏、GitHub Release Body | `python tools/bump_version.py bump --version X.Y.Z`（格式见 `docs/announcements/README.md`，ADR 0013） |
 | `studio/domain/training.py:TrainingConfig`（`studio/schema.py` 是 shim） | `argparse_bridge` 生成 argparse、前端 `SchemaForm` 渲染、`validate_schema_consistency()` 校验 | 改字段时跟 4 个 plugin registry（adapters / optimizers / schedulers / losses）的 Literal 枚举**一起改**，启动期会拒；`model_family` Literal 另与 runtime `families` registry + studio `FAMILY_ASSETS` / 能力矩阵三方对齐（`tests/test_model_family_gating.py` 锁死） |
 | `studio/domain/common.py`（能力矩阵 / 族默认 / `FAMILY_SAMPLING`） | runtime SPECS 直接引用（单源）、`cap_gate()` 展开 show_when、选项按族过滤 | 改族能力 / 族默认 / 采样白名单只动这一处 |
-| `studio/infrastructure/secrets.py` schema（`studio/secrets.py` 是 shim） | `/api/secrets` + Settings 7 tab 表单 | Pydantic 模型 + 前端表单同时改 |
+| `studio/infrastructure/secrets.py` Pydantic 兼容 schema（`studio/secrets.py` 是 shim） | ADR 0017 后由 `settings.json`、`credentials.json`、`llm_presets/*.json` 组合出的运行时视图 | 普通设置走 `/api/settings`；LLM preset / credential 必须走各自资源 API，禁止把 `llm_tagger.presets` 写回聚合配置 |
 
 ### 3.4 训练栈插件边界（ADR 0003）
 

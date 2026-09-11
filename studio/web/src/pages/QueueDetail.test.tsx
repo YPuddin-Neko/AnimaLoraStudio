@@ -4,11 +4,13 @@
  *  做 elapsed time tick，旧实现 [task] 作 deps 会让 snapshot config 也跟着
  *  2s 重拉 —— 浏览器卡顿、loading flash。 */
 import { render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { DialogProvider } from '../components/Dialog'
 import { ToastProvider } from '../components/Toast'
 import type { Task } from '../api/client'
-import QueueDetailPage, { SnapshotConfigTab } from './QueueDetail'
+import QueueDetailPage, { OutputsTab, SnapshotConfigTab } from './QueueDetail'
 
 const SNAPSHOT_URL_PREFIX = '/api/queue/'
 const SNAPSHOT_URL_SUFFIX = '/snapshot/config'
@@ -110,6 +112,45 @@ describe('SnapshotConfigTab', () => {
   })
 })
 
+describe('OutputsTab 响应式输出表', () => {
+  it('为两个横向滚动区提供独立名称，并披露被截断的完整目录', async () => {
+    const outputDir = 'C:/very/long/output/path'
+    const body = {
+      task_id: 119,
+      output_dir: outputDir,
+      exists: true,
+      supports_open_folder: false,
+      archive_basename: 'project-version',
+      files: [
+        { name: 'model.safetensors', path: 'model.safetensors', size: 100, mtime: 2, kind: 'lora', is_lora: true },
+        { name: 'state.pt', path: 'state.pt', size: 200, mtime: 1, kind: 'training_state', is_lora: false },
+      ],
+    }
+    fetchMock.mockResolvedValue({
+      ok: true, status: 200,
+      json: async () => body, text: async () => JSON.stringify(body),
+      headers: new Headers({ 'content-type': 'application/json' }),
+    } as Response)
+
+    render(
+      <MemoryRouter>
+        <ToastProvider>
+          <DialogProvider>
+            <OutputsTab taskId={119} />
+          </DialogProvider>
+        </ToastProvider>
+      </MemoryRouter>,
+    )
+
+    expect(await screen.findByRole('region', { name: '输出文件' }))
+      .toHaveClass('ui-queue-output-table')
+    expect(screen.getByRole('region', { name: '训练状态' }))
+      .toHaveClass('ui-queue-output-table')
+    expect(screen.getByText(outputDir, { selector: 'code' }))
+      .toHaveAttribute('title', outputDir)
+  })
+})
+
 // ── 暂停按钮的 SSE 刷新（QueueDetailPage header）─────────────────────────────
 //
 // regression：恢复 / 启动后 is_pausable 由 train_loop_started + auto_epoch_backup_written
@@ -183,6 +224,18 @@ describe('QueueDetailPage 暂停按钮 SSE 刷新', () => {
 
     // 初始：running header 已渲染（PID 卡片），但 is_pausable=false → 暂停按钮不在
     await waitFor(() => expect(screen.getByText('取消任务')).toBeInTheDocument())
+    const stats = screen.getByTestId('queue-detail-stats')
+    expect(stats).toHaveClass('ui-queue-detail-stats')
+    expect(stats.querySelector('[title="train"]'))
+      .toHaveClass('overflow-hidden', 'text-ellipsis')
+    expect(screen.getByText('train', { selector: '.ui-queue-detail-title' }))
+      .toHaveAttribute('title', 'train')
+    expect(screen.getByText('train.yaml', { selector: '.ui-queue-detail-title' }))
+      .toHaveAttribute('title', 'train.yaml')
+    expect(screen.getByRole('button', { name: '取消任务' })).toHaveClass('btn-warn', 'btn-sm')
+    for (const statusBadge of screen.getAllByText('运行中')) {
+      expect(statusBadge).toHaveClass('badge-accent')
+    }
     expect(screen.queryByTestId('detail-pause-btn')).not.toBeInTheDocument()
 
     // 后端首个 epoch backup 落盘 → is_pausable 升级；推一条 SSE 事件
@@ -244,8 +297,25 @@ describe('QueueDetailPage 类型差异化 tab（P-H）', () => {
     expect(screen.queryByText('指标')).not.toBeInTheDocument()
     expect(screen.queryByText('关联配置')).not.toBeInTheDocument()
     expect(screen.queryByText('输出')).not.toBeInTheDocument()
-    // overview tab 仍在
-    expect(screen.getByText('详情')).toBeInTheDocument()
+    // overview tab 仍在，并与当前面板建立 ARIA 关联
+    const tablist = screen.getByRole('tablist', { name: '任务详情分区' })
+    const overview = screen.getByRole('tab', { name: '详情' })
+    const log = screen.getByRole('tab', { name: '日志' })
+    expect(tablist).toHaveClass('ui-selection-underline')
+    expect(overview).toHaveAttribute('aria-selected', 'true')
+    expect(overview).toHaveAttribute('aria-controls', 'queue-detail-panel')
+    expect(screen.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', overview.id)
+
+    const user = userEvent.setup()
+    overview.focus()
+    await user.keyboard('{ArrowRight}')
+    expect(log).toHaveFocus()
+    expect(log).toHaveAttribute('aria-selected', 'true')
+    expect(screen.getByRole('tabpanel')).toHaveAttribute('aria-labelledby', log.id)
+
+    // QueueDetail 把当前 tab 同步到 window.location.hash；切回概览，避免污染后续用例。
+    await user.keyboard('{ArrowLeft}')
+    expect(overview).toHaveAttribute('aria-selected', 'true')
   })
 })
 
