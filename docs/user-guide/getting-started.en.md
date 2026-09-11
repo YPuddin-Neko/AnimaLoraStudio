@@ -41,6 +41,10 @@ python -m studio build        # Build frontend only
 python -m studio test         # pytest + vitest
 ```
 
+## Upgrading an existing installation
+
+Read [Upgrading to v0.27](upgrading-v0.27.en.md) first: stop jobs and back up data before updating dependencies. First startup automatically separates legacy settings and LLM preset storage.
+
 ## Download models
 
 After launch, go to the model download center under **Settings → Training**. Downloads are grouped by model family (Anima / Krea 2) — grab only the family you plan to train (defaults to `./models/`); Anima-only users can skip the large Krea 2 files:
@@ -80,7 +84,7 @@ Open <http://127.0.0.1:8765/>, click "+ New project" on the projects page, and t
 
 1. **Download** — Booru search and file import sit side by side on desktop. Booru (configure Gelbooru / Danbooru credentials in Settings first) estimates matches before you confirm the batch size; file import accepts images / zip archives from the current device or an existing file selected with the app server picker, then asks you to confirm the import. The source-image area below shows the total image count and size.
 2. **Curate** — unused images on the left and the current training folder on the right; select images to add them to that folder and manage training subfolders. When you need held-out evaluation images, switch the top **Destination** control to the secondary Validation mode.
-3. **Preprocess** ✱ — overview (multi-select + one-click undo) + duplicate review + upscale (ESRGAN / Real-ESRGAN presets) + crop (manual boxes + aspect-ratio prefill) + inpaint (either paint over the source image or draw a training mask). Skip if not needed.
+3. **Preprocess** ✱ — overview (multi-select + one-click undo) + duplicate review + upscale (ESRGAN / Real-ESRGAN presets) + crop (manual boxes + aspect-ratio prefill) + retouch (paint over the source image or draw a training mask; [automatic head masks](auto-head-mask.en.md) can assist editing, but results must be saved manually). Skip if not needed.
 4. **Tag** — choose WD14, CLTagger, or an OpenAI-compatible LLM (including a JoyCaption preset), then tune its thresholds; GPU execution providers fall back automatically. A trigger word entered at the top is injected into every caption. Existing captions are skipped by default; choosing overwrite requires an impact confirmation before the run starts. While idle, **This tagging plan** shows scope, policy, and estimated work. Once a task is live, its submitted snapshot is the **Current task**, while the form and summary become editable **Next-run settings**. **Current tagging status** separately shows training/validation coverage and facts from the previous run. Folder + skip displays “scan after start” because per-folder tagged counts are unavailable; an exact zero-image run remains allowed and completes as a successful worker no-op.
 5. **Tag editor** — the active folder is the shared scope for bulk selection and tag distribution; the workspace supports bulk add / delete / replace, per-image correction, resizable three-pane editing, and restore points. External caption updates preserve local edits until you explicitly **Save and refresh** or **Discard and refresh**, and files the backend did not write remain pending.
 6. **Regularization set** ✱ — **AI prior generation** is the default (the base model generates images with no LoRA), with faster **Booru reverse search** as an alternative. The run-plan summary appears once in the status rail; a full rebuild asks for confirmation before deleting existing images, captions, metadata, and deletion history. While a task runs, its immutable snapshot is shown separately from the editable **next-run settings**. After generation, filter images by folder, batch-delete outliers, or run automatic deduplication. mirror / flat structure, WD14 / CLTagger, and resolution clustering remain available.
@@ -88,6 +92,10 @@ Open <http://127.0.0.1:8765/>, click "+ New project" on the projects page, and t
 8. **Test** — single-image / XY matrix / inference daemon.
 
 View tasks on the **Queue** page; open **task detail** for logs / monitoring / output (with one-click full zip download).
+
+The preprocessing overview's **Processed dataset / Deleted** views support arrow keys and Home/End; switching views clears the current selection. Images scroll independently so selection and undo controls stay visible. Select all in the processed view selects only processed images. Failed loads offer Retry; failed refreshes retain existing images instead of showing an empty dataset.
+
+The Upscale page's resolution filter also supports arrow keys and Home/End and clears selection when changed. Choose Custom for a separate 256–4096-pixel input, or Off for direct 4× output. Folders with a resolution prefix continue to set the target resolution automatically.
 
 ## Test your LoRA + ComfyUI
 
